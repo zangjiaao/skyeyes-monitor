@@ -160,7 +160,24 @@ export function dayBounds(reference: Date, timeZone: string, dayOffset: number):
   return { start, end };
 }
 
+export function closedWindow(reference: Date, config: ScheduleConfig, shiftsBack: number): TimeRange {
+  const latest = latestScheduleInstant(reference, config);
+  const length = config.windowHours * 60 * 60 * 1000;
+  const end = new Date(latest.getTime() - shiftsBack * length);
+  return { start: new Date(end.getTime() - length), end };
+}
+
 export type PeriodLabel = "今日" | "昨日" | "更早";
+
+export function publishPeriod(iso: string, reference: Date, config: ScheduleConfig): PeriodLabel {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return "更早";
+  const today = closedWindow(reference, config, 0);
+  if (parsed >= today.start && parsed < today.end) return "今日";
+  const yesterday = closedWindow(reference, config, 1);
+  if (parsed >= yesterday.start && parsed < yesterday.end) return "昨日";
+  return "更早";
+}
 
 export function periodLabel(iso: string, reference: Date, timeZone: string): PeriodLabel {
   const parsed = new Date(iso);

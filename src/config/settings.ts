@@ -20,6 +20,15 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   app_base_url: "",
   finalize_deadline_minutes: "60",
   x_max_pages: "5",
+  min_text_length: "20",
+  exclude_words: "",
+  blocked_accounts: "",
+  min_followers: "0",
+  min_account_age_days: "0",
+  exclude_retweets: "1",
+  exclude_ads: "1",
+  relevance_enabled: "1",
+  relevance_threshold: "40",
 };
 
 export const EDITABLE_SETTINGS = Object.keys(SETTING_DEFAULTS);
@@ -42,6 +51,15 @@ export interface AppSettings {
   appBaseUrl: string;
   finalizeDeadlineMinutes: number;
   xMaxPages: number;
+  minTextLength: number;
+  excludeWords: string[];
+  blockedAccounts: string[];
+  minFollowers: number;
+  minAccountAgeDays: number;
+  excludeRetweets: boolean;
+  excludeAds: boolean;
+  relevanceEnabled: boolean;
+  relevanceThreshold: number;
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -53,6 +71,16 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
 function flag(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === "") return fallback;
   return value === "1" || value === "true";
+}
+
+export function parseTermList(value: string | undefined): string[] {
+  if (!value) return [];
+  const seen = new Set<string>();
+  for (const part of value.split(/[\n,;，]+/)) {
+    const term = part.trim().toLowerCase();
+    if (term) seen.add(term);
+  }
+  return [...seen];
 }
 
 function parseEmails(value: string | undefined): string[] {
@@ -100,6 +128,15 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     appBaseUrl: merged.app_base_url.replace(/\/$/, ""),
     finalizeDeadlineMinutes: clampInt(merged.finalize_deadline_minutes, 60, 15, 180),
     xMaxPages: clampInt(merged.x_max_pages, 5, 1, 10),
+    minTextLength: clampInt(merged.min_text_length, 20, 0, 500),
+    excludeWords: parseTermList(merged.exclude_words),
+    blockedAccounts: parseTermList(merged.blocked_accounts),
+    minFollowers: clampInt(merged.min_followers, 0, 0, 10_000_000),
+    minAccountAgeDays: clampInt(merged.min_account_age_days, 0, 0, 3650),
+    excludeRetweets: flag(merged.exclude_retweets, true),
+    excludeAds: flag(merged.exclude_ads, true),
+    relevanceEnabled: flag(merged.relevance_enabled, true),
+    relevanceThreshold: clampInt(merged.relevance_threshold, 40, 0, 100),
   };
 }
 
@@ -141,7 +178,22 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
     }
     next.allowed_admin_emails = parseEmails(next.allowed_admin_emails).join(",");
   }
+  assertInt(next.min_text_length, 0, 500, "最短正文长度必须是 0 到 500");
+  assertInt(next.min_followers, 0, 10_000_000, "最少粉丝数必须是 0 到 10000000，0 表示不限制");
+  assertInt(next.min_account_age_days, 0, 3650, "最少账号天数必须是 0 到 3650，0 表示不限制");
+  assertInt(next.relevance_threshold, 0, 100, "相关度阈值必须是 0 到 100，0 表示不因分数排除");
+  if (next.exclude_words !== undefined) next.exclude_words = parseTermList(next.exclude_words).join(",");
+  if (next.blocked_accounts !== undefined) next.blocked_accounts = parseTermList(next.blocked_accounts).join(",");
+  if ((next.exclude_words?.length ?? 0) > 4000 || (next.blocked_accounts?.length ?? 0) > 4000) {
+    throw new Error("过滤词或屏蔽账号过长");
+  }
   return next;
+}
+
+function assertInt(value: string | undefined, min: number, max: number, message: string): void {
+  if (value === undefined || value === "") return;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new Error(message);
 }
 
 export async function loadSettings(db: D1Database): Promise<AppSettings> {

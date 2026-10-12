@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { assertAllowedEmail, authenticate } from "../auth/access";
 import { EDITABLE_SETTINGS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
+import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
+import { closedWindow, decideSchedule } from "../domain/time";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
-import { dayBounds, decideSchedule } from "../domain/time";
 import { parseCsv, parseXlsx } from "../import/table";
 import { storeExcel } from "../pipeline/run";
 import { startManualRun } from "../schedule";
@@ -51,14 +52,19 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       scheduleHour: settings.scheduleHour,
       windowHours: settings.windowHours,
     });
-    const today = dayBounds(now, settings.timeZone, 0);
-    const yesterday = dayBounds(now, settings.timeZone, -1);
+    const schedule = {
+      timeZone: settings.timeZone,
+      scheduleHour: settings.scheduleHour,
+      windowHours: settings.windowHours,
+    };
+    const today = closedWindow(now, schedule, 0);
+    const yesterday = closedWindow(now, schedule, 1);
     const [countries, totals, todayCounts, yesterdayCounts, runs, failed, usage] = await Promise.all([
       c.env.DB.prepare("SELECT id, name, code, enabled FROM countries ORDER BY name").all(),
-      c.env.DB.prepare("SELECT country_id, COUNT(*) AS n FROM records GROUP BY country_id").all<{ country_id: string; n: number }>(),
-      c.env.DB.prepare("SELECT country_id, COUNT(*) AS n FROM records WHERE collected_at >= ? AND collected_at < ? GROUP BY country_id")
+      c.env.DB.prepare(`SELECT country_id, COUNT(*) AS n FROM records WHERE ${DELIVERABLE_SQL} GROUP BY country_id`).all<{ country_id: string; n: number }>(),
+      c.env.DB.prepare(`SELECT country_id, COUNT(*) AS n FROM records WHERE ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ? GROUP BY country_id`)
         .bind(today.start.toISOString(), today.end.toISOString()).all<{ country_id: string; n: number }>(),
-      c.env.DB.prepare("SELECT country_id, COUNT(*) AS n FROM records WHERE collected_at >= ? AND collected_at < ? GROUP BY country_id")
+      c.env.DB.prepare(`SELECT country_id, COUNT(*) AS n FROM records WHERE ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ? GROUP BY country_id`)
         .bind(yesterday.start.toISOString(), yesterday.end.toISOString()).all<{ country_id: string; n: number }>(),
       c.env.DB.prepare("SELECT * FROM runs ORDER BY started_at DESC LIMIT 12").all(),
       c.env.DB.prepare(
@@ -351,19 +357,57 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       binds.push(countryId);
     }
     if (view === "today" || view === "yesterday") {
-      const bounds = dayBounds(new Date(), settings.timeZone, view === "today" ? 0 : -1);
-      clauses.push("collected_at >= ? AND collected_at < ?");
+      const bounds = closedWindow(new Date(), {
+        timeZone: settings.timeZone,
+        scheduleHour: settings.scheduleHour,
+        windowHours: settings.windowHours,
+      }, view === "today" ? 0 : 1);
+      clauses.push(DELIVERABLE_SQL);
+      clauses.push("published_at >= ? AND published_at < ?");
       binds.push(bounds.start.toISOString(), bounds.end.toISOString());
     }
     const where = clauses.join(" AND ");
     const rows = await c.env.DB.prepare(
       `SELECT id, source, url, country_name, matched_target, author_handle, author_name, author_url,
-              original_text, published_at, collected_at, translation_zh
-       FROM records WHERE ${where} ORDER BY collected_at DESC LIMIT ? OFFSET ?`,
+              original_text, published_at, collected_at, translation_zh, relevance_score,
+              exclude_reason, is_spam, time_status
+       FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,
     ).bind(...binds, limit, offset).all();
     const total = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM records WHERE ${where}`)
       .bind(...binds).first<{ n: number }>();
     return c.json({ records: rows.results, total: total?.n ?? 0 });
+  });
+
+  app.post("/api/records/:id/spam", async (c) => {
+    try {
+      const body = await readJson(c.req.raw);
+      const id = c.req.param("id");
+      const row = await c.env.DB.prepare(
+        "SELECT id, author_handle, author_url, url FROM records WHERE id = ?",
+      ).bind(id).first<{ id: string; author_handle: string; author_url: string; url: string }>();
+      if (!row) return c.json({ error: "记录不存在" }, 404);
+      await c.env.DB.prepare(
+        "UPDATE records SET is_spam = 1, exclude_reason = 'spam' WHERE id = ?",
+      ).bind(id).run();
+      let blocked: string | null = null;
+      if (body.blockAuthor === true) {
+        blocked = authorBlockKey({
+          authorHandle: row.author_handle,
+          authorUrl: row.author_url,
+          url: row.url,
+        });
+        if (!blocked) throw new Error("没有可屏蔽的作者");
+        const settings = await loadSettings(c.env.DB);
+        if (!settings.blockedAccounts.includes(blocked)) {
+          await saveSettings(c.env.DB, {
+            blocked_accounts: [...settings.blockedAccounts, blocked].join(","),
+          });
+        }
+      }
+      return c.json({ ok: true, blocked });
+    } catch (error) {
+      return jsonError(error);
+    }
   });
 
   app.get("/api/export/excel", async (c) => {

@@ -27,6 +27,10 @@ export interface CollectedRecord {
   authorHandle: string;
   authorName: string;
   authorUrl: string;
+  authorFollowers?: number | null;
+  authorCreatedAt?: string | null;
+  isRetweet?: boolean;
+  isAd?: boolean;
   text: string;
   publishedAt: string | null;
 }
@@ -38,6 +42,7 @@ export interface SearchRequest {
   fetchImpl: typeof fetch;
   apiKey?: string;
   maxPages?: number;
+  excludeRetweets?: boolean;
 }
 
 export interface SearchResult {

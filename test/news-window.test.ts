@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { rssItemsToRecords } from "../src/sources/google-news";
 import type { SearchRequest } from "../src/domain/types";
+import { rssItemsToRecords } from "../src/sources/google-news";
 
 const request: SearchRequest = {
   targets: [{ id: "t1", kind: "keyword", name: "示例", query: "示例" }],
@@ -12,8 +12,8 @@ const request: SearchRequest = {
   fetchImpl: fetch,
 };
 
-describe("Google News 时间窗", () => {
-  it("丢掉窗口外的条目，保留窗口内的条目", () => {
+describe("Google News 解析", () => {
+  it("保留原始发布时间，缺 pubDate 时留空，由统一门槛决定去留", () => {
     const records = rssItemsToRecords([
       {
         title: "窗口内",
@@ -29,7 +29,18 @@ describe("Google News 时间窗", () => {
         description: "",
         source: "Example",
       },
+      {
+        title: "没有时间",
+        link: "https://news.example/none",
+        pubDate: "",
+        description: "",
+        source: "Example",
+      },
     ], request);
-    expect(records.map((record) => record.url)).toEqual(["https://news.example/in"]);
+    expect(records.map((record) => [record.url, record.publishedAt])).toEqual([
+      ["https://news.example/in", "2026-10-11T10:00:00.000Z"],
+      ["https://news.example/out", "2024-09-20T07:00:00.000Z"],
+      ["https://news.example/none", null],
+    ]);
   });
 });

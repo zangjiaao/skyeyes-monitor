@@ -29,6 +29,12 @@ const FIELDS = [
   ["finalize_deadline_minutes", "收尾截止分钟"],
   ["x_max_pages", "X 每个查询最多翻页"],
   ["excel_key", "R2 中的 Excel 文件名"],
+  ["min_text_length", "最短正文长度，0 表示不限制"],
+  ["min_followers", "X 最少粉丝数，0 表示不限制；没有粉丝数时不因此排除"],
+  ["min_account_age_days", "X 最少账号天数，0 表示不限制；没有注册时间时不因此排除"],
+  ["relevance_threshold", "相关度阈值 0–100，低于此分数不进 Excel/邮件，0 表示不因分数排除"],
+  ["exclude_words", "排除词，逗号或换行分隔"],
+  ["blocked_accounts", "屏蔽账号或站点域名，逗号分隔"],
 ] as const;
 
 export function SettingsPage() {
@@ -73,7 +79,10 @@ export function SettingsPage() {
       </HStack>
       <HStack gap={3}>
         <CheckboxInput label="翻译成中文" value={flag("translation_enabled")} onChange={(checked) => setValues({ ...values, translation_enabled: checked ? "1" : "0" })} />
+        <CheckboxInput label="相关度评分" value={flag("relevance_enabled")} onChange={(checked) => setValues({ ...values, relevance_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="发送每日邮件" value={flag("email_enabled")} onChange={(checked) => setValues({ ...values, email_enabled: checked ? "1" : "0" })} />
+        <CheckboxInput label="排除转推" value={flag("exclude_retweets")} onChange={(checked) => setValues({ ...values, exclude_retweets: checked ? "1" : "0" })} />
+        <CheckboxInput label="排除广告" value={flag("exclude_ads")} onChange={(checked) => setValues({ ...values, exclude_ads: checked ? "1" : "0" })} />
       </HStack>
       <Selector
         label="邮件服务"

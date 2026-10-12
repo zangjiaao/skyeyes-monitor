@@ -1,7 +1,17 @@
 import { loadSettings, type AppSettings } from "../config/settings";
 import { batchTargetsForQuery } from "../domain/batch";
 import { dedupeRecords } from "../domain/dedupe";
-import type { SourceId, TargetKind } from "../domain/types";
+import {
+  DELIVERABLE_SQL,
+  decideAdmission,
+  isRepublish,
+  normalizeTitle,
+  ruleRejectReason,
+  urlKeyFor,
+  type ExistingIdentity,
+  type FilterRules,
+} from "../domain/gate";
+import type { CollectedRecord, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
 import { sendWithCloudflare } from "../email/cloudflare";
@@ -11,6 +21,7 @@ import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
 import { errorMessage, log, logError } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
+import { scoreRelevance } from "../domain/relevance";
 import { translateToChinese } from "../translate";
 import type { CollectMessage } from "./messages";
 
@@ -71,6 +82,42 @@ async function runChunk(db: D1Database, statements: D1PreparedStatement[]): Prom
     results.push(...await db.batch(chunk));
   }
   return results;
+}
+
+function rulesFromSettings(settings: AppSettings): FilterRules {
+  return {
+    minTextLength: settings.minTextLength,
+    excludeWords: settings.excludeWords,
+    blockedAccounts: settings.blockedAccounts,
+    minFollowers: settings.minFollowers,
+    minAccountAgeDays: settings.minAccountAgeDays,
+    excludeRetweets: settings.excludeRetweets,
+    excludeAds: settings.excludeAds,
+  };
+}
+
+function likePrefix(value: string): string {
+  return `${value.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+async function findSimilar(db: D1Database, urlKey: string, titleKey: string): Promise<ExistingIdentity[]> {
+  const prefix = titleKey.slice(0, 24);
+  const rows = await db.prepare(
+    `SELECT url_key, title_key, published_at FROM records
+     WHERE url_key = ?
+        OR title_key = ?
+        OR (? <> '' AND title_key LIKE ? ESCAPE '\\')
+     LIMIT 40`,
+  ).bind(urlKey, titleKey, prefix.length >= 12 ? prefix : "", prefix.length >= 12 ? likePrefix(prefix) : "").all<{
+    url_key: string;
+    title_key: string;
+    published_at: string | null;
+  }>();
+  return rows.results.map((row) => ({
+    urlKey: row.url_key,
+    titleKey: row.title_key,
+    publishedAt: row.published_at,
+  }));
 }
 
 function isRetryable(error: unknown): boolean {
@@ -214,13 +261,44 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       fetchImpl: globalThis.fetch.bind(globalThis),
       apiKey: batch.source === "x" ? env.TWITTERAPI_IO_KEY : undefined,
       maxPages: settings.xMaxPages,
+      excludeRetweets: settings.excludeRetweets,
     });
     const unique = dedupeRecords(result.records);
     const collectedAt = new Date().toISOString();
-    const translated: Array<typeof unique[number] & { translation: string | null }> = [];
+    const window = { start: new Date(run.window_start), end: new Date(run.window_end) };
+    const rules = rulesFromSettings(settings);
+    const accepted: ExistingIdentity[] = [];
+    const kept: Array<CollectedRecord & {
+      translation: string | null;
+      relevanceScore: number | null;
+      timeStatus: string;
+      excludeReason: string | null;
+      titleKey: string;
+      urlKey: string;
+    }> = [];
     for (const record of unique) {
+      const titleKey = normalizeTitle(record.text);
+      const urlKey = urlKeyFor(record.url);
+      const ruleReason = ruleRejectReason(record, rules, new Date(collectedAt));
+      const timeOnly = decideAdmission({
+        publishedAt: record.publishedAt,
+        window,
+        ruleReason: null,
+        republish: false,
+        relevanceEnabled: false,
+        relevanceScore: null,
+        relevanceThreshold: settings.relevanceThreshold,
+      });
+      if (timeOnly.timeStatus === "out_of_window" || ruleReason) continue;
+      let republish = false;
+      if (timeOnly.timeStatus === "in_window") {
+        const existing = await findSimilar(env.DB, urlKey, titleKey);
+        republish = isRepublish({ urlKey, titleKey }, [...existing, ...accepted]);
+        if (republish) continue;
+      }
       let translation: string | null = null;
-      if (settings.translationEnabled && record.text) {
+      let relevanceScore: number | null = null;
+      if (timeOnly.timeStatus === "in_window" && settings.translationEnabled && record.text) {
         try {
           translation = await translateToChinese(
             env.AI,
@@ -232,14 +310,44 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           logError("translation failed", error, { dedupeKey: record.dedupeKey });
         }
       }
-      translated.push({ ...record, translation });
+      if (timeOnly.timeStatus === "in_window" && settings.relevanceEnabled && record.text) {
+        try {
+          relevanceScore = await scoreRelevance(env.AI, record.text, record.matchedTarget);
+        } catch (error) {
+          logError("relevance score failed", error, { dedupeKey: record.dedupeKey });
+        }
+      }
+      const admission = decideAdmission({
+        publishedAt: record.publishedAt,
+        window,
+        ruleReason,
+        republish,
+        relevanceEnabled: settings.relevanceEnabled,
+        relevanceScore,
+        relevanceThreshold: settings.relevanceThreshold,
+      });
+      if (admission.action === "drop") continue;
+      if (admission.timeStatus === "in_window") {
+        accepted.push({ urlKey, titleKey, publishedAt: record.publishedAt });
+      }
+      kept.push({
+        ...record,
+        translation,
+        relevanceScore,
+        timeStatus: admission.timeStatus,
+        excludeReason: admission.excludeReason,
+        titleKey,
+        urlKey,
+      });
     }
-    const statements: D1PreparedStatement[] = translated.map((record) => env.DB.prepare(
+    const statements: D1PreparedStatement[] = kept.map((record) => env.DB.prepare(
       `INSERT INTO records (
         id, dedupe_key, source, external_id, url, country_id, country_name,
         matched_target_id, matched_target, author_handle, author_name, author_url,
-        original_text, published_at, collected_at, translation_zh, run_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        original_text, published_at, collected_at, translation_zh, run_id,
+        title_key, url_key, time_status, relevance_score, exclude_reason, is_spam,
+        author_followers, author_created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -259,9 +367,19 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       collectedAt,
       record.translation,
       runId,
+      record.titleKey,
+      record.urlKey,
+      record.timeStatus,
+      record.relevanceScore,
+      record.excludeReason,
+      record.authorFollowers ?? null,
+      record.authorCreatedAt ?? null,
     ));
     const inserted = await runChunk(env.DB, statements);
-    const added = inserted.reduce((sum, item) => sum + (item.meta.changes ?? 0), 0);
+    const added = inserted.reduce((sum, item, index) => {
+      if (kept[index]?.excludeReason) return sum;
+      return sum + (item.meta.changes ?? 0);
+    }, 0);
     const finishedAt = new Date().toISOString();
     await env.DB.batch([
       env.DB.prepare(
@@ -317,9 +435,10 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
   let truncated = false;
   while (newestFirst.length < MAX_EXCEL_ROWS) {
     const page = await db.prepare(
-      `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
+       `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
               source, url, matched_target, collected_at, translation_zh
-       FROM records ORDER BY collected_at DESC, id DESC LIMIT ? OFFSET ?`,
+       FROM records WHERE ${DELIVERABLE_SQL}
+       ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
     ).bind(pageSize, offset).all<RecordRow>();
     if (page.results.length === 0) break;
     for (const row of page.results) {
@@ -341,7 +460,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
     offset += page.results.length;
     if (page.results.length < pageSize) break;
     if (newestFirst.length >= MAX_EXCEL_ROWS) {
-      const extra = await db.prepare("SELECT id FROM records LIMIT 1 OFFSET ?").bind(MAX_EXCEL_ROWS).first();
+      const extra = await db.prepare(`SELECT id FROM records WHERE ${DELIVERABLE_SQL} LIMIT 1 OFFSET ?`).bind(MAX_EXCEL_ROWS).first();
       truncated = Boolean(extra);
     }
   }
@@ -356,6 +475,8 @@ export async function storeExcel(env: Env, settings: AppSettings): Promise<{ byt
     records: loaded.records,
     reference: new Date(),
     timeZone: settings.timeZone,
+    scheduleHour: settings.scheduleHour,
+    windowHours: settings.windowHours,
   });
   const key = settings.excelKey || env.EXCEL_FILENAME || "skyeyes.xlsx";
   await env.EXPORTS.put(key, bytes, {
@@ -421,8 +542,10 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     if (stored.truncated) notes = [notes, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`].filter(Boolean).join(" ");
     const grouped = await env.DB.prepare(
       `SELECT country_name, source, COUNT(*) AS n
-       FROM records WHERE run_id = ? GROUP BY country_name, source`,
-    ).bind(runId).all<{ country_name: string; source: string; n: number }>();
+       FROM records
+       WHERE run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?
+       GROUP BY country_name, source`,
+    ).bind(runId, run.window_start, run.window_end).all<{ country_name: string; source: string; n: number }>();
     const byCountry = new Map<string, { added: number; bySource: Record<string, number> }>();
     for (const row of grouped.results) {
       const current = byCountry.get(row.country_name) ?? { added: 0, bySource: {} };

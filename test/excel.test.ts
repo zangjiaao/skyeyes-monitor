@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { buildMonitorWorkbook, readWorkbookSheets, type ExcelRecord } from "../src/export/excel";
 
-function record(partial: Partial<ExcelRecord> & Pick<ExcelRecord, "countryName" | "collectedAt" | "originalText">): ExcelRecord {
+function record(partial: Partial<ExcelRecord> & Pick<ExcelRecord, "countryName" | "publishedAt" | "collectedAt" | "originalText">): ExcelRecord {
   return {
-    publishedAt: partial.collectedAt,
     authorHandle: "someone",
     authorName: "某人",
     authorUrl: "https://x.com/someone",
@@ -15,64 +14,66 @@ function record(partial: Partial<ExcelRecord> & Pick<ExcelRecord, "countryName" 
   };
 }
 
+function sheetsFor(records: ExcelRecord[]) {
+  return readWorkbookSheets(buildMonitorWorkbook({
+    countries: [{ name: "示例国家甲" }, { name: "示例国家乙" }],
+    records,
+    reference: new Date("2026-10-12T04:00:00.000Z"),
+    timeZone: "Asia/Shanghai",
+    scheduleHour: 10,
+    windowHours: 24,
+  }));
+}
+
 describe("Excel", () => {
-  it("每个国家一张全量历史表，并提供今日和昨日视图", () => {
-    const reference = new Date("2026-10-12T04:00:00.000Z");
-    const bytes = buildMonitorWorkbook({
-      countries: [{ name: "示例国家甲" }, { name: "示例国家乙" }],
-      reference,
-      timeZone: "Asia/Shanghai",
-      records: [
-        record({
-          countryName: "示例国家甲",
-          collectedAt: "2026-10-02T02:00:00.000Z",
-          originalText: "十天前",
-        }),
-        record({
-          countryName: "示例国家甲",
-          collectedAt: "2026-10-12T01:00:00.000Z",
-          originalText: "今天",
-        }),
-        record({
-          countryName: "示例国家乙",
-          collectedAt: "2026-10-11T03:00:00.000Z",
-          originalText: "昨天",
-        }),
-      ],
-    });
-    const sheets = readWorkbookSheets(bytes);
+  it("今日和昨日按发布时间的 10:00 窗口划分，同时保留采集时间", () => {
+    const sheets = sheetsFor([
+      record({
+        countryName: "示例国家甲",
+        publishedAt: "2026-10-02T02:00:00.000Z",
+        collectedAt: "2026-10-12T03:00:00.000Z",
+        originalText: "十天前",
+      }),
+      record({
+        countryName: "示例国家甲",
+        publishedAt: "2026-10-11T06:00:00.000Z",
+        collectedAt: "2026-10-12T02:00:00.000Z",
+        originalText: "今天",
+      }),
+      record({
+        countryName: "示例国家乙",
+        publishedAt: "2026-10-10T06:00:00.000Z",
+        collectedAt: "2026-10-12T02:00:00.000Z",
+        originalText: "昨天",
+      }),
+    ]);
     expect(Object.keys(sheets)).toEqual(["示例国家甲", "示例国家乙", "今日", "昨日"]);
+    expect(sheets["示例国家甲"][0]).toEqual([
+      "原文", "发布时间", "作者账号", "作者显示名", "主页", "来源", "链接", "国家", "命中目标", "采集日期", "中文译文", "时段",
+    ]);
     expect(sheets["示例国家甲"].map((row) => row[0])).toEqual(["原文", "十天前", "今天"]);
+    expect(sheets["示例国家甲"].map((row) => row[1])).toEqual(["发布时间", "2026-10-02T02:00:00.000Z", "2026-10-11T06:00:00.000Z"]);
+    expect(sheets["示例国家甲"].map((row) => row[9])).toEqual(["采集日期", "2026-10-12T03:00:00.000Z", "2026-10-12T02:00:00.000Z"]);
     expect(sheets["示例国家甲"].map((row) => row[11])).toEqual(["时段", "更早", "今日"]);
-    expect(sheets["示例国家乙"]).toHaveLength(2);
     expect(sheets["今日"].map((row) => row[0])).toEqual(["原文", "今天"]);
     expect(sheets["昨日"].map((row) => row[0])).toEqual(["原文", "昨天"]);
   });
 
   it("重新生成时保留更早的历史行", () => {
-    const reference = new Date("2026-10-12T04:00:00.000Z");
     const older = record({
       countryName: "示例国家甲",
-      collectedAt: "2026-09-01T02:00:00.000Z",
+      publishedAt: "2026-09-01T02:00:00.000Z",
+      collectedAt: "2026-09-01T03:00:00.000Z",
       originalText: "历史",
     });
     const today = record({
       countryName: "示例国家甲",
-      collectedAt: "2026-10-12T01:00:00.000Z",
+      publishedAt: "2026-10-11T08:00:00.000Z",
+      collectedAt: "2026-10-12T02:00:00.000Z",
       originalText: "新增",
     });
-    const first = readWorkbookSheets(buildMonitorWorkbook({
-      countries: [{ name: "示例国家甲" }],
-      records: [older],
-      reference,
-      timeZone: "Asia/Shanghai",
-    }));
-    const second = readWorkbookSheets(buildMonitorWorkbook({
-      countries: [{ name: "示例国家甲" }],
-      records: [older, today],
-      reference,
-      timeZone: "Asia/Shanghai",
-    }));
+    const first = sheetsFor([older]);
+    const second = sheetsFor([older, today]);
     expect(first["示例国家甲"].map((row) => row[0])).toEqual(["原文", "历史"]);
     expect(second["示例国家甲"].map((row) => row[0])).toEqual(["原文", "历史", "新增"]);
     expect(second["今日"].map((row) => row[0])).toEqual(["原文", "新增"]);

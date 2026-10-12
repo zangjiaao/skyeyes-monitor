@@ -16,6 +16,11 @@ interface TweetAuthor {
   userName?: string;
   name?: string;
   url?: string;
+  followers?: number;
+  followersCount?: number;
+  followers_count?: number;
+  createdAt?: string;
+  created_at?: string;
 }
 
 interface Tweet {
@@ -25,6 +30,9 @@ interface Tweet {
   createdAt?: string;
   author?: TweetAuthor;
   retweeted_tweet?: unknown;
+  promoted?: boolean;
+  isAd?: boolean;
+  is_promoted?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -37,16 +45,22 @@ export function parseXCreatedAt(value: string | undefined): string | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
+function readFollowers(author: TweetAuthor | undefined): number | null {
+  const value = author?.followers ?? author?.followersCount ?? author?.followers_count;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function tweetsToRecords(tweets: Tweet[], request: SearchRequest): CollectedRecord[] {
   const records: CollectedRecord[] = [];
   for (const tweet of tweets) {
-    if (tweet.retweeted_tweet) continue;
     const id = tweet.id?.trim() ?? "";
     const url = tweet.url?.trim() || (id ? `https://x.com/i/status/${id}` : "");
     const text = tweet.text?.trim() ?? "";
     if (!url || !text) continue;
     const handle = tweet.author?.userName?.trim() ?? "";
     const matched = matchTarget(text, handle, request.targets);
+    const retweet = Boolean(tweet.retweeted_tweet) || /^rt\s+@/i.test(text);
     records.push({
       dedupeKey: makeDedupeKey("x", id || null, url),
       source: "x",
@@ -58,6 +72,10 @@ export function tweetsToRecords(tweets: Tweet[], request: SearchRequest): Collec
       authorHandle: handle,
       authorName: tweet.author?.name?.trim() ?? "",
       authorUrl: tweet.author?.url?.trim() || (handle ? `https://x.com/${handle}` : ""),
+      authorFollowers: readFollowers(tweet.author),
+      authorCreatedAt: parseXCreatedAt(tweet.author?.createdAt ?? tweet.author?.created_at),
+      isRetweet: retweet,
+      isAd: tweet.promoted === true || tweet.isAd === true || tweet.is_promoted === true,
       text,
       publishedAt: parseXCreatedAt(tweet.createdAt),
     });
@@ -71,7 +89,9 @@ export const xProvider: SourceProvider = {
     if (!request.apiKey) {
       throw new Error("未配置 TWITTERAPI_IO_KEY");
     }
-    const query = buildXQuery(request.targets, request.window);
+    const query = buildXQuery(request.targets, request.window, {
+      excludeRetweets: request.excludeRetweets !== false,
+    });
     if (!query) return { records: [], calls: 0 };
     const maxPages = request.maxPages ?? 5;
     const records: CollectedRecord[] = [];

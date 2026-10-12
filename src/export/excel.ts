@@ -1,5 +1,5 @@
 import * as XLSX from "xlsx";
-import { periodLabel, type PeriodLabel } from "../domain/time";
+import { publishPeriod, type PeriodLabel, type ScheduleConfig } from "../domain/time";
 
 export interface ExcelRecord {
   countryName: string;
@@ -20,6 +20,8 @@ export interface WorkbookInput {
   records: ExcelRecord[];
   reference: Date;
   timeZone: string;
+  scheduleHour: number;
+  windowHours: number;
 }
 
 const HEADERS = [
@@ -88,9 +90,13 @@ function addSheet(
 export function buildMonitorWorkbook(input: WorkbookInput): Uint8Array {
   const workbook = XLSX.utils.book_new();
   const used = new Set<string>();
+  const schedule: ScheduleConfig = {
+    timeZone: input.timeZone,
+    scheduleHour: input.scheduleHour,
+    windowHours: input.windowHours,
+  };
   const annotated = input.records.map((record) => {
-    const stamp = record.collectedAt || record.publishedAt;
-    return [record, periodLabel(stamp, input.reference, input.timeZone)] as const;
+    return [record, publishPeriod(record.publishedAt, input.reference, schedule)] as const;
   });
 
   const countryNames = [

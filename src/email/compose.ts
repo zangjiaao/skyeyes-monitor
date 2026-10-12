@@ -39,7 +39,7 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
     `SkyEyes 每日监测`,
     `时区: ${input.timeZone}`,
     `窗口: ${input.windowStart} 至 ${input.windowEnd}`,
-    `新增合计: ${total}`,
+    `窗口内实际发布且通过过滤: ${total}`,
     "",
     ...input.countries.map((country) => {
       const parts = Object.entries(country.bySource)
@@ -50,7 +50,9 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
     "",
     `失败批次: ${input.failedBatches}`,
     input.incomplete ? "本轮在截止时间前仍有批次未完成，邮件里是目前已经入库的内容。" : "本轮批次已全部结束。",
-    input.attached ? "完整历史见附件 skyeyes.xlsx。同一文件会在每次运行后覆盖更新。" : "Excel 较大，未放入附件。",
+    input.attached
+      ? "附件 skyeyes.xlsx 会覆盖更新。国家表是已通过时间校验的历史；「今日」「昨日」只按发布时间落入计划窗口的条目，不含缺时间、窗口外、旧文重发、规则过滤或低相关度的内容。"
+      : "Excel 较大，未放入附件。",
   ];
   if (input.downloadUrl) lines.push(`下载: ${input.downloadUrl}`);
   if (input.notes) lines.push("", input.notes);

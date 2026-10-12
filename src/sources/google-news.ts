@@ -14,8 +14,7 @@ export function rssItemsToRecords(
     if (!item.link || !text) return [];
     const matched = matchTarget(text, "", request.targets);
     const published = item.pubDate ? new Date(item.pubDate) : null;
-    const publishedOk = published && !Number.isNaN(published.getTime()) ? published : null;
-    if (publishedOk && (publishedOk < request.window.start || publishedOk >= request.window.end)) return [];
+    const publishedAt = published && !Number.isNaN(published.getTime()) ? published.toISOString() : null;
     return [{
       dedupeKey: makeDedupeKey("google_news", null, item.link),
       source: "google_news" as const,
@@ -28,7 +27,7 @@ export function rssItemsToRecords(
       authorName: item.source,
       authorUrl: "",
       text,
-      publishedAt: publishedOk ? publishedOk.toISOString() : null,
+      publishedAt,
     }];
   });
 }

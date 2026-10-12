@@ -54,12 +54,17 @@ export function buildCombinedQuery(targets: QueryTarget[]): string {
   return `(${clauses.join(" OR ")})`;
 }
 
-export function buildXQuery(targets: QueryTarget[], window: TimeWindow): string {
+export function buildXQuery(
+  targets: QueryTarget[],
+  window: TimeWindow,
+  options?: { excludeRetweets?: boolean },
+): string {
   const combined = buildCombinedQuery(targets);
   if (!combined) return "";
   const since = Math.floor(window.start.getTime() / 1000);
   const until = Math.floor(window.end.getTime() / 1000);
-  return `${combined} since_time:${since} until_time:${until} -is:retweet`;
+  const retweet = options?.excludeRetweets === false ? "" : " -is:retweet";
+  return `${combined} since_time:${since} until_time:${until}${retweet}`;
 }
 
 export function buildNewsQuery(targets: QueryTarget[], window: TimeWindow): string {

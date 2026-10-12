@@ -13,10 +13,15 @@ interface RecordRow extends Record<string, unknown> {
   country_name: string;
   matched_target: string;
   author_name: string;
+  author_handle: string;
   original_text: string;
   translation_zh: string | null;
   url: string;
+  published_at: string | null;
   collected_at: string;
+  relevance_score: number | null;
+  exclude_reason: string | null;
+  is_spam: number;
 }
 
 export function DataPage() {
@@ -45,7 +50,7 @@ export function DataPage() {
       <VStack gap={1}>
         <Heading level={1}>数据</Heading>
         <Text type="body" color="secondary">
-          {`Excel 固定为 skyeyes.xlsx，每次运行都会用数据库里的全部历史覆盖这一份文件。当前筛选共 ${total} 条。`}
+          {`今日和昨日按发布时间的计划窗口筛选，只含可进入日报的条目。全部视图含时间不明和低相关度记录，供核对。当前筛选共 ${total} 条。`}
         </Text>
       </VStack>
       {error ? <Banner status="error" title="操作失败" description={error} /> : null}
@@ -108,13 +113,47 @@ export function DataPage() {
         textOverflow="truncate"
         data={records}
         columns={[
+          { key: "published_at", header: "发布", renderCell: (row) => formatTime(row.published_at) },
           { key: "collected_at", header: "采集", renderCell: (row) => formatTime(row.collected_at) },
           { key: "country_name", header: "国家" },
           { key: "source", header: "来源" },
           { key: "matched_target", header: "目标" },
           { key: "author_name", header: "作者" },
+          { key: "relevance_score", header: "相关度", renderCell: (row) => row.relevance_score ?? "—" },
+          { key: "exclude_reason", header: "排除", renderCell: (row) => row.exclude_reason || (row.is_spam ? "spam" : "—") },
           { key: "original_text", header: "原文" },
           { key: "translation_zh", header: "中文", renderCell: (row) => row.translation_zh || "—" },
+          {
+            key: "actions",
+            header: "审核",
+            renderCell: (row) => (
+              <HStack gap={1}>
+                <Button
+                  label="标为垃圾"
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => {
+                    api(`/api/records/${row.id}/spam`, { method: "POST", body: JSON.stringify({ blockAuthor: false }) })
+                      .then(() => load())
+                      .catch((reason: Error) => setError(reason.message));
+                  }}
+                />
+                <Button
+                  label="屏蔽作者"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    api(`/api/records/${row.id}/spam`, { method: "POST", body: JSON.stringify({ blockAuthor: true }) })
+                      .then(() => {
+                        setNotice("已标为垃圾，并加入屏蔽名单");
+                        return load();
+                      })
+                      .catch((reason: Error) => setError(reason.message));
+                  }}
+                />
+              </HStack>
+            ),
+          },
           {
             key: "url",
             header: "链接",
