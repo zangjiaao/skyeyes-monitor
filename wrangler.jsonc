@@ -1,0 +1,102 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "skyeyes-monitor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "triggers": {
+    "crons": [
+      "0 2 * * *",
+      "0 3 * * *"
+    ]
+  },
+  "vars": {
+    "X_PROVIDER": "twitterapi_io",
+    "WEB_PROVIDER": "both",
+    "EMAIL_PROVIDER": "cloudflare",
+    "EMAIL_FROM": "",
+    "PUBLIC_BASE_URL": "",
+    "TRANSLATION_MODEL": "@cf/meta/m2m100-1.2b",
+    "TRANSLATION_FALLBACK_MODEL": "",
+    "EXCEL_OBJECT_KEY": "skyeyes.xlsx",
+    "BATCH_MAX_TERMS": "12",
+    "BATCH_MAX_QUERY_CHARS": "400",
+    "MAX_SEARCH_PAGES": "5",
+    "MAX_WEB_RESULTS": "50",
+    "X_QUERY_SUFFIX": "-filter:replies",
+    "X_MAX_QUERY_CHARS": "900",
+    "NEWS_HL": "en-US",
+    "NEWS_GL": "US",
+    "NEWS_CEID": "US:en",
+    "DOWNLOAD_TTL_SECONDS": "604800",
+    "FINALIZE_DELAY_SECONDS": "3600",
+    "DEADLINE_MIN_AGE_SECONDS": "3000",
+    "FINALIZE_LEASE_SECONDS": "180",
+    "MAX_TRANSLATIONS_PER_BATCH": "25",
+    "MAX_TRANSLATIONS_ON_FINALIZE": "80",
+    "MAX_EXCEL_ROWS": "20000"
+  },
+  "secrets": {
+    "required": ["ADMIN_TOKEN", "TWITTERAPI_IO_KEY", "RESEND_API_KEY"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "skyeyes-monitor",
+      // 换成 `npx wrangler d1 create skyeyes-monitor` 打印的 UUID。资源 ID 不是密钥，可以提交。
+      "database_id": "00000000-0000-4000-8000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "EXPORTS",
+      "bucket_name": "skyeyes-exports"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "COLLECT_QUEUE",
+        "queue": "skyeyes-collect"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "skyeyes-collect",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "max_concurrency": 1,
+        "retry_delay": 60,
+        "dead_letter_queue": "skyeyes-collect-dlq"
+      },
+      {
+        "queue": "skyeyes-collect-dlq",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 1,
+        "max_concurrency": 1
+      }
+    ]
+  }
+}
