@@ -1,0 +1,92 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "skyeyes-monitor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "assets": {
+    "directory": "./admin/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "EXCEL_FILENAME": "skyeyes.xlsx"
+  },
+  // 密钥只通过 wrangler secret put 注入，禁止把真实值写进本文件。
+  "secrets": {
+    "required": ["TWITTERAPI_IO_KEY", "RESEND_API_KEY", "TEAM_DOMAIN", "POLICY_AUD"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "skyeyes-monitor",
+      // 创建 D1 后，把 wrangler d1 create 输出的 UUID 填到这里。
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "EXPORTS",
+      "bucket_name": "skyeyes-monitor"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "COLLECT_QUEUE",
+        "queue": "skyeyes-collect"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "skyeyes-collect",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 5,
+        "max_concurrency": 2,
+        "retry_delay": 45,
+        "dead_letter_queue": "skyeyes-collect-dlq"
+      },
+      {
+        "queue": "skyeyes-collect-dlq",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 1
+      }
+    ]
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL"
+    }
+  ],
+  // 仅 wrangler dev 生效，不会用在线上。线上必须校验 Access JWT。
+  "access": {
+    "dev": {
+      "aud": "skyeyes-local",
+      "identity": {
+        "email": "dev@example.com"
+      }
+    }
+  }
+}

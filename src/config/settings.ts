@@ -1,0 +1,162 @@
+import type { SourceId } from "../domain/types";
+
+export const SETTING_DEFAULTS: Record<string, string> = {
+  schedule_hour: "10",
+  window_hours: "24",
+  batch_size: "12",
+  timezone: "Asia/Shanghai",
+  translation_enabled: "1",
+  translation_source_lang: "en",
+  translation_target_lang: "zh",
+  email_enabled: "0",
+  email_provider: "resend",
+  email_from: "",
+  email_from_name: "SkyEyes",
+  x_enabled: "1",
+  google_news_enabled: "1",
+  gdelt_enabled: "0",
+  excel_key: "skyeyes.xlsx",
+  allowed_admin_emails: "",
+  app_base_url: "",
+  finalize_deadline_minutes: "60",
+  x_max_pages: "5",
+};
+
+export const EDITABLE_SETTINGS = Object.keys(SETTING_DEFAULTS);
+
+export interface AppSettings {
+  scheduleHour: number;
+  windowHours: number;
+  batchSize: number;
+  timeZone: string;
+  translationEnabled: boolean;
+  translationSourceLang: string;
+  translationTargetLang: string;
+  emailEnabled: boolean;
+  emailProvider: "resend" | "cloudflare";
+  emailFrom: string;
+  emailFromName: string;
+  sources: Record<SourceId, boolean>;
+  excelKey: string;
+  allowedAdminEmails: string[];
+  appBaseUrl: string;
+  finalizeDeadlineMinutes: number;
+  xMaxPages: number;
+}
+
+function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+function flag(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value === "") return fallback;
+  return value === "1" || value === "true";
+}
+
+function parseEmails(value: string | undefined): string[] {
+  if (!value) return [];
+  const seen = new Set<string>();
+  for (const part of value.split(/[\s,;]+/)) {
+    const email = part.trim().toLowerCase();
+    if (email) seen.add(email);
+  }
+  return [...seen];
+}
+
+export function isValidTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function parseSettings(raw: Record<string, string>): AppSettings {
+  const merged = { ...SETTING_DEFAULTS, ...raw };
+  const timeZone = isValidTimeZone(merged.timezone) ? merged.timezone : "Asia/Shanghai";
+  const provider = merged.email_provider === "cloudflare" ? "cloudflare" : "resend";
+  return {
+    scheduleHour: clampInt(merged.schedule_hour, 10, 0, 23),
+    windowHours: clampInt(merged.window_hours, 24, 1, 168),
+    batchSize: clampInt(merged.batch_size, 12, 1, 40),
+    timeZone,
+    translationEnabled: flag(merged.translation_enabled, true),
+    translationSourceLang: merged.translation_source_lang || "en",
+    translationTargetLang: merged.translation_target_lang || "zh",
+    emailEnabled: flag(merged.email_enabled, false),
+    emailProvider: provider,
+    emailFrom: merged.email_from.trim(),
+    emailFromName: merged.email_from_name.trim() || "SkyEyes",
+    sources: {
+      x: flag(merged.x_enabled, true),
+      google_news: flag(merged.google_news_enabled, true),
+      gdelt: flag(merged.gdelt_enabled, false),
+    },
+    excelKey: merged.excel_key.trim() || "skyeyes.xlsx",
+    allowedAdminEmails: parseEmails(merged.allowed_admin_emails),
+    appBaseUrl: merged.app_base_url.replace(/\/$/, ""),
+    finalizeDeadlineMinutes: clampInt(merged.finalize_deadline_minutes, 60, 15, 180),
+    xMaxPages: clampInt(merged.x_max_pages, 5, 1, 10),
+  };
+}
+
+export function validateSettingsPatch(patch: Record<string, unknown>): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (!EDITABLE_SETTINGS.includes(key)) {
+      throw new Error(`未知配置项 ${key}`);
+    }
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+      throw new Error(`配置项 ${key} 类型不正确`);
+    }
+    next[key] = typeof value === "boolean" ? (value ? "1" : "0") : String(value).trim();
+  }
+  if (next.timezone && !isValidTimeZone(next.timezone)) {
+    throw new Error("时区无效");
+  }
+  if (next.email_provider && next.email_provider !== "resend" && next.email_provider !== "cloudflare") {
+    throw new Error("邮件服务只能是 resend 或 cloudflare");
+  }
+  if (next.schedule_hour) {
+    const hour = Number(next.schedule_hour);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error("运行小时必须是 0 到 23");
+  }
+  if (next.window_hours) {
+    const hours = Number(next.window_hours);
+    if (!Number.isFinite(hours) || hours < 1 || hours > 168) throw new Error("时间窗口必须是 1 到 168 小时");
+  }
+  if (next.batch_size) {
+    const size = Number(next.batch_size);
+    if (!Number.isInteger(size) || size < 1 || size > 40) throw new Error("批次大小必须是 1 到 40");
+  }
+  if (next.email_from && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.email_from)) {
+    throw new Error("发件人邮箱格式不正确");
+  }
+  if (next.allowed_admin_emails) {
+    for (const email of parseEmails(next.allowed_admin_emails)) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error(`管理员邮箱格式不正确: ${email}`);
+    }
+    next.allowed_admin_emails = parseEmails(next.allowed_admin_emails).join(",");
+  }
+  return next;
+}
+
+export async function loadSettings(db: D1Database): Promise<AppSettings> {
+  const rows = await db.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
+  const raw: Record<string, string> = {};
+  for (const row of rows.results) raw[row.key] = row.value;
+  return parseSettings(raw);
+}
+
+export async function saveSettings(db: D1Database, patch: Record<string, string>): Promise<AppSettings> {
+  const statements = Object.entries(patch).map(([key, value]) =>
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).bind(key, value),
+  );
+  if (statements.length > 0) await db.batch(statements);
+  return loadSettings(db);
+}
