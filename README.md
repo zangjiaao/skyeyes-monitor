@@ -71,7 +71,7 @@ npx wrangler queues create skyeyes-collect-dlq
 
 `wrangler dev` 的队列在进程内存里。重启后消息会丢，D1 里这些批次仍可能是 `queued` 且 `enqueued_at` 已填，或停在 `running`。状态页的「恢复卡住的批次」会把它们收回来。线上队列不会因为重启 Worker 而丢消息，但恢复同样能接手租约过期的批次。
 
-Cloudflare Queues 的 `sendBatch` 一次最多 **100 条**，请求体最多 **256KB**。采集入队会按这个上限拆开，失败的分片会隔 0.2 秒、0.5 秒、1 秒重试。一次运行如果有成百上千个批次，当前请求只发送第一页，再丢一条很小的后续消息去发送下一页，避免单次请求把 Worker 的子请求打满。唤醒消息不再按批次序号各延迟最多 15 分钟。X 的节奏只由 D1 里的 `x_qps` 时间槽决定：槽位还要等超过 2 秒时，这条消息稍后重试，不占着消费者。Google News 和 GDELT 不走这个槽，可以和 X 并行。`wrangler.jsonc` 里消费者 `max_concurrency` 是 8。配置项 `queue_concurrency` 默认 4，范围 1–8，限制同时处于 `running` 的批次数。
+Cloudflare Queues 的 `sendBatch` 一次最多 **100 条**，请求体最多 **256KB**。采集入队会按这个上限拆开，失败的分片会隔 0.2 秒、0.5 秒、1 秒重试。一次运行如果有成百上千个批次，当前请求只发送第一页，再丢一条很小的后续消息去发送下一页，避免单次请求把 Worker 的子请求打满。唤醒消息不再按批次序号各延迟最多 15 分钟。X 的节奏只由 D1 里的 `x_qps` 时间槽决定：槽位还要等超过 2 秒时，这条消息稍后重试，不占着消费者。Google News 和 GDELT 不走这个槽，可以和 X 并行。`wrangler.jsonc` 里消费者 `max_concurrency` 是 8。如果本地 `wrangler.local.jsonc` 仍把它留在 1，`wrangler dev` 会一次只跑一个批次，改成 8 才和线上一致。配置项 `queue_concurrency` 默认 4，范围 1–8，限制同时处于 `running` 的批次数。
 
 每个批次有 `enqueued_at`：写入队列成功才填上。领取时写入 `lease_token` 和 `lease_expires_at`（10 分钟）。开始采集时 `attempts` 加一；因为 X 时间槽或并发上限而稍后重试时，这次不计入重试次数。某一页入队失败时，只有这一页标为失败，运行记成「部分失败」或「失败」，说明是「未入队：…」。迁移是 `0011_batch_enqueue.sql` 和 `0014_batch_lease.sql`。
 
