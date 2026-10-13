@@ -1,6 +1,6 @@
 export const MAX_BULK_DELETE = 100;
 
-export function parseDeleteIds(value: unknown): string[] {
+export function parseDeleteIds(value: unknown, action = "删除"): string[] {
   if (!Array.isArray(value)) throw new Error("ids 必须是数组");
   const unique: string[] = [];
   const seen = new Set<string>();
@@ -12,7 +12,7 @@ export function parseDeleteIds(value: unknown): string[] {
     seen.add(id);
     unique.push(id);
   }
-  if (unique.length === 0) throw new Error("请选择要删除的记录");
+  if (unique.length === 0) throw new Error(`请选择要${action}的记录`);
   if (unique.length > MAX_BULK_DELETE) throw new Error(`一次最多删除 ${MAX_BULK_DELETE} 条`);
   return unique;
 }

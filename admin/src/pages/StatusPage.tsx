@@ -23,6 +23,7 @@ interface RunRow extends Record<string, unknown> {
   started_at: string;
   records_added: number;
   batches_failed: number;
+  relevance_failed: number;
   email_status: string | null;
 }
 
@@ -135,6 +136,7 @@ export function StatusPage() {
           { key: "status", header: "状态" },
           { key: "records_added", header: "新增" },
           { key: "batches_failed", header: "失败批次" },
+          { key: "relevance_failed", header: "评分失败", renderCell: (row) => row.relevance_failed ?? 0 },
           { key: "email_status", header: "邮件", renderCell: (row) => row.email_status || "—" },
         ]}
       />

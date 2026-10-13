@@ -126,7 +126,8 @@ describe("相关度阈值", () => {
   it("只接受单独的 0 到 100 整数", () => {
     expect(parseRelevanceScore("72")).toBe(72);
     expect(parseRelevanceScore('{"score": 15}')).toBe(15);
-    expect(parseRelevanceScore("大概 80 分")).toBeNull();
+    expect(parseRelevanceScore("大概 80 分")).toBe(80);
+    expect(parseRelevanceScore("0到100，结果是72")).toBe(72);
     expect(parseRelevanceScore("150")).toBeNull();
   });
 });

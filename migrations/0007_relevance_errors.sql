@@ -1,0 +1,2 @@
+ALTER TABLE records ADD COLUMN relevance_error TEXT;
+ALTER TABLE runs ADD COLUMN relevance_failed INTEGER NOT NULL DEFAULT 0;

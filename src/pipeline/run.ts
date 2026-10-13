@@ -292,9 +292,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const window = { start: new Date(run.window_start), end: new Date(run.window_end) };
     const rules = rulesFromSettings(settings);
     const accepted: ExistingIdentity[] = [];
+    let relevanceFailures = 0;
     const kept: Array<CollectedRecord & {
       translation: string | null;
       relevanceScore: number | null;
+      relevanceError: string | null;
       timeStatus: string;
       excludeReason: string | null;
       titleKey: string;
@@ -327,6 +329,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       }
       let translation: string | null = null;
       let relevanceScore: number | null = null;
+      let relevanceError: string | null = null;
       if (timeOnly.timeStatus === "in_window" && settings.translationEnabled && record.text) {
         try {
           translation = await translateToChinese(
@@ -340,10 +343,12 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         }
       }
       if (timeOnly.timeStatus === "in_window" && settings.relevanceEnabled && record.text) {
-        try {
-          relevanceScore = await scoreRelevance(env.AI, record.text, record.matchedTarget);
-        } catch (error) {
-          logError("relevance score failed", error, { dedupeKey: record.dedupeKey });
+        const outcome = await scoreRelevance(env.AI, record.text, record.matchedTarget);
+        relevanceScore = outcome.score;
+        relevanceError = outcome.error;
+        if (outcome.error) {
+          relevanceFailures += 1;
+          logError("relevance score failed", new Error(outcome.error), { dedupeKey: record.dedupeKey });
         }
       }
       const admission = decideAdmission({
@@ -363,6 +368,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         ...record,
         translation,
         relevanceScore,
+        relevanceError,
         timeStatus: admission.timeStatus,
         excludeReason: admission.excludeReason,
         titleKey,
@@ -378,9 +384,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         id, dedupe_key, source, external_id, url, country_id, country_name,
         matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
         original_text, published_at, collected_at, translation_zh, run_id,
-        title_key, url_key, time_status, relevance_score, exclude_reason, is_spam,
+        title_key, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -405,6 +411,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       record.urlKey,
       record.timeStatus,
       record.relevanceScore,
+      record.relevanceError,
       record.excludeReason,
       record.authorFollowers ?? null,
       record.authorCreatedAt ?? null,
@@ -420,13 +427,22 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         `UPDATE batches SET status = 'done', items_found = ?, calls = ?, finished_at = ?, error = NULL WHERE id = ?`,
       ).bind(unique.length, result.calls, finishedAt, batchId),
       env.DB.prepare(
-        "UPDATE runs SET records_added = records_added + ?, batches_done = batches_done + 1 WHERE id = ?",
-      ).bind(added, runId),
+        `UPDATE runs SET records_added = records_added + ?, batches_done = batches_done + 1,
+           relevance_failed = relevance_failed + ? WHERE id = ?`,
+      ).bind(added, relevanceFailures, runId),
       env.DB.prepare(
         "INSERT INTO api_usage (id, run_id, source, calls, items, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
       ).bind(crypto.randomUUID(), runId, batch.source, result.calls, unique.length, finishedAt),
     ]);
-    log("batch done", { runId, batchId, source: batch.source, items: unique.length, added, filtered });
+    log("batch done", {
+      runId,
+      batchId,
+      source: batch.source,
+      items: unique.length,
+      added,
+      filtered,
+      relevanceFailed: relevanceFailures,
+    });
     await maybeEnqueueFinalize(env, runId);
   } catch (error) {
     if (isRetryable(error)) {

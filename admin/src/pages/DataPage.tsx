@@ -22,6 +22,7 @@ interface RecordRow extends Record<string, unknown> {
   published_at: string | null;
   collected_at: string;
   relevance_score: number | null;
+  relevance_error: string | null;
   exclude_reason: string | null;
   is_spam: number;
 }
@@ -35,6 +36,8 @@ export function DataPage() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [pendingIds, setPendingIds] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
+  const [scoreMode, setScoreMode] = useState<"" | "selected" | "unscored">("");
+  const [scoring, setScoring] = useState(false);
   const { selectionConfig } = useTableSelectionState({
     data: records,
     idKey: "id",
@@ -56,6 +59,46 @@ export function DataPage() {
     // view 变化时重新拉取。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
+
+  async function runScore() {
+    const mode = scoreMode;
+    if (!mode) return;
+    setScoring(true);
+    setError("");
+    let scored = 0;
+    let failed = 0;
+    try {
+      if (mode === "selected") {
+        const ids = [...selectedKeys];
+        for (let index = 0; index < ids.length; index += 20) {
+          const result = await api<{ scored: number; failed: number }>("/api/records/rescore", {
+            method: "POST",
+            body: JSON.stringify({ mode: "selected", ids: ids.slice(index, index + 20) }),
+          });
+          scored += result.scored;
+          failed += result.failed;
+        }
+      } else {
+        for (let round = 0; round < 15; round += 1) {
+          const result = await api<{ scored: number; failed: number; attempted: number; remaining: number }>(
+            "/api/records/rescore",
+            { method: "POST", body: JSON.stringify({ mode: "unscored" }) },
+          );
+          scored += result.scored;
+          failed += result.failed;
+          if (result.attempted === 0 || result.remaining === 0) break;
+        }
+      }
+      setScoreMode("");
+      setSelectedKeys(new Set());
+      setNotice(failed > 0 ? `已评分 ${scored} 条，${failed} 条失败` : `已评分 ${scored} 条`);
+      await load();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "评分失败");
+    } finally {
+      setScoring(false);
+    }
+  }
 
   return (
     <VStack gap={4}>
@@ -101,6 +144,18 @@ export function DataPage() {
           }}
         />
         <Button
+          label={selectedKeys.size > 0 ? `为所选评分 ${selectedKeys.size} 条` : "为所选评分"}
+          variant="secondary"
+          isDisabled={selectedKeys.size === 0 || scoring || deleting}
+          onClick={() => setScoreMode("selected")}
+        />
+        <Button
+          label="为未评分记录打分"
+          variant="secondary"
+          isDisabled={scoring || deleting}
+          onClick={() => setScoreMode("unscored")}
+        />
+        <Button
           label={selectedKeys.size > 0 ? `删除所选 ${selectedKeys.size} 条` : "删除所选"}
           variant="destructive"
           isDisabled={selectedKeys.size === 0 || deleting}
@@ -142,7 +197,11 @@ export function DataPage() {
           { key: "matched_target", header: "目标" },
           { key: "matched_term", header: "检索词", renderCell: (row) => row.matched_term || "—" },
           { key: "author_name", header: "作者" },
-          { key: "relevance_score", header: "相关度", renderCell: (row) => row.relevance_score ?? "—" },
+          {
+            key: "relevance_score",
+            header: "相关度",
+            renderCell: (row) => row.relevance_score ?? row.relevance_error ?? "—",
+          },
           { key: "exclude_reason", header: "排除", renderCell: (row) => row.exclude_reason || (row.is_spam ? "spam" : "—") },
           { key: "original_text", header: "原文" },
           { key: "translation_zh", header: "中文", renderCell: (row) => row.translation_zh || "—" },
@@ -190,6 +249,44 @@ export function DataPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={scoreMode !== ""}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !scoring) setScoreMode("");
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={scoreMode === "selected" ? `为所选 ${selectedKeys.size} 条评分` : "为未评分记录打分"}
+            onOpenChange={(open) => {
+              if (!open && !scoring) setScoreMode("");
+            }}
+          />
+          <Text type="body">
+            {scoreMode === "selected"
+              ? "会重新调用模型给这些记录打分，并覆盖原来的分数或失败原因。每次 20 条，多出来的会接着评。"
+              : "只给还没有分数、也没有失败原因的记录打分，每次 20 条。已经失败的记录请勾选后再评。"}
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="开始评分"
+              variant="primary"
+              isLoading={scoring}
+              onClick={() => {
+                void runScore();
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={scoring}
+              onClick={() => setScoreMode("")}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
       <Dialog
         isOpen={pendingIds.length > 0}
         purpose="form"
