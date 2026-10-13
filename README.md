@@ -216,13 +216,15 @@ npx wrangler d1 migrations apply skyeyes-monitor --local
 npm run dev
 ```
 
-另一个终端：
+`npm run dev` 会先构建管理后台到 `admin/dist`，再启动 Wrangler。这个目录被 git 忽略，全新克隆里本来没有它；Wrangler 要求 `assets.directory` 指向的目录已经存在，所以不能跳过这一步直接执行 `wrangler dev`。构建完成后，后台和接口都在 `http://127.0.0.1:8787`。
+
+改界面时可以另开一个终端，用 Vite 热更新，不必每次改完都重新构建：
 
 ```bash
 npm run dev:admin
 ```
 
-后台开发服务器在 `http://127.0.0.1:5173`，并把 `/api` 代理到 `wrangler dev`（默认 `http://127.0.0.1:8787`）。`.dev.vars` 已被 git 忽略。
+这个地址是 `http://127.0.0.1:5173`，并把 `/api` 代理到本机的 Wrangler。`.dev.vars` 已被 git 忽略。
 
 Workers AI 没有本地模拟器。配置里保留了 `ai` 绑定之后，`wrangler dev` 会要求先执行 `npx wrangler login`，否则启动会停在 OAuth，接口也不会响应。登录只影响本机调用真实翻译模型。发信绑定在本地是模拟的，不会真的把邮件发出去。
 

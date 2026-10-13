@@ -5,7 +5,7 @@
   "description": "Daily X and web monitor on Cloudflare Workers",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "npm run build && wrangler dev",
     "dev:admin": "vite --config admin/vite.config.ts",
     "build": "vite build --config admin/vite.config.ts",
     "typecheck": "wrangler types && tsc -p tsconfig.json --noEmit && tsc -p admin/tsconfig.json --noEmit",
