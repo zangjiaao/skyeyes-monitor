@@ -7,7 +7,7 @@ import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table, useTableSelection, useTableSelectionState } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
-import { api, formatTime } from "../api";
+import { api, formatTime, timeHeader } from "../api";
 
 interface RecordRow extends Record<string, unknown> {
   id: string;
@@ -45,6 +45,8 @@ interface ListPayload {
   total: number;
   page: number;
   pageSize: number;
+  timeZone: string;
+  utcOffset: string;
 }
 
 const PAGE_SIZES = ["20", "50", "100"];
@@ -70,6 +72,8 @@ export function DataPage() {
   const [countries, setCountries] = useState<NamedOption[]>([]);
   const [targets, setTargets] = useState<NamedOption[]>([]);
   const [records, setRecords] = useState<RecordRow[]>([]);
+  const [timeZone, setTimeZone] = useState("");
+  const [utcOffset, setUtcOffset] = useState("");
   const [total, setTotal] = useState(0);
   const [reloadToken, setReloadToken] = useState(0);
   const [error, setError] = useState("");
@@ -165,6 +169,8 @@ export function DataPage() {
           return;
         }
         setRecords(payload.records);
+        setTimeZone(payload.timeZone);
+        setUtcOffset(payload.utcOffset);
         setTotal(payload.total);
         setJump(String(payload.page));
       })
@@ -562,8 +568,8 @@ export function DataPage() {
         data={records}
         plugins={{ selection }}
         columns={[
-          { key: "published_at", header: "发布", renderCell: (row) => formatTime(row.published_at) },
-          { key: "collected_at", header: "采集", renderCell: (row) => formatTime(row.collected_at) },
+          { key: "published_at", header: timeHeader("发布时间", timeZone, utcOffset), renderCell: (row) => formatTime(row.published_at, timeZone) },
+          { key: "collected_at", header: timeHeader("采集时间", timeZone, utcOffset), renderCell: (row) => formatTime(row.collected_at, timeZone) },
           { key: "country_name", header: "国家" },
           {
             key: "source",

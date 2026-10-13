@@ -190,15 +190,35 @@ export function periodLabel(iso: string, reference: Date, timeZone: string): Per
 }
 
 export function formatInZone(date: Date, timeZone: string): string {
-  return new Intl.DateTimeFormat("sv-SE", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).format(date).replace(" ", " ");
+  const parts = getZonedParts(date, timeZone);
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)} ${pad(parts.hour)}:${pad(parts.minute)}`;
+}
+
+export function utcOffsetLabel(date: Date, timeZone: string): string {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" })
+    .formatToParts(date)
+    .find((part) => part.type === "timeZoneName")?.value ?? "GMT";
+  const normalized = name.replace("\u2212", "-").replace(/\u00a0/g, "").trim();
+  const match = normalized.match(/^GMT(?:([+-])(\d{1,2})(?::(\d{2}))?)?$/);
+  if (!match) return normalized.replace(/^GMT/, "UTC");
+  if (!match[1]) return "UTC";
+  const hours = Number(match[2]);
+  const minutes = match[3] ? Number(match[3]) : 0;
+  if (hours === 0 && minutes === 0) return "UTC";
+  const minuteText = minutes === 0 ? "" : `:${pad(minutes)}`;
+  return `UTC${match[1]}${hours}${minuteText}`;
+}
+
+export function timeColumnLabel(title: string, timeZone: string, date: Date): string {
+  return `${title}（${timeZone}, ${utcOffsetLabel(date, timeZone)}）`;
+}
+
+export function zonedWallClock(iso: string, timeZone: string): Date | null {
+  if (!iso) return null;
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const parts = getZonedParts(parsed, timeZone);
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second));
 }
 
 export function formatDayUtc(date: Date): string {

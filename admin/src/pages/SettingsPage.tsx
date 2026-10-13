@@ -16,7 +16,7 @@ interface Recipient extends Record<string, unknown> {
 }
 
 const FIELDS = [
-  ["schedule_hour", "每天运行小时（上海时间，整点）"],
+  ["schedule_hour", "每天运行小时（配置时区的整点）"],
   ["window_hours", "采集窗口小时数"],
   ["batch_size", "保留项。每个目标已经单独查询，不再把多个目标合成一条搜索"],
   ["timezone", "时区"],
@@ -124,8 +124,14 @@ export function SettingsPage() {
         variant="primary"
         onClick={() => {
           setError("");
-          api("/api/settings", { method: "PUT", body: JSON.stringify(values) })
-            .then(() => setNotice("已保存"))
+          api<{ excel?: boolean; excelError?: string | null }>("/api/settings", { method: "PUT", body: JSON.stringify(values) })
+            .then((result) => {
+              if (result.excelError) {
+                setError(`已保存，但 Excel 未重写：${result.excelError}`);
+                return;
+              }
+              setNotice(result.excel ? "已保存，并按新时区重新生成 Excel" : "已保存");
+            })
             .catch((reason: Error) => setError(reason.message));
         }}
       />

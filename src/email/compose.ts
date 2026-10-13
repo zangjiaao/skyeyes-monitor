@@ -1,3 +1,5 @@
+import { calendarKey, formatInZone, utcOffsetLabel } from "../domain/time";
+
 export interface DigestCountry {
   name: string;
   added: number;
@@ -30,16 +32,26 @@ const SOURCE_LABEL: Record<string, string> = {
   gdelt: "GDELT",
 };
 
+function formatWindowInstant(iso: string, timeZone: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return formatInZone(date, timeZone);
+}
+
 export function buildDigest(input: DigestInput): { subject: string; text: string; html: string } {
   const total = input.countries.reduce((sum, country) => sum + country.added, 0);
-  const day = input.windowEnd.slice(0, 10);
+  const end = new Date(input.windowEnd);
+  const day = Number.isNaN(end.getTime()) ? input.windowEnd.slice(0, 10) : calendarKey(end, input.timeZone);
+  const zoneLabel = Number.isNaN(end.getTime())
+    ? input.timeZone
+    : `${input.timeZone}, ${utcOffsetLabel(end, input.timeZone)}`;
   const subject = input.incomplete
     ? `SkyEyes 每日监测 ${day}（部分批次未完成）`
     : `SkyEyes 每日监测 ${day}`;
   const lines = [
     `SkyEyes 每日监测`,
     `时区: ${input.timeZone}`,
-    `窗口: ${input.windowStart} 至 ${input.windowEnd}`,
+    `窗口: ${formatWindowInstant(input.windowStart, input.timeZone)} 至 ${formatWindowInstant(input.windowEnd, input.timeZone)}（${zoneLabel}）`,
     `窗口内实际发布且通过过滤: ${total}`,
     "",
     ...input.countries.map((country) => {

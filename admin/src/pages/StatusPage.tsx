@@ -5,7 +5,7 @@ import { Heading, Text } from "@astryxdesign/core/Text";
 import { Table } from "@astryxdesign/core/Table";
 import { VStack, HStack } from "@astryxdesign/core/Layout";
 import { Banner } from "@astryxdesign/core/Banner";
-import { api, formatTime } from "../api";
+import { api, formatTime, timeHeader } from "../api";
 
 const RUN_STATUS: Record<string, string> = {
   running: "进行中",
@@ -53,6 +53,7 @@ interface StatusPayload {
   windowHours: number;
   batchSize: number;
   timezone: string;
+  utcOffset: string;
   countries: CountryCount[];
   runs: RunRow[];
   stuckBatches: number;
@@ -134,7 +135,7 @@ export function StatusPage() {
       <VStack gap={1}>
         <Heading level={1}>系统状态</Heading>
         <Text type="body" color="secondary">
-          {`每天 ${data.scheduleHour}:00（${data.timezone}）采集前 ${data.windowHours} 小时。下次运行 ${formatTime(data.nextRun)}。批次大小 ${data.batchSize}。`}
+          {`每天 ${data.scheduleHour}:00（${data.timezone}, ${data.utcOffset}）采集前 ${data.windowHours} 小时。下次运行 ${formatTime(data.nextRun, data.timezone)}。批次大小 ${data.batchSize}。`}
         </Text>
       </VStack>
       <HStack gap={2}>
@@ -188,7 +189,7 @@ export function StatusPage() {
         textOverflow="truncate"
         data={data.runs}
         columns={[
-          { key: "started_at", header: "开始", renderCell: (row) => formatTime(row.started_at) },
+          { key: "started_at", header: timeHeader("开始", data.timezone, data.utcOffset), renderCell: (row) => formatTime(row.started_at, data.timezone) },
           { key: "trigger", header: "触发" },
           { key: "status", header: "状态", renderCell: (row) => RUN_STATUS[row.status] ?? row.status },
           { key: "records_added", header: "新增" },
@@ -225,14 +226,14 @@ export function StatusPage() {
       />
       <Heading level={2}>X 限流</Heading>
       <Text type="body" color="secondary">
-        {`当前每秒 ${data.rateLimit.xQps} 次。近 24 小时 ${data.rateLimit.hits24h} 次，近 7 日 ${data.rateLimit.hits7d} 次。最近一次 ${formatTime(data.rateLimit.lastHitAt)}，Retry-After ${data.rateLimit.lastRetryAfterSeconds ?? "—"} 秒。`}
+        {`当前每秒 ${data.rateLimit.xQps} 次。近 24 小时 ${data.rateLimit.hits24h} 次，近 7 日 ${data.rateLimit.hits7d} 次。最近一次 ${formatTime(data.rateLimit.lastHitAt, data.timezone)}，Retry-After ${data.rateLimit.lastRetryAfterSeconds ?? "—"} 秒。`}
       </Text>
       <Table
         density="compact"
         idKey="id"
         data={data.rateLimit.recent}
         columns={[
-          { key: "recordedAt", header: "时间", renderCell: (row) => formatTime(row.recordedAt) },
+          { key: "recordedAt", header: timeHeader("时间", data.timezone, data.utcOffset), renderCell: (row) => formatTime(row.recordedAt, data.timezone) },
           { key: "source", header: "来源" },
           { key: "status", header: "状态码" },
           { key: "retryAfterSeconds", header: "Retry-After", renderCell: (row) => row.retryAfterSeconds ?? "—" },

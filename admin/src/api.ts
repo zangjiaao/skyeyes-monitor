@@ -25,16 +25,31 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function formatTime(value: string | null | undefined): string {
-  if (!value) return "—";
+export function formatTime(value: string | null | undefined, timeZone: string): string {
+  if (!value || !timeZone) return "—";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).format(date);
+  if (Number.isNaN(date.getTime())) return "—";
+  try {
+    const map: Record<string, string> = {};
+    for (const part of new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date)) {
+      if (part.type !== "literal") map[part.type] = part.value;
+    }
+    const hour = map.hour === "24" ? "00" : map.hour;
+    return `${map.year}-${map.month}-${map.day} ${hour}:${map.minute}`;
+  } catch {
+    return "—";
+  }
+}
+
+export function timeHeader(title: string, timeZone: string, utcOffset: string): string {
+  if (!timeZone) return title;
+  return utcOffset ? `${title}（${timeZone}, ${utcOffset}）` : `${title}（${timeZone}）`;
 }

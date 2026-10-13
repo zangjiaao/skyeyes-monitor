@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { assertAllowedEmail, authenticate } from "../auth/access";
 import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
-import { closedWindow, decideSchedule } from "../domain/time";
+import { closedWindow, decideSchedule, utcOffsetLabel } from "../domain/time";
 import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 import {
@@ -385,6 +385,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       now: now.toISOString(),
       email: c.get("email"),
       timezone: settings.timeZone,
+      utcOffset: utcOffsetLabel(now, settings.timeZone),
       scheduleHour: settings.scheduleHour,
       windowHours: settings.windowHours,
       batchSize: settings.batchSize,
@@ -712,12 +713,18 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     try {
       const body = await readJson(c.req.raw);
       const patch = validateSettingsPatch(body);
+      const previous = await loadSettings(c.env.DB);
       const settings = await saveSettings(c.env.DB, patch);
+      const refreshed = settings.timeZone !== previous.timeZone
+        ? await refreshWorkbook(c.env)
+        : { excel: false, excelError: null };
       return c.json({
         ok: true,
         scheduleHour: settings.scheduleHour,
         windowHours: settings.windowHours,
         batchSize: settings.batchSize,
+        timeZone: settings.timeZone,
+        ...refreshed,
       });
     } catch (error) {
       return jsonError(error);
@@ -756,11 +763,14 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       ).bind(...query.binds, query.limit, query.offset).all();
       const total = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM records WHERE ${query.where}`)
         .bind(...query.binds).first<{ n: number }>();
+      const now = new Date();
       return c.json({
         records: rows.results,
         total: total?.n ?? 0,
         page: query.page,
         pageSize: query.pageSize,
+        timeZone: settings.timeZone,
+        utcOffset: utcOffsetLabel(now, settings.timeZone),
       });
     } catch (error) {
       return jsonError(error);
