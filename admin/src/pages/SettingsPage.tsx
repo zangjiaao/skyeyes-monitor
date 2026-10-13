@@ -18,7 +18,7 @@ interface Recipient extends Record<string, unknown> {
 const FIELDS = [
   ["schedule_hour", "每天运行小时（上海时间，整点）"],
   ["window_hours", "采集窗口小时数"],
-  ["batch_size", "每批目标数"],
+  ["batch_size", "保留项。每个目标已经单独查询，不再把多个目标合成一条搜索"],
   ["timezone", "时区"],
   ["email_from", "发件人邮箱"],
   ["email_from_name", "发件人名称"],
@@ -27,7 +27,7 @@ const FIELDS = [
   ["translation_source_lang", "翻译源语言代码"],
   ["translation_target_lang", "翻译目标语言代码"],
   ["finalize_deadline_minutes", "收尾截止分钟"],
-  ["x_max_pages", "X 每个查询最多翻页"],
+  ["x_max_pages", "X 每条检索词最多翻页。同一目标的每条词各自占用这些页"],
   ["x_qps", "X 每秒请求数。未付费账号保持 0.2（每 5 秒 1 次）；充值后可提高到 10，上限 20"],
   ["excel_key", "R2 中的 Excel 文件名"],
   ["min_text_length", "最短正文长度，0 表示不限制"],

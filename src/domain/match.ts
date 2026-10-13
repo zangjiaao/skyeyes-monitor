@@ -1,3 +1,4 @@
+import { termsOf, verifyHit } from "./terms";
 import type { QueryTarget } from "./types";
 
 export function matchTarget(
@@ -5,19 +6,13 @@ export function matchTarget(
   authorHandle: string,
   targets: QueryTarget[],
 ): QueryTarget | null {
-  const handle = authorHandle.replace(/^@/, "").toLowerCase();
-  if (handle) {
-    for (const target of targets) {
-      if (target.kind !== "handle") continue;
-      const query = target.query.replace(/^@/, "").toLowerCase();
-      if (query && query === handle) return target;
+  let best: { target: QueryTarget; term: string } | null = null;
+  for (const target of targets) {
+    for (const term of termsOf(target)) {
+      const verdict = verifyHit({ text, authorHandle, target, queriedTerm: term });
+      if (!verdict.ok || !verdict.term) continue;
+      if (!best || verdict.term.length > best.term.length) best = { target, term: verdict.term };
     }
   }
-  const haystack = text.toLowerCase();
-  for (const target of targets) {
-    const query = target.query.replace(/^@/, "").replace(/"/g, "").trim().toLowerCase();
-    if (query && haystack.includes(query)) return target;
-    if (target.name.trim() && haystack.includes(target.name.trim().toLowerCase())) return target;
-  }
-  return null;
+  return best?.target ?? null;
 }

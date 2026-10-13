@@ -11,6 +11,7 @@ export interface ExcelRecord {
   source: string;
   url: string;
   matchedTarget: string;
+  matchedTerm?: string;
   collectedAt: string;
   translationZh: string;
 }
@@ -37,6 +38,7 @@ const HEADERS = [
   "采集日期",
   "中文译文",
   "时段",
+  "命中检索词",
 ];
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -73,6 +75,7 @@ function row(record: ExcelRecord, period: PeriodLabel): string[] {
     record.collectedAt,
     record.translationZh,
     period,
+    record.matchedTerm ?? "",
   ];
 }
 

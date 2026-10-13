@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { assertTermList, flagEnabled, splitImportTerms, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 
 export interface ImportRow {
@@ -6,6 +7,9 @@ export interface ImportRow {
   kind: TargetKind;
   name: string;
   query: string;
+  terms: string[];
+  excludeTerms: string[];
+  caseSensitive: boolean;
   enabled: boolean;
 }
 
@@ -51,15 +55,31 @@ function parseCsvRows(text: string): string[][] {
   return rows.filter((item) => item.some((value) => value.trim()));
 }
 
+function cell(row: Record<string, string>, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = row[key];
+    if (value && value.trim()) return value.trim();
+  }
+  return "";
+}
+
 export function recordsFromRows(rows: Record<string, string>[]): ImportRow[] {
   return rows.map((row, index) => {
-    const countryCode = (row.country_code || row.country || "").trim();
-    const kind = (row.kind || "").trim() as TargetKind;
-    const name = (row.name || "").trim();
-    const query = (row.query || name).trim();
+    const countryCode = cell(row, "country_code", "country");
+    const kind = cell(row, "kind") as TargetKind;
+    const name = cell(row, "name");
+    const terms = assertTermList(
+      splitImportTerms(cell(row, "terms", "query") || name),
+      `第 ${index + 2} 行检索词`,
+    );
+    const excludeTerms = assertTermList(
+      splitImportTerms(cell(row, "exclude", "exclude_terms")),
+      `第 ${index + 2} 行排除词`,
+      true,
+    );
     const enabledRaw = (row.enabled || "1").trim().toLowerCase();
-    if (!countryCode || !name || !query) {
-      throw new Error(`第 ${index + 2} 行缺少 country_code、name 或 query`);
+    if (!countryCode || !name) {
+      throw new Error(`第 ${index + 2} 行缺少 country_code 或 name`);
     }
     if (!TARGET_KINDS.includes(kind)) {
       throw new Error(`第 ${index + 2} 行 kind 必须是 ${TARGET_KINDS.join("/")}`);
@@ -68,10 +88,35 @@ export function recordsFromRows(rows: Record<string, string>[]): ImportRow[] {
       countryCode,
       kind,
       name,
-      query,
+      query: terms[0],
+      terms,
+      excludeTerms,
+      caseSensitive: flagEnabled(cell(row, "case_sensitive", "caseSensitive")),
       enabled: !["0", "false", "no"].includes(enabledRaw),
     };
   });
+}
+
+export function mergeImportRows(rows: ImportRow[]): ImportRow[] {
+  const merged = new Map<string, ImportRow>();
+  for (const row of rows) {
+    const key = `${row.countryCode}\0${row.kind}\0${row.name}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, {
+        ...row,
+        terms: [...row.terms],
+        excludeTerms: [...row.excludeTerms],
+      });
+      continue;
+    }
+    existing.terms = uniqueTerms([...existing.terms, ...row.terms]);
+    existing.excludeTerms = uniqueTerms([...existing.excludeTerms, ...row.excludeTerms]);
+    existing.query = existing.terms[0] ?? existing.query;
+    existing.caseSensitive = existing.caseSensitive || row.caseSensitive;
+    existing.enabled = row.enabled;
+  }
+  return [...merged.values()];
 }
 
 export function parseCsv(text: string): ImportRow[] {
@@ -85,7 +130,7 @@ export function parseCsv(text: string): ImportRow[] {
     });
     return record;
   });
-  return recordsFromRows(records);
+  return mergeImportRows(recordsFromRows(records));
 }
 
 export function parseXlsx(bytes: Uint8Array): ImportRow[] {
@@ -94,9 +139,9 @@ export function parseXlsx(bytes: Uint8Array): ImportRow[] {
   if (!name) return [];
   const sheet = workbook.Sheets[name];
   const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
-  return recordsFromRows(rows.map((row) => {
+  return mergeImportRows(recordsFromRows(rows.map((row) => {
     const record: Record<string, string> = {};
     for (const [key, value] of Object.entries(row)) record[key.trim()] = String(value ?? "").trim();
     return record;
-  }));
+  })));
 }

@@ -1,5 +1,8 @@
 export function normalizeUrl(url: string): string {
-  const trimmed = url.trim();
+  if (typeof url !== "string") return "";
+  const trimmed = url.trim().replace(/\u0000/g, "");
+  const article = trimmed.match(/https?:\/\/news\.google\.com\/(?:rss\/)?articles\/([^/?#\s]+)/i);
+  if (article?.[1]) return `https://news.google.com/rss/articles/${article[1]}`;
   try {
     const parsed = new URL(trimmed);
     parsed.hash = "";
@@ -23,22 +26,42 @@ export function makeDedupeKey(
   externalId: string | null | undefined,
   url: string,
 ): string {
-  const id = externalId?.trim();
+  const id = typeof externalId === "string" ? externalId.trim() : "";
   if (id) return `${source}:id:${id}`;
   return `${source}:url:${normalizeUrl(url)}`;
 }
 
-export function dedupeRecords<T extends { dedupeKey: string; url: string; source: string }>(
-  records: T[],
-): T[] {
-  const seen = new Set<string>();
+export function dedupeRecords<T extends {
+  dedupeKey: string;
+  url?: string | null;
+  source: string;
+  matchedTerm?: string | null;
+}>(records: T[]): T[] {
   const unique: T[] = [];
+  const indexByKey = new Map<string, number>();
   for (const record of records) {
-    const urlKey = `${record.source}:url:${normalizeUrl(record.url)}`;
-    if (seen.has(record.dedupeKey) || seen.has(urlKey)) continue;
-    seen.add(record.dedupeKey);
-    seen.add(urlKey);
-    unique.push(record);
+    if (!record || typeof record.url !== "string" || !record.url.trim() || typeof record.dedupeKey !== "string") {
+      continue;
+    }
+    let canonical = "";
+    try {
+      canonical = `${record.source}:url:${normalizeUrl(record.url)}`;
+    } catch {
+      continue;
+    }
+    const keys = [record.dedupeKey, canonical];
+    const existingIndex = keys.map((key) => indexByKey.get(key)).find((index) => index !== undefined);
+    if (existingIndex === undefined) {
+      const index = unique.length;
+      unique.push(record);
+      for (const key of keys) indexByKey.set(key, index);
+      continue;
+    }
+    const current = unique[existingIndex];
+    if ((record.matchedTerm?.length ?? 0) > (current.matchedTerm?.length ?? 0)) {
+      unique[existingIndex] = record;
+    }
+    for (const key of keys) indexByKey.set(key, existingIndex);
   }
   return unique;
 }

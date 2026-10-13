@@ -3,8 +3,10 @@ import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
+import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table } from "@astryxdesign/core/Table";
+import { TextArea } from "@astryxdesign/core/TextArea";
 import { TextInput } from "@astryxdesign/core/TextInput";
 import { api } from "../api";
 
@@ -21,6 +23,9 @@ interface Target extends Record<string, unknown> {
   kind: string;
   name: string;
   query: string;
+  terms: string;
+  exclude_terms: string;
+  case_sensitive: number;
   enabled: number;
 }
 
@@ -38,10 +43,22 @@ export function TargetsPage() {
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
   const [targetName, setTargetName] = useState("");
-  const [query, setQuery] = useState("");
+  const [terms, setTerms] = useState("");
+  const [excludeTerms, setExcludeTerms] = useState("");
+  const [caseSensitive, setCaseSensitive] = useState(false);
   const [kind, setKind] = useState("keyword");
+  const [editingId, setEditingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
+  function resetTargetForm() {
+    setEditingId("");
+    setTargetName("");
+    setTerms("");
+    setExcludeTerms("");
+    setCaseSensitive(false);
+    setKind("keyword");
+  }
 
   async function reload() {
     const payload = await api<{ countries: Country[] }>("/api/countries");
@@ -136,6 +153,9 @@ export function TargetsPage() {
         ]}
       />
       <Heading level={2}>目标</Heading>
+      <Text type="body" color="secondary">
+        一个目标只有一个显示名，检索词一行一条。同一目标的每条检索词会单独搜索，命中都记在这个显示名上。2 到 5 个字母的缩写始终区分大小写并按整词匹配，请写成希望命中的样子，例如 BLA。
+      </Text>
       <Selector
         label="国家"
         value={countryId}
@@ -145,23 +165,55 @@ export function TargetsPage() {
       />
       <HStack gap={2}>
         <Selector label="类型" value={kind} onChange={setKind} options={KINDS} />
-        <TextInput label="名称" value={targetName} onChange={setTargetName} />
-        <TextInput label="检索词" value={query} onChange={setQuery} description="账号不要带 @" />
+        <TextInput label="显示名" value={targetName} onChange={setTargetName} description="日报里看到的名称" />
+      </HStack>
+      <TextArea
+        label="检索词"
+        rows={5}
+        value={terms}
+        onChange={setTerms}
+        description="一行一条。账号不要带 @。例如 BLA、Balochistan Liberation Army、俾路支解放军。"
+      />
+      <TextArea
+        label="排除词"
+        rows={3}
+        value={excludeTerms}
+        onChange={setExcludeTerms}
+        description="可选，一行一条。命中则丢弃，例如 Biologics License、bla bla。"
+      />
+      <CheckboxInput
+        label="英文短语区分大小写"
+        value={caseSensitive}
+        onChange={setCaseSensitive}
+        description="2 到 5 个字母的缩写始终区分大小写。这个开关作用于更长的英文短语。"
+      />
+      <HStack gap={2}>
         <Button
-          label="添加目标"
+          label={editingId ? "保存修改" : "添加目标"}
           variant="primary"
           onClick={() => {
             setError("");
-            api("/api/targets", {
-              method: "POST",
-              body: JSON.stringify({ countryId, kind, name: targetName, query: query || targetName }),
-            }).then(async () => {
-              setTargetName("");
-              setQuery("");
+            const body = JSON.stringify({
+              countryId,
+              kind,
+              name: targetName,
+              terms,
+              excludeTerms,
+              caseSensitive,
+            });
+            const request = editingId
+              ? api(`/api/targets/${editingId}`, { method: "PATCH", body })
+              : api("/api/targets", { method: "POST", body });
+            request.then(async () => {
+              resetTargetForm();
+              setNotice(editingId ? "已保存目标" : "已添加目标");
               await reload();
             }).catch((reason: Error) => setError(reason.message));
           }}
         />
+        {editingId ? (
+          <Button label="取消编辑" variant="secondary" onClick={resetTargetForm} />
+        ) : null}
       </HStack>
       <Button
         label="导入 CSV / Excel"
@@ -186,7 +238,7 @@ export function TargetsPage() {
         }}
       />
       <Text type="supporting" color="secondary">
-        表头：country_code, kind, name, query, enabled。kind 为 person、organization、keyword 或 handle。
+        表头：country_code, kind, name, query, exclude, case_sensitive, enabled。query 里多条检索词用 | 或换行分开；同一国家、类型、显示名的多行会合并。也可以用 terms、exclude_terms 这两列表头。kind 为 person、organization、keyword 或 handle。
       </Text>
       <Table
         density="compact"
@@ -194,14 +246,39 @@ export function TargetsPage() {
         data={targets}
         columns={[
           { key: "kind", header: "类型" },
-          { key: "name", header: "名称" },
-          { key: "query", header: "检索词" },
+          { key: "name", header: "显示名" },
+          {
+            key: "terms",
+            header: "检索词",
+            renderCell: (row) => (row.terms || row.query).split(/\r?\n/).filter(Boolean).join(" · "),
+          },
+          {
+            key: "exclude_terms",
+            header: "排除词",
+            renderCell: (row) => row.exclude_terms?.split(/\r?\n/).filter(Boolean).join(" · ") || "—",
+          },
+          { key: "case_sensitive", header: "区分大小写", renderCell: (row) => (row.case_sensitive ? "是" : "否") },
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
           {
             key: "actions",
             header: "操作",
             renderCell: (row) => (
               <HStack gap={1}>
+                <Button
+                  label="编辑"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setEditingId(row.id);
+                    setCountryId(row.country_id);
+                    setKind(row.kind);
+                    setTargetName(row.name);
+                    setTerms(row.terms || row.query);
+                    setExcludeTerms(row.exclude_terms || "");
+                    setCaseSensitive(row.case_sensitive === 1);
+                    setError("");
+                  }}
+                />
                 <Button
                   label={row.enabled ? "停用" : "启用"}
                   variant="secondary"

@@ -1,7 +1,7 @@
-import { buildXQuery } from "../domain/batch";
-import { makeDedupeKey } from "../domain/dedupe";
-import { matchTarget } from "../domain/match";
-import type { CollectedRecord, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
+import { buildXTermQuery, searchPlan } from "../domain/batch";
+import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
+import { cleanText, verifyHit } from "../domain/terms";
+import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { parseRetryAfter, retryDelaySeconds, shouldWaitInBatch, sleep } from "./x-rate";
 
 const ENDPOINT = "https://api.twitterapi.io/twitter/tweet/advanced_search";
@@ -63,15 +63,20 @@ function readFollowers(author: TweetAuthor | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function tweetsToRecords(tweets: Tweet[], request: SearchRequest): CollectedRecord[] {
+export function tweetsToRecords(
+  tweets: Tweet[],
+  request: SearchRequest,
+  target: QueryTarget,
+  term: string,
+): CollectedRecord[] {
   const records: CollectedRecord[] = [];
   for (const tweet of tweets) {
     const id = tweet.id?.trim() ?? "";
     const url = tweet.url?.trim() || (id ? `https://x.com/i/status/${id}` : "");
-    const text = tweet.text?.trim() ?? "";
+    const text = cleanText(tweet.text?.trim() ?? "");
     if (!url || !text) continue;
     const handle = tweet.author?.userName?.trim() ?? "";
-    const matched = matchTarget(text, handle, request.targets);
+    const matched = { id: target.id, name: target.name };
     const retweet = Boolean(tweet.retweeted_tweet) || /^rt\s+@/i.test(text);
     records.push({
       dedupeKey: makeDedupeKey("x", id || null, url),
@@ -79,8 +84,9 @@ export function tweetsToRecords(tweets: Tweet[], request: SearchRequest): Collec
       externalId: id || null,
       url,
       countryName: request.countryName,
-      matchedTargetId: matched?.id ?? null,
-      matchedTarget: matched?.name ?? "批次未精确命中",
+      matchedTargetId: matched.id,
+      matchedTarget: matched.name,
+      matchedTerm: term,
       authorHandle: handle,
       authorName: tweet.author?.name?.trim() ?? "",
       authorUrl: tweet.author?.url?.trim() || (handle ? `https://x.com/${handle}` : ""),
@@ -116,58 +122,73 @@ export const xProvider: SourceProvider = {
     if (!request.apiKey) {
       throw new Error("未配置 TWITTERAPI_IO_KEY");
     }
-    const query = buildXQuery(request.targets, request.window, {
-      excludeRetweets: request.excludeRetweets !== false,
-    });
-    if (!query) return { records: [], calls: 0 };
     const maxPages = request.maxPages ?? 5;
     const records: CollectedRecord[] = [];
     let calls = 0;
-    let cursor = "";
+    let filtered = 0;
     let waits = 0;
     const pause = request.sleepImpl ?? sleep;
-    for (let page = 0; page < maxPages; page += 1) {
-      const url = new URL(ENDPOINT);
-      url.searchParams.set("query", query);
-      url.searchParams.set("queryType", "Latest");
-      if (cursor) url.searchParams.set("cursor", cursor);
-      let response: Response;
-      for (;;) {
-        if (request.beforeRequest) await request.beforeRequest();
-        response = await request.fetchImpl(url, {
-          headers: { "X-API-Key": request.apiKey },
-        });
-        calls += 1;
-        if (response.status !== 429 && response.status !== 503) break;
-        const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
-        const delaySeconds = retryDelaySeconds({
-          attempt: (request.queueAttempt ?? 1) - 1 + waits,
-          retryAfterSeconds,
-        });
-        const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
-        if (shouldWaitInBatch(delaySeconds, waits)) {
-          waits += 1;
-          await pause(delaySeconds * 1000);
-          continue;
+    for (const step of searchPlan(request.targets)) {
+      const query = buildXTermQuery(step.target, step.term, request.window, {
+        excludeRetweets: request.excludeRetweets !== false,
+      });
+      if (!query) continue;
+      let cursor = "";
+      for (let page = 0; page < maxPages; page += 1) {
+        const url = new URL(ENDPOINT);
+        url.searchParams.set("query", query);
+        url.searchParams.set("queryType", "Latest");
+        if (cursor) url.searchParams.set("cursor", cursor);
+        let response: Response;
+        for (;;) {
+          if (request.beforeRequest) await request.beforeRequest();
+          response = await request.fetchImpl(url, {
+            headers: { "X-API-Key": request.apiKey },
+          });
+          calls += 1;
+          if (response.status !== 429 && response.status !== 503) break;
+          const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
+          const delaySeconds = retryDelaySeconds({
+            attempt: (request.queueAttempt ?? 1) - 1 + waits,
+            retryAfterSeconds,
+          });
+          const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
+          if (shouldWaitInBatch(delaySeconds, waits)) {
+            waits += 1;
+            await pause(delaySeconds * 1000);
+            continue;
+          }
+          throw new RateLimitError(`twitterapi.io 限流 ${response.status}`, {
+            delaySeconds,
+            retryAfterSeconds,
+            recorded,
+          });
         }
-        throw new RateLimitError(`twitterapi.io 限流 ${response.status}`, {
-          delaySeconds,
-          retryAfterSeconds,
-          recorded,
-        });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`twitterapi.io ${response.status}: ${detail.slice(0, 300)}`);
+        }
+        const payload = asRecord(await response.json());
+        const tweets = Array.isArray(payload?.tweets) ? payload.tweets as Tweet[] : [];
+        for (const record of tweetsToRecords(tweets, request, step.target, step.term)) {
+          const verdict = verifyHit({
+            text: record.text,
+            authorHandle: record.authorHandle,
+            target: step.target,
+            queriedTerm: step.term,
+          });
+          if (!verdict.ok || !verdict.term) {
+            filtered += 1;
+            continue;
+          }
+          records.push({ ...record, matchedTerm: verdict.term });
+        }
+        const hasNext = payload?.has_next_page === true;
+        const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
+        if (!hasNext || !next || next === cursor) break;
+        cursor = next;
       }
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(`twitterapi.io ${response.status}: ${detail.slice(0, 300)}`);
-      }
-      const payload = asRecord(await response.json());
-      const tweets = Array.isArray(payload?.tweets) ? payload.tweets as Tweet[] : [];
-      records.push(...tweetsToRecords(tweets, request));
-      const hasNext = payload?.has_next_page === true;
-      const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
-      if (!hasNext || !next || next === cursor) break;
-      cursor = next;
     }
-    return { records, calls };
+    return { records: dedupeRecords(records), calls, filtered };
   },
 };

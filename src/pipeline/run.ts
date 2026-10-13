@@ -1,5 +1,6 @@
 import { loadSettings, type AppSettings } from "../config/settings";
 import { batchTargetsForQuery } from "../domain/batch";
+import { splitLines } from "../domain/terms";
 import { dedupeRecords } from "../domain/dedupe";
 import {
   DELIVERABLE_SQL,
@@ -11,7 +12,7 @@ import {
   type ExistingIdentity,
   type FilterRules,
 } from "../domain/gate";
-import type { CollectedRecord, SourceId, TargetKind } from "../domain/types";
+import type { CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
 import { sendWithCloudflare } from "../email/cloudflare";
@@ -42,6 +43,9 @@ interface TargetRow {
   kind: TargetKind;
   name: string;
   query: string;
+  terms: string;
+  exclude_terms: string;
+  case_sensitive: number;
   enabled: number;
 }
 
@@ -73,6 +77,7 @@ interface RecordRow {
   source: string;
   url: string;
   matched_target: string;
+  matched_term: string;
   collected_at: string;
   translation_zh: string | null;
 }
@@ -120,6 +125,20 @@ async function findSimilar(db: D1Database, urlKey: string, titleKey: string): Pr
     titleKey: row.title_key,
     publishedAt: row.published_at,
   }));
+}
+
+function toQueryTarget(target: TargetRow): QueryTarget {
+  const listed = splitLines(target.terms);
+  const terms = listed.length > 0 ? listed : splitLines(target.query);
+  return {
+    id: target.id,
+    kind: target.kind,
+    name: target.name,
+    query: terms[0] ?? target.query,
+    terms,
+    excludeTerms: splitLines(target.exclude_terms),
+    caseSensitive: target.case_sensitive === 1,
+  };
 }
 
 function isRetryable(error: unknown): boolean {
@@ -173,17 +192,13 @@ export async function startRun(env: Env, input: {
 
   for (const country of countries.results) {
     const targets = await env.DB.prepare(
-      "SELECT id, country_id, kind, name, query, enabled FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name",
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled
+       FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
-    const queryTargets = targets.results.map((target) => ({
-      id: target.id,
-      kind: target.kind,
-      name: target.name,
-      query: target.query,
-    }));
+    const queryTargets = targets.results.map(toQueryTarget);
     for (const source of SOURCE_IDS) {
       if (!settings.sources[source] || queryTargets.length === 0) continue;
-      const groups = batchTargetsForQuery(queryTargets, settings.batchSize);
+      const groups = batchTargetsForQuery(queryTargets);
       for (const group of groups) {
         const batchId = crypto.randomUUID();
         inserts.push(env.DB.prepare(
@@ -222,7 +237,8 @@ async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> 
   if (ids.length === 0) return [];
   const marks = ids.map(() => "?").join(",");
   const result = await db.prepare(
-    `SELECT id, country_id, kind, name, query, enabled FROM targets WHERE id IN (${marks})`,
+    `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled
+     FROM targets WHERE id IN (${marks})`,
   ).bind(...ids).all<TargetRow>();
   return result.results;
 }
@@ -251,12 +267,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const targets = await loadTargets(env.DB, ids);
     const provider = getProvider(batch.source);
     const result = await provider.search({
-      targets: targets.map((target) => ({
-        id: target.id,
-        kind: target.kind,
-        name: target.name,
-        query: target.query,
-      })),
+      targets: targets.map(toQueryTarget),
       window: { start: new Date(run.window_start), end: new Date(run.window_end) },
       countryName: country.name,
       // Workers 里的 fetch 必须绑定 globalThis，否则会报 Illegal invocation。
@@ -275,6 +286,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       } : undefined,
     });
     const unique = dedupeRecords(result.records);
+    let filtered = result.filtered ?? 0;
     const collectedAt = new Date().toISOString();
     const window = { start: new Date(run.window_start), end: new Date(run.window_end) };
     const rules = rulesFromSettings(settings);
@@ -288,6 +300,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       urlKey: string;
     }> = [];
     for (const record of unique) {
+      if (!record.matchedTargetId || !record.matchedTerm?.trim()) {
+        filtered += 1;
+        continue;
+      }
+      try {
       const titleKey = normalizeTitle(record.text);
       const urlKey = urlKeyFor(record.url);
       const ruleReason = ruleRejectReason(record, rules, new Date(collectedAt));
@@ -350,15 +367,19 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         titleKey,
         urlKey,
       });
+      } catch (error) {
+        filtered += 1;
+        logError("record skipped", error, { runId, batchId, url: record.url });
+      }
     }
     const statements: D1PreparedStatement[] = kept.map((record) => env.DB.prepare(
       `INSERT INTO records (
         id, dedupe_key, source, external_id, url, country_id, country_name,
-        matched_target_id, matched_target, author_handle, author_name, author_url,
+        matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
         original_text, published_at, collected_at, translation_zh, run_id,
         title_key, url_key, time_status, relevance_score, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -370,6 +391,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       country.name,
       record.matchedTargetId,
       record.matchedTarget,
+      record.matchedTerm ?? "",
       record.authorHandle,
       record.authorName,
       record.authorUrl,
@@ -403,7 +425,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         "INSERT INTO api_usage (id, run_id, source, calls, items, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
       ).bind(crypto.randomUUID(), runId, batch.source, result.calls, unique.length, finishedAt),
     ]);
-    log("batch done", { runId, batchId, source: batch.source, items: unique.length, added });
+    log("batch done", { runId, batchId, source: batch.source, items: unique.length, added, filtered });
     await maybeEnqueueFinalize(env, runId);
   } catch (error) {
     if (isRetryable(error)) {
@@ -459,7 +481,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
   while (newestFirst.length < MAX_EXCEL_ROWS) {
     const page = await db.prepare(
        `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
-              source, url, matched_target, collected_at, translation_zh
+              source, url, matched_target, matched_term, collected_at, translation_zh
        FROM records WHERE ${DELIVERABLE_SQL}
        ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
     ).bind(pageSize, offset).all<RecordRow>();
@@ -476,6 +498,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
         source: row.source,
         url: row.url,
         matchedTarget: row.matched_target,
+        matchedTerm: row.matched_term,
         collectedAt: row.collected_at,
         translationZh: row.translation_zh ?? "",
       });

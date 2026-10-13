@@ -30,4 +30,24 @@ describe("去重", () => {
     expect(normalizeUrl("https://Example.com/a/?utm_medium=rss&id=1"))
       .toBe("https://example.com/a?id=1");
   });
+
+  it("同一篇 Google News 文章忽略 oc、hl 和末尾斜杠", () => {
+    const canonical = "https://news.google.com/rss/articles/ART1";
+    expect(normalizeUrl("https://news.google.com/rss/articles/ART1?oc=5")).toBe(canonical);
+    expect(normalizeUrl("https://news.google.com/articles/ART1/?oc=9&hl=en")).toBe(canonical);
+    expect(normalizeUrl("https://news.google.com/rss/articles/ART1/")).toBe(canonical);
+  });
+
+  it("缺少链接时跳过，不让整批去重失败", () => {
+    const kept = {
+      source: "google_news",
+      dedupeKey: "google_news:url:https://news.example/ok",
+      url: "https://news.example/ok",
+    };
+    expect(dedupeRecords([
+      kept,
+      { source: "google_news", dedupeKey: "google_news:url:", url: undefined as unknown as string },
+      { source: "google_news", dedupeKey: "google_news:url:", url: "" },
+    ])).toEqual([kept]);
+  });
 });

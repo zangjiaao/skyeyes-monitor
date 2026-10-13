@@ -6,6 +6,7 @@ function decodeXml(value: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/\u0000/g, "")
     .trim();
 }
 
@@ -16,6 +17,13 @@ function tag(block: string, name: string): string {
 
 export function stripTags(value: string): string {
   return decodeXml(value).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** 链接元素里经常跟着查询参数或多余文字，只取第一条 http(s) 地址。 */
+export function firstHttpUrl(value: string): string {
+  const match = value.match(/https?:\/\/[^\s<>"']+/i);
+  if (!match) return "";
+  return match[0].replace(/[),.;]+$/, "");
 }
 
 export interface RssItem {
@@ -34,7 +42,7 @@ export function parseRssItems(xml: string): RssItem[] {
       const body = chunk.split(/<\/item>/i)[0] ?? "";
       return {
         title: stripTags(tag(body, "title")),
-        link: tag(body, "link") || tag(body, "guid"),
+        link: firstHttpUrl(tag(body, "link") || tag(body, "guid")),
         pubDate: tag(body, "pubDate"),
         description: stripTags(tag(body, "description")),
         source: stripTags(tag(body, "source")),

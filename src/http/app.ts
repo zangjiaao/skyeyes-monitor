@@ -3,6 +3,7 @@ import { assertAllowedEmail, authenticate } from "../auth/access";
 import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule } from "../domain/time";
+import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 import { parseCsv, parseXlsx } from "../import/table";
 import { storeExcel } from "../pipeline/run";
@@ -263,15 +264,30 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const body = await readJson(c.req.raw);
       const countryId = requireString(body.countryId, "国家");
       const name = requireString(body.name, "名称");
-      const query = requireString(body.query ?? body.name, "检索词");
       const kind = requireString(body.kind, "类型") as TargetKind;
       if (!TARGET_KINDS.includes(kind)) throw new Error("类型无效");
+      const terms = assertTermList(termsFromUnknown(body.terms ?? body.query ?? body.name), "检索词");
+      const excludeTerms = assertTermList(termsFromUnknown(body.excludeTerms ?? body.exclude_terms ?? ""), "排除词", true);
+      const caseSensitive = flagEnabled(body.caseSensitive ?? body.case_sensitive) ? 1 : 0;
       const country = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(countryId).first();
       if (!country) throw new Error("国家不存在");
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
-        "INSERT INTO targets (id, country_id, kind, name, query, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ).bind(id, countryId, kind, name, query, body.enabled === false ? 0 : 1, new Date().toISOString()).run();
+        `INSERT INTO targets (
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        id,
+        countryId,
+        kind,
+        name,
+        terms[0],
+        joinTerms(terms),
+        joinTerms(excludeTerms),
+        caseSensitive,
+        body.enabled === false ? 0 : 1,
+        new Date().toISOString(),
+      ).run();
       return c.json({ id }, 201);
     } catch (error) {
       return jsonError(error);
@@ -287,8 +303,20 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       if (typeof body.name === "string") {
         await c.env.DB.prepare("UPDATE targets SET name = ? WHERE id = ?").bind(body.name.trim(), id).run();
       }
-      if (typeof body.query === "string") {
-        await c.env.DB.prepare("UPDATE targets SET query = ? WHERE id = ?").bind(body.query.trim(), id).run();
+      if (body.terms !== undefined || typeof body.query === "string") {
+        const terms = assertTermList(termsFromUnknown(body.terms ?? body.query), "检索词");
+        await c.env.DB.prepare("UPDATE targets SET query = ?, terms = ? WHERE id = ?")
+          .bind(terms[0], joinTerms(terms), id).run();
+      }
+      if (body.excludeTerms !== undefined || body.exclude_terms !== undefined) {
+        const excludeTerms = assertTermList(termsFromUnknown(body.excludeTerms ?? body.exclude_terms), "排除词", true);
+        await c.env.DB.prepare("UPDATE targets SET exclude_terms = ? WHERE id = ?")
+          .bind(joinTerms(excludeTerms), id).run();
+      }
+      if (body.caseSensitive !== undefined || body.case_sensitive !== undefined) {
+        const caseSensitive = flagEnabled(body.caseSensitive ?? body.case_sensitive) ? 1 : 0;
+        await c.env.DB.prepare("UPDATE targets SET case_sensitive = ? WHERE id = ?")
+          .bind(caseSensitive, id).run();
       }
       if (typeof body.kind === "string") {
         if (!TARGET_KINDS.includes(body.kind as TargetKind)) throw new Error("类型无效");
@@ -322,17 +350,46 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       if (rows.length > 5000) throw new Error("一次最多导入 5000 行");
       const countries = await c.env.DB.prepare("SELECT id, code FROM countries").all<{ id: string; code: string }>();
       const byCode = new Map(countries.results.map((country) => [country.code, country.id]));
-      const statements: D1PreparedStatement[] = [];
       const now = new Date().toISOString();
       for (const row of rows) {
         const countryId = byCode.get(row.countryCode);
         if (!countryId) throw new Error(`未知国家代码 ${row.countryCode}，请先创建国家`);
-        statements.push(c.env.DB.prepare(
-          "INSERT INTO targets (id, country_id, kind, name, query, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ).bind(crypto.randomUUID(), countryId, row.kind, row.name, row.query, row.enabled ? 1 : 0, now));
-      }
-      for (let index = 0; index < statements.length; index += 40) {
-        await c.env.DB.batch(statements.slice(index, index + 40));
+        const existing = await c.env.DB.prepare(
+          `SELECT id, terms, exclude_terms, case_sensitive FROM targets
+           WHERE country_id = ? AND kind = ? AND name = ?`,
+        ).bind(countryId, row.kind, row.name).first<{
+          id: string;
+          terms: string;
+          exclude_terms: string;
+          case_sensitive: number;
+        }>();
+        const terms = uniqueTerms([...splitLines(existing?.terms), ...row.terms]);
+        const excludeTerms = uniqueTerms([...splitLines(existing?.exclude_terms), ...row.excludeTerms]);
+        const caseSensitive = existing?.case_sensitive === 1 || row.caseSensitive ? 1 : 0;
+        if (existing) {
+          await c.env.DB.prepare(
+            `UPDATE targets
+             SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?
+             WHERE id = ?`,
+          ).bind(terms[0], joinTerms(terms), joinTerms(excludeTerms), caseSensitive, row.enabled ? 1 : 0, existing.id).run();
+        } else {
+          await c.env.DB.prepare(
+            `INSERT INTO targets (
+              id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            crypto.randomUUID(),
+            countryId,
+            row.kind,
+            row.name,
+            terms[0],
+            joinTerms(terms),
+            joinTerms(excludeTerms),
+            caseSensitive,
+            row.enabled ? 1 : 0,
+            now,
+          ).run();
+        }
       }
       return c.json({ imported: rows.length });
     } catch (error) {
@@ -427,7 +484,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     }
     const where = clauses.join(" AND ");
     const rows = await c.env.DB.prepare(
-      `SELECT id, source, url, country_name, matched_target, author_handle, author_name, author_url,
+      `SELECT id, source, url, country_name, matched_target, matched_term, author_handle, author_name, author_url,
               original_text, published_at, collected_at, translation_zh, relevance_score,
               exclude_reason, is_spam, time_status
        FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,

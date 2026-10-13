@@ -12,6 +12,7 @@ interface RecordRow extends Record<string, unknown> {
   source: string;
   country_name: string;
   matched_target: string;
+  matched_term: string;
   author_name: string;
   author_handle: string;
   original_text: string;
@@ -118,6 +119,7 @@ export function DataPage() {
           { key: "country_name", header: "国家" },
           { key: "source", header: "来源" },
           { key: "matched_target", header: "目标" },
+          { key: "matched_term", header: "检索词", renderCell: (row) => row.matched_term || "—" },
           { key: "author_name", header: "作者" },
           { key: "relevance_score", header: "相关度", renderCell: (row) => row.relevance_score ?? "—" },
           { key: "exclude_reason", header: "排除", renderCell: (row) => row.exclude_reason || (row.is_spam ? "spam" : "—") },

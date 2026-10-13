@@ -71,7 +71,7 @@ npx wrangler queues create skyeyes-collect-dlq
 
 ### 6. 准备 X 和网页数据源
 
-- 在 [twitterapi.io](https://twitterapi.io/) 申请 API key。采集用的是 `GET /twitter/tweet/advanced_search`，时间范围用 `since_time` / `until_time`（Unix 秒）。多个目标会合成一条 `from:账号 OR "机构名" OR "关键词"`，再按批次大小和查询长度拆开，减少调用次数。
+- 在 [twitterapi.io](https://twitterapi.io/) 申请 API key。采集用的是 `GET /twitter/tweet/advanced_search`，时间范围用 `since_time` / `until_time`（Unix 秒）。每个目标单独查询，目标里的每条检索词再各发一次请求（短语加引号，账号用 `from:`），并带上该目标的排除词。高流量的短词不会占掉其他词的页数。`x_max_pages` 是**每条检索词**最多翻多少页。
 - twitterapi.io 按账号限制每秒请求数（[QPS 说明](https://twitterapi.io/qps-limits)）。从未付费的账号是 **0.2 次/秒**（每 5 秒 1 次），付费账号最高 **20 次/秒**。后台配置项 `x_qps` 默认 **0.2**。所有发往 twitterapi.io 的请求，包括同一查询的翻页，都按这个速率排队，批次之间共用 D1 里的一个时间槽，队列消费者并发也是 1。充值之后在后台「配置」里把「X 每秒请求数」调高即可，例如 `10`，不用重新部署。
 - 接口返回 429 时会读取 `Retry-After`。等待不超过 20 秒、且本批次还没为此睡过 3 次，就在当前批次里等待再请求。更长的等待，或没有 `Retry-After` 时的退避（5 秒、10 秒、20 秒，之后封顶 120 秒），会把队列消息按 `delaySeconds` 推迟重试。重试次数用尽、消息进入死信队列之前，限流不算失败批次。状态页的「X 限流」显示近 24 小时和近 7 日的次数，以及最近几次的 `Retry-After`。
 - Google News RSS 和 GDELT 不需要密钥。新闻的日期过滤是按天的，X 的时间边界是精确到秒的。
@@ -170,14 +170,34 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 
 1. 用 Access 允许的邮箱打开站点。
 2. 在「监测目标」删除「示例国家甲 / 示例国家乙」和占位关键词。删除国家会一并删除它的目标，已经采集的历史记录会保留国家名称。
-3. 添加真实国家，再添加人物、机构、关键词或 X 账号。账号类型的检索词不要带 `@`。
-4. 或用 CSV / Excel 批量导入。第一行表头必须是：
+3. 添加真实国家，再添加人物、机构、关键词或 X 账号。一个目标有一个**显示名**和多条**检索词**（后台里一行一条）。账号类型的检索词不要带 `@`。
+4. 或用 CSV / Excel 批量导入。第一行表头：
 
    ```text
-   country_code,kind,name,query,enabled
+   country_code,kind,name,query,exclude,case_sensitive,enabled
    ```
 
-   `kind` 只能是 `person`、`organization`、`keyword`、`handle`。`country_code` 必须已经存在。不要把这份真实文件提交到 Git。
+   `query` 里多条检索词用 `|` 分开，也可以在带引号的单元格里换行。`exclude` 同样。同一 `country_code` + `kind` + `name` 的多行会合并成一个目标（检索词和排除词取并集）。`terms`、`exclude_terms` 也可以当作表头。`kind` 只能是 `person`、`organization`、`keyword`、`handle`。`country_code` 必须已经存在。不要把这份真实文件提交到 Git。
+
+   短缩写不要拆成很多目标。例如把下面这些词放在**同一个**显示名下，每条单独占自己的翻页，命中都记成这个显示名：
+
+   ```text
+   country_code,kind,name,query,exclude,case_sensitive,enabled
+   pk,organization,俾路支解放军,BLA|Balochistan Liberation Army|俾路支解放军,Biologics License|bla bla,1,1
+   pk,organization,俾路支解放军,俾路支解放阵地,,1,1
+   pk,organization,俾路支解放阵地,BLF|Balochistan Liberation Front,,1,1
+   ```
+
+   导入后第一个目标有四条检索词：`BLA`、`Balochistan Liberation Army`、`俾路支解放军`、`俾路支解放阵地`，排除 `Biologics License` 和 `bla bla`。第二个目标是阵地的缩写和英文全称。
+
+   怎么填才不会把无关内容算进来：
+
+   - 2 到 5 个英文字母的缩写**始终**按大小写和整词匹配。请写成要命中的样子，例如 `BLA`，不要写成 `bla`。`BLA` 不会命中 `bla bla` 或 `blank`。
+   - 更长的英文短语默认不区分大小写，但必须是整词。`Baloch` 不会命中 `Balochistan`。需要区分大小写时打开目标上的「英文短语区分大小写」，或在 CSV 里把 `case_sensitive` 设为 `1`。
+   - 含汉字、假名或谚文的检索词按子串匹配。较短的中文词会命中包含它的更长句子。
+   - 排除词用同一套规则，命中就丢掉整条。FDA 的 `Biologics License`、口头禅 `bla bla` 都适合放在排除词里。
+   - 正文里没有任何一条检索词的结果不会入库（X 账号类除外：作者就是这个账号时保留）。丢掉的条数记在运行日志的 `filtered` 里。
+   - 命中检索词来自返回这条结果的那次查询，不是事后按目标顺序做子串扫描。数据页和 Excel 的「命中检索词」列可以看到是哪一条。
 5. 在「配置」里添加真实收件人并启用，填发件人，打开需要的数据源和「发送每日邮件」。
 6. 在「数据」页点「手动运行」。手动运行的窗口是「现在往前 N 小时」，N 是配置里的窗口长度。定时运行则结束于最近一个计划时刻。
 7. 状态页应出现这次运行、分国家的今日/昨日/累计数量，以及各数据源是否已配置。失败批次和近 7 日调用次数也在这一页。
@@ -191,10 +211,11 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 | --- | --- | --- |
 | `schedule_hour` | 10 | 上海时间的小时，0–23。Cron 固定为每小时整点，所以只能精确到小时。 |
 | `window_hours` | 24 | 定时运行的窗口长度。10:00 触发时，窗口是昨天 10:00 到今天 10:00。 |
-| `batch_size` | 12 | 每条搜索最多放多少个目标。查询太长时还会再拆开。 |
+| `batch_size` | 12 | 保留的配置。每个目标已经单独查询，不再把多个目标合成一条 OR。 |
 | `timezone` | Asia/Shanghai | 计划时刻、今日/昨日和邮件时间都用此时区。 |
 | `finalize_deadline_minutes` | 60 | 开始后超过这么久仍未收尾，下一次整点 Cron 会把已经入库的内容发出去，并把运行标为未完成。批次如果提前全部结束，会立刻收尾，不必等到截止。 |
-| `x_qps` | 0.2 | twitterapi.io 每秒请求数。未付费账号保持 0.2；充值后可改为 10，上限 20。改完立即生效。 |
+| `x_qps` | 0.2 | twitterapi.io 每秒请求数。未付费账号保持 0.2；充值后可改为 10，上限 20。改完立即生效。每一次 X 请求（含翻页）都受它限制。 |
+| `x_max_pages` | 5 | 每条检索词在 X 上最多翻多少页。同一目标的每条词各自拥有这个额度。 |
 
 改小时后，下一次到达该小时的整点 Cron 才会自动跑。赶不上就用「数据」页的手动运行。手动运行的采集窗口是「现在往前 N 小时」，但 Excel 的「今日」「昨日」始终按上面的计划窗口和发布时间计算。
 
@@ -221,7 +242,7 @@ npm run dev
 
 `npm run dev` 会先构建管理后台到 `admin/dist`，再启动 Wrangler。这个目录被 git 忽略，全新克隆里本来没有它；Wrangler 要求 `assets.directory` 指向的目录已经存在，所以不能跳过这一步直接执行 `wrangler dev`。构建完成后，后台和接口都在 `http://127.0.0.1:8787`。
 
-如果本地库是在这次限流改动之前建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 会加上 X 的共享时间槽和限流记录，并写入默认 `x_qps=0.2`。线上部署时 CI 会对远程库执行同一条迁移。
+如果本地库是更早版本建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 加上 X 的共享时间槽；`0005_target_terms.sql` 给目标加上多条检索词、排除词和大小写开关，并把原来的 `query` 复制成第一条检索词，同时给采集记录加上命中检索词。线上推到 `main` 时 CI 会对远程库执行同一条迁移。已有的单检索词目标不用手工改库，但建议按上一节把缩写、全称和中文名收成同一个目标，并补上排除词。
 
 改界面时可以另开一个终端，用 Vite 热更新，不必每次改完都重新构建：
 
@@ -241,14 +262,14 @@ npm run typecheck
 npm run build
 ```
 
-测试覆盖：上海时区及非东八区的窗口计算、OR 查询分批、按帖子 id / 链接去重、多表 Excel 以及重新生成时保留历史行、X 的 QPS 间隔、`Retry-After` 和批次内重试。
+测试覆盖：上海时区及非东八区的窗口计算、每个目标单独成批、每条检索词各自翻页、缩写整词匹配和排除词、多检索词导入、按帖子 id / 链接去重、Google News 同一文章不同参数合并、多表 Excel 以及重新生成时保留历史行、X 的 QPS 间隔、`Retry-After` 和批次内重试。
 
 ## 添加一个新数据源
 
 Reddit、Telegram 或其他来源不要写死在调度里。新增时改这些地方：
 
 1. 在 `src/domain/types.ts` 的 `SOURCE_IDS` 里加上新 id。
-2. 新建 `src/sources/<name>.ts`，实现 `SourceProvider`：`search({ targets, window, fetchImpl, apiKey })` 返回统一的 `CollectedRecord`（原文、链接、作者、发布时间、命中的目标）。用 `makeDedupeKey` 和 `matchTarget`。不要在数据源里自行决定能不能进日报；窗口、缺时间、旧文重发和规则过滤都在 `src/domain/gate.ts`，采集结果返回后统一执行。能解析出的发布时间放进 `publishedAt`，解析不了就留 `null`。
+2. 新建 `src/sources/<name>.ts`，实现 `SourceProvider`：`search({ targets, window, fetchImpl, apiKey })` 返回统一的 `CollectedRecord`（原文、链接、作者、发布时间、命中的目标和检索词）。用 `searchPlan` 按目标的每条检索词各查一次，用 `verifyHit` 确认正文真的命中，再用 `makeDedupeKey`。不要在数据源里自行决定能不能进日报；窗口、缺时间、旧文重发和规则过滤都在 `src/domain/gate.ts`，采集结果返回后统一执行。能解析出的发布时间放进 `publishedAt`，解析不了就留 `null`。对不上任何检索词的条目不要返回。
 3. 在 `src/sources/registry.ts` 注册。
 4. 在 `src/config/settings.ts` 增加一个 `*_enabled` 开关，并在 `migrations/` 里加一条默认设置。不要把密钥写进迁移。
 5. 在 `src/http/app.ts` 的状态接口里加上该来源的 `configured` 判断（只返回布尔值）。

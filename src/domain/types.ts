@@ -8,7 +8,11 @@ export interface QueryTarget {
   id: string;
   kind: TargetKind;
   name: string;
+  /** 第一条检索词。完整列表在 terms。 */
   query: string;
+  terms?: string[];
+  excludeTerms?: string[];
+  caseSensitive?: boolean;
 }
 
 export interface TimeWindow {
@@ -24,6 +28,7 @@ export interface CollectedRecord {
   countryName: string;
   matchedTargetId: string | null;
   matchedTarget: string;
+  matchedTerm?: string | null;
   authorHandle: string;
   authorName: string;
   authorUrl: string;
@@ -58,6 +63,7 @@ export interface SearchRequest {
 export interface SearchResult {
   records: CollectedRecord[];
   calls: number;
+  filtered?: number;
 }
 
 export interface SourceProvider {
