@@ -26,6 +26,13 @@ import { recordRateEvent, reserveXSlot, sleep } from "../sources/x-rate";
 import { interpretRecord } from "../ai/interpret";
 import { translationCell } from "../translate";
 import type { CollectMessage } from "./messages";
+import {
+  enqueueInChunks,
+  enqueueRunStatus,
+  firstQueuePage,
+  NOT_ENQUEUED_ERROR,
+  STUCK_BATCH_GRACE_MS,
+} from "./queue-batch";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const MAX_EXCEL_ROWS = 50000;
@@ -154,13 +161,238 @@ function isRetryable(error: unknown): boolean {
   return /限流|429|502|503|504|network|ECONN|fetch failed/i.test(error.message);
 }
 
+const ACTIVE_ENQUEUE_STATUSES = ["running", "partial", "failed"];
+
+interface EnqueueCounts {
+  sent: number;
+  failed: number;
+  pending: number;
+}
+
+export interface EnqueuePageResult {
+  enqueued: number;
+  failed: number;
+  pending: number;
+  warning: string | null;
+}
+
+function batchQueueMessage(runId: string, batchId: string, batchIndex: number): MessageSendRequest<CollectMessage> {
+  return {
+    body: { type: "batch", runId, batchId },
+    delaySeconds: Math.min(batchIndex * 3, 900),
+  };
+}
+
+async function enqueueCounts(db: D1Database, runId: string): Promise<EnqueueCounts> {
+  const counts = await db.prepare(
+    `SELECT
+       SUM(CASE WHEN status IN ('queued', 'running', 'done') AND enqueued_at IS NOT NULL AND enqueued_at NOT LIKE 'claim:%' THEN 1 ELSE 0 END) AS sent,
+       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN status = 'queued' AND (enqueued_at IS NULL OR enqueued_at LIKE 'claim:%') THEN 1 ELSE 0 END) AS pending
+     FROM batches WHERE run_id = ?`,
+  ).bind(runId).first<{ sent: number | null; failed: number | null; pending: number | null }>();
+  return {
+    sent: counts?.sent ?? 0,
+    failed: counts?.failed ?? 0,
+    pending: counts?.pending ?? 0,
+  };
+}
+
+async function syncRunEnqueueState(env: Env, runId: string, warning: string | null): Promise<EnqueueCounts> {
+  const counts = await enqueueCounts(env.DB, runId);
+  const current = await env.DB.prepare("SELECT status, notes FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ status: string; notes: string | null }>();
+  if (!current || !ACTIVE_ENQUEUE_STATUSES.includes(current.status)) return counts;
+  const status = enqueueRunStatus(counts);
+  let notes = warning ?? current.notes;
+  const enqueueNote = notes?.startsWith("未入队") || notes?.startsWith("还有批次没有写入队列");
+  if (counts.failed === 0 && counts.pending === 0 && enqueueNote) notes = null;
+  const finishedAt = status === "failed" ? new Date().toISOString() : null;
+  await env.DB.prepare(
+    `UPDATE runs
+     SET status = ?, notes = ?, batches_failed = ?, finished_at = CASE WHEN ? = 'failed' THEN ? ELSE NULL END
+     WHERE id = ? AND status IN ('running', 'partial', 'failed')`,
+  ).bind(status, notes, counts.failed, status, finishedAt, runId).run();
+  return counts;
+}
+
+async function claimBatches(db: D1Database, runId: string, ids: string[], token: string): Promise<{ id: string; batch_index: number }[]> {
+  for (let index = 0; index < ids.length; index += 80) {
+    const slice = ids.slice(index, index + 80);
+    const marks = slice.map(() => "?").join(",");
+    await db.prepare(
+      `UPDATE batches SET enqueued_at = ?
+       WHERE run_id = ? AND status = 'queued' AND enqueued_at IS NULL AND id IN (${marks})`,
+    ).bind(token, runId, ...slice).run();
+  }
+  const claimed = await db.prepare(
+    "SELECT id, batch_index FROM batches WHERE run_id = ? AND enqueued_at = ? ORDER BY batch_index",
+  ).bind(runId, token).all<{ id: string; batch_index: number }>();
+  return claimed.results;
+}
+
+export async function continueEnqueue(
+  env: Env,
+  runId: string,
+  options: { createdBefore?: string } = {},
+): Promise<EnqueuePageResult> {
+  const run = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ status: string }>();
+  if (!run || !ACTIVE_ENQUEUE_STATUSES.includes(run.status)) {
+    return { enqueued: 0, failed: 0, pending: 0, warning: null };
+  }
+  const selected = options.createdBefore
+    ? await env.DB.prepare(
+      `SELECT id, batch_index FROM batches
+       WHERE run_id = ? AND status = 'queued' AND enqueued_at IS NULL AND created_at <= ?
+       ORDER BY batch_index LIMIT 100`,
+    ).bind(runId, options.createdBefore).all<{ id: string; batch_index: number }>()
+    : await env.DB.prepare(
+      `SELECT id, batch_index FROM batches
+       WHERE run_id = ? AND status = 'queued' AND enqueued_at IS NULL
+       ORDER BY batch_index LIMIT 100`,
+    ).bind(runId).all<{ id: string; batch_index: number }>();
+  const candidates = selected.results.map((row) => batchQueueMessage(runId, row.id, row.batch_index));
+  const page = firstQueuePage(candidates).page;
+  if (page.length === 0) {
+    const counts = await syncRunEnqueueState(env, runId, null);
+    return { enqueued: 0, failed: 0, pending: counts.pending, warning: null };
+  }
+  const token = `claim:${new Date().toISOString()}:${crypto.randomUUID()}`;
+  const ids = page.map((message) => message.body.type === "batch" ? message.body.batchId : "");
+  const claimed = await claimBatches(env.DB, runId, ids.filter(Boolean), token);
+  if (claimed.length === 0) {
+    const counts = await enqueueCounts(env.DB, runId);
+    return { enqueued: 0, failed: 0, pending: counts.pending, warning: null };
+  }
+  const messages = claimed.map((row) => batchQueueMessage(runId, row.id, row.batch_index));
+  const sentPage = await enqueueInChunks(env.COLLECT_QUEUE, messages);
+  let warning = sentPage.error;
+  if (sentPage.error) {
+    logError("enqueue page failed", new Error(sentPage.error), { runId, batches: claimed.length });
+    const finishedAt = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE batches
+       SET status = 'failed', enqueued_at = NULL, error = ?, finished_at = ?
+       WHERE enqueued_at = ?`,
+    ).bind(sentPage.error, finishedAt, token).run();
+  } else {
+    await env.DB.prepare("UPDATE batches SET enqueued_at = ? WHERE enqueued_at = ?")
+      .bind(new Date().toISOString(), token)
+      .run();
+  }
+  const counts = await syncRunEnqueueState(env, runId, warning);
+  if (counts.pending > 0) {
+    const follow = await enqueueInChunks(env.COLLECT_QUEUE, [{ body: { type: "enqueue", runId } }]);
+    if (follow.error) {
+      logError("enqueue continuation failed", new Error(follow.error), { runId, pending: counts.pending });
+      warning = warning ?? "还有批次没有写入队列。下次定时运行或状态页的「重新入队」会继续发送。";
+      await syncRunEnqueueState(env, runId, warning);
+    }
+  }
+  return {
+    enqueued: sentPage.sent.length,
+    failed: sentPage.failed.length,
+    pending: counts.pending,
+    warning,
+  };
+}
+
+export async function requeueStuckBatches(env: Env, options: {
+  now?: Date;
+  runId?: string;
+  minAgeMs?: number;
+  includeFailed?: boolean;
+} = {}): Promise<{ runs: number; batches: number; warning: string | null }> {
+  const now = options.now ?? new Date();
+  const minAgeMs = options.minAgeMs ?? 0;
+  const createdBefore = new Date(now.getTime() - minAgeMs).toISOString();
+  const claimCutoff = new Date(now.getTime() - STUCK_BATCH_GRACE_MS).toISOString();
+  await env.DB.prepare(
+    `UPDATE batches SET enqueued_at = NULL
+     WHERE status = 'queued' AND enqueued_at LIKE 'claim:%' AND enqueued_at < ?`,
+  ).bind(`claim:${claimCutoff}`).run();
+  if (options.includeFailed) {
+    const failedSql = options.runId
+      ? `UPDATE batches SET status = 'queued', error = NULL, finished_at = NULL
+         WHERE run_id = ? AND enqueued_at IS NULL AND status = 'failed' AND error LIKE '未入队：%'`
+      : `UPDATE batches SET status = 'queued', error = NULL, finished_at = NULL
+         WHERE enqueued_at IS NULL AND status = 'failed' AND error LIKE '未入队：%'`;
+    const failed = options.runId
+      ? env.DB.prepare(failedSql).bind(options.runId)
+      : env.DB.prepare(failedSql);
+    await failed.run();
+  }
+  const runs = options.runId
+    ? await env.DB.prepare(
+      `SELECT DISTINCT run_id FROM batches
+       WHERE run_id = ? AND status = 'queued' AND enqueued_at IS NULL AND created_at <= ?`,
+    ).bind(options.runId, createdBefore).all<{ run_id: string }>()
+    : await env.DB.prepare(
+      `SELECT DISTINCT run_id FROM batches
+       WHERE status = 'queued' AND enqueued_at IS NULL AND created_at <= ?`,
+    ).bind(createdBefore).all<{ run_id: string }>();
+  let batches = 0;
+  let warning: string | null = null;
+  for (const row of runs.results) {
+    const current = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+      .bind(row.run_id)
+      .first<{ status: string }>();
+    if (!current || current.status === "cancelled" || current.status === "completed" || current.status === "finalizing") {
+      continue;
+    }
+    if (current.status === "failed" || current.status === "incomplete") {
+      await env.DB.prepare(
+        "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ? AND status IN ('failed', 'incomplete')",
+      ).bind(row.run_id).run();
+    }
+    const page = await continueEnqueue(env, row.run_id, minAgeMs > 0 ? { createdBefore } : {});
+    batches += page.enqueued;
+    warning = warning ?? page.warning;
+  }
+  return { runs: runs.results.length, batches, warning };
+}
+
+export async function cancelRun(env: Env, runId: string): Promise<{ cancelledBatches: number }> {
+  const current = await env.DB.prepare("SELECT id, status FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ id: string; status: string }>();
+  if (!current) throw new Error("运行不存在");
+  if (current.status === "completed" || current.status === "cancelled" || current.status === "finalizing") {
+    throw new Error("这次运行已经结束");
+  }
+  const now = new Date().toISOString();
+  const cancelled = await env.DB.prepare(
+    `UPDATE batches
+     SET status = 'failed', error = '已取消', finished_at = ?
+     WHERE run_id = ? AND status = 'queued' AND (enqueued_at IS NULL OR enqueued_at LIKE 'claim:%')`,
+  ).bind(now, runId).run();
+  const pending = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM batches WHERE run_id = ? AND status IN ('queued', 'running')`,
+  ).bind(runId).first<{ n: number }>();
+  if ((pending?.n ?? 0) === 0) {
+    await env.DB.prepare(
+      `UPDATE runs SET status = 'cancelled', finished_at = ?, notes = '已取消', batches_failed = (
+         SELECT COUNT(*) FROM batches WHERE run_id = ? AND status = 'failed'
+       ) WHERE id = ?`,
+    ).bind(now, runId, runId).run();
+  } else {
+    await env.DB.prepare(
+      `UPDATE runs SET status = 'partial', notes = '已取消尚未入队的批次。' WHERE id = ?`,
+    ).bind(runId).run();
+  }
+  return { cancelledBatches: cancelled.meta.changes ?? 0 };
+}
+
 export async function startRun(env: Env, input: {
   trigger: "schedule" | "manual";
   now: Date;
   slotKey: string;
   windowStart: Date;
   windowEnd: Date;
-}): Promise<{ runId: string; created: boolean; batches: number }> {
+}): Promise<{ runId: string; created: boolean; batches: number; enqueued: number; warning: string | null }> {
   const settings = await loadSettings(env.DB);
   const runId = crypto.randomUUID();
   const slotKey = input.trigger === "manual" ? `manual-${runId}` : input.slotKey;
@@ -186,7 +418,7 @@ export async function startRun(env: Env, input: {
       .first<{ id: string }>();
     if (existing && input.trigger === "schedule") {
       log("schedule already started", { runId: existing.id, slotKey: input.slotKey });
-      return { runId: existing.id, created: false, batches: 0 };
+      return { runId: existing.id, created: false, batches: 0, enqueued: 0, warning: null };
     }
     throw error;
   }
@@ -234,10 +466,10 @@ export async function startRun(env: Env, input: {
   log("run started", { runId, trigger: input.trigger, batches: messages.length });
   if (messages.length === 0) {
     await finalizeRun(env, runId, "complete");
-  } else {
-    await env.COLLECT_QUEUE.sendBatch(messages);
+    return { runId, created: true, batches: 0, enqueued: 0, warning: null };
   }
-  return { runId, created: true, batches: messages.length };
+  const page = await continueEnqueue(env, runId);
+  return { runId, created: true, batches: messages.length, enqueued: page.enqueued, warning: page.warning };
 }
 
 async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> {
@@ -544,8 +776,11 @@ async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
     `SELECT COUNT(*) AS pending FROM batches WHERE run_id = ? AND status IN ('queued', 'running')`,
   ).bind(runId).first<{ pending: number }>();
   const run = await env.DB.prepare("SELECT status FROM runs WHERE id = ?").bind(runId).first<{ status: string }>();
-  if ((pending?.pending ?? 0) === 0 && run?.status === "running") {
-    await env.COLLECT_QUEUE.send({ type: "finalize", runId, reason: "complete" } satisfies CollectMessage);
+  if ((pending?.pending ?? 0) === 0 && (run?.status === "running" || run?.status === "partial")) {
+    const follow = await enqueueInChunks(env.COLLECT_QUEUE, [{
+      body: { type: "finalize", runId, reason: "complete" },
+    }]);
+    if (follow.error) logError("finalize enqueue failed", new Error(follow.error), { runId });
   }
 }
 
@@ -639,14 +874,14 @@ async function sendDigest(
 
 export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline"): Promise<void> {
   const claim = await env.DB.prepare(
-    "UPDATE runs SET status = 'finalizing' WHERE id = ? AND status = 'running'",
+    "UPDATE runs SET status = 'finalizing' WHERE id = ? AND status IN ('running', 'partial')",
   ).bind(runId).run();
   if ((claim.meta.changes ?? 0) === 0) return;
 
   const settings = await loadSettings(env.DB);
   const run = await env.DB.prepare(
-    "SELECT id, status, window_start, window_end, batches_failed FROM runs WHERE id = ?",
-  ).bind(runId).first<RunRow>();
+    "SELECT id, status, window_start, window_end, batches_failed, notes FROM runs WHERE id = ?",
+  ).bind(runId).first<RunRow & { notes: string | null }>();
   if (!run) return;
   const counts = await env.DB.prepare(
     `SELECT
@@ -658,7 +893,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   const failed = counts?.failed ?? 0;
   const pending = counts?.pending ?? 0;
   const incomplete = reason === "deadline" || failed > 0 || pending > 0;
-  let notes = incomplete ? "有批次未完成，已发送目前收集到的内容。" : "";
+  let notes = [run.notes, incomplete ? "有批次未完成，已发送目前收集到的内容。" : ""].filter(Boolean).join(" ");
   let emailStatus = "skipped";
   let emailError: string | null = null;
 
@@ -752,12 +987,23 @@ export async function handleDeadLetter(env: Env, message: CollectMessage): Promi
     await maybeEnqueueFinalize(env, message.runId);
     return;
   }
+  if (message.type === "enqueue") {
+    const finishedAt = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE batches
+       SET status = 'failed', error = ?, finished_at = ?
+       WHERE run_id = ? AND status = 'queued' AND (enqueued_at IS NULL OR enqueued_at LIKE 'claim:%')`,
+    ).bind(NOT_ENQUEUED_ERROR, finishedAt, message.runId).run();
+    await syncRunEnqueueState(env, message.runId, NOT_ENQUEUED_ERROR);
+    await maybeEnqueueFinalize(env, message.runId);
+    return;
+  }
   await finalizeRun(env, message.runId, message.reason);
 }
 
 export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
   const rows = await env.DB.prepare(
-    "SELECT id FROM runs WHERE status = 'running' AND deadline_at <= ?",
+    "SELECT id FROM runs WHERE status IN ('running', 'partial') AND deadline_at <= ?",
   ).bind(now.toISOString()).all<{ id: string }>();
   for (const row of rows.results) {
     await finalizeRun(env, row.id, "deadline");

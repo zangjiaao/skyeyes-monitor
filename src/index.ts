@@ -1,7 +1,7 @@
 import { createApp } from "./http/app";
 import { logError } from "./log";
 import { isCollectMessage } from "./pipeline/messages";
-import { handleDeadLetter, processBatch, finalizeRun } from "./pipeline/run";
+import { continueEnqueue, handleDeadLetter, processBatch, finalizeRun } from "./pipeline/run";
 import { handleScheduled } from "./schedule";
 import { RateLimitError } from "./sources/x";
 
@@ -26,6 +26,8 @@ export default {
           await handleDeadLetter(env, message.body);
         } else if (message.body.type === "batch") {
           await processBatch(env, message.body.runId, message.body.batchId);
+        } else if (message.body.type === "enqueue") {
+          await continueEnqueue(env, message.body.runId);
         } else {
           await finalizeRun(env, message.body.runId, message.body.reason);
         }

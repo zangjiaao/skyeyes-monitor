@@ -1,11 +1,17 @@
 import { loadSettings } from "./config/settings";
 import { decideSchedule, rollingWindow } from "./domain/time";
 import { logError } from "./log";
-import { finalizeOverdue, startRun } from "./pipeline/run";
+import { STUCK_BATCH_GRACE_MS } from "./pipeline/queue-batch";
+import { finalizeOverdue, requeueStuckBatches, startRun } from "./pipeline/run";
 
 export async function handleScheduled(env: Env, scheduledTime: number): Promise<void> {
   const now = new Date(scheduledTime);
   await finalizeOverdue(env, now);
+  try {
+    await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
+  } catch (error) {
+    logError("requeue stuck batches failed", error);
+  }
   const settings = await loadSettings(env.DB);
   const decision = decideSchedule(now, {
     timeZone: settings.timeZone,
@@ -34,7 +40,17 @@ export async function handleScheduled(env: Env, scheduledTime: number): Promise<
   }
 }
 
-export async function startManualRun(env: Env, now = new Date()): Promise<{ runId: string; batches: number }> {
+export async function startManualRun(env: Env, now = new Date()): Promise<{
+  runId: string;
+  batches: number;
+  enqueued: number;
+  warning: string | null;
+}> {
+  try {
+    await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
+  } catch (error) {
+    logError("requeue stuck batches failed", error);
+  }
   const settings = await loadSettings(env.DB);
   const window = rollingWindow(now, settings.windowHours);
   const started = await startRun(env, {
@@ -44,5 +60,10 @@ export async function startManualRun(env: Env, now = new Date()): Promise<{ runI
     windowStart: window.start,
     windowEnd: window.end,
   });
-  return { runId: started.runId, batches: started.batches };
+  return {
+    runId: started.runId,
+    batches: started.batches,
+    enqueued: started.enqueued,
+    warning: started.warning,
+  };
 }

@@ -1,10 +1,21 @@
 import { useEffect, useState } from "react";
 import { Badge } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { Table } from "@astryxdesign/core/Table";
 import { VStack, HStack } from "@astryxdesign/core/Layout";
 import { Banner } from "@astryxdesign/core/Banner";
 import { api, formatTime } from "../api";
+
+const RUN_STATUS: Record<string, string> = {
+  running: "进行中",
+  partial: "部分失败",
+  failed: "失败",
+  cancelled: "已取消",
+  completed: "完成",
+  incomplete: "未完成",
+  finalizing: "收尾中",
+};
 
 interface CountryCount extends Record<string, unknown> {
   id: string;
@@ -25,6 +36,7 @@ interface RunRow extends Record<string, unknown> {
   batches_failed: number;
   relevance_failed: number;
   email_status: string | null;
+  notes: string | null;
 }
 
 interface SourceState extends Record<string, unknown> {
@@ -43,6 +55,7 @@ interface StatusPayload {
   timezone: string;
   countries: CountryCount[];
   runs: RunRow[];
+  stuckBatches: number;
   failedBatches: Array<Record<string, unknown> & { id: string; country_name: string; source: string; error: string | null }>;
   apiUsage: Array<Record<string, unknown> & { source: string; calls: number; items: number }>;
   sources: Record<string, SourceState>;
@@ -80,10 +93,38 @@ function flag(ok: boolean, yes: string, no: string) {
 export function StatusPage() {
   const [data, setData] = useState<StatusPayload | null>(null);
   const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  function reload() {
+    api<StatusPayload>("/api/status").then(setData).catch((reason: Error) => setError(reason.message));
+  }
 
   useEffect(() => {
-    api<StatusPayload>("/api/status").then(setData).catch((reason: Error) => setError(reason.message));
+    reload();
   }, []);
+
+  function requeue(runId?: string) {
+    setActionError("");
+    const path = runId ? `/api/runs/${runId}/requeue` : "/api/runs/requeue";
+    api<{ batches: number; warning: string | null }>(path, { method: "POST" })
+      .then((result) => {
+        setNotice(result.warning ?? `已重新入队 ${result.batches} 个批次`);
+        if (result.warning) setActionError(result.warning);
+        reload();
+      })
+      .catch((reason: Error) => setActionError(reason.message));
+  }
+
+  function cancel(runId: string) {
+    setActionError("");
+    api<{ cancelledBatches: number }>(`/api/runs/${runId}/cancel`, { method: "POST" })
+      .then((result) => {
+        setNotice(`已取消 ${result.cancelledBatches} 个尚未入队的批次`);
+        reload();
+      })
+      .catch((reason: Error) => setActionError(reason.message));
+  }
 
   if (error) return <Banner status="error" title="无法读取状态" description={error} />;
   if (!data) return <Text type="body">正在读取状态…</Text>;
@@ -128,19 +169,47 @@ export function StatusPage() {
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
         ]}
       />
+      {actionError ? <Banner status="error" title="队列操作失败" description={actionError} /> : null}
+      {notice ? <Banner status="success" title={notice} isDismissable onDismiss={() => setNotice("")} /> : null}
+      {(data.stuckBatches ?? 0) > 0 ? (
+        <Banner
+          status="warning"
+          title={`${data.stuckBatches} 个批次已写入数据库，但还没有进入采集队列`}
+          description="重新入队会补发这些批次。取消只会停下尚未入队的批次，已经在采集的批次会继续。"
+        />
+      ) : null}
+      <HStack gap={2}>
+        <Button label="重新入队卡住的批次" variant="secondary" onClick={() => requeue()} />
+      </HStack>
       <Heading level={2}>最近运行</Heading>
       <Table
         density="compact"
         idKey="id"
+        textOverflow="truncate"
         data={data.runs}
         columns={[
           { key: "started_at", header: "开始", renderCell: (row) => formatTime(row.started_at) },
           { key: "trigger", header: "触发" },
-          { key: "status", header: "状态" },
+          { key: "status", header: "状态", renderCell: (row) => RUN_STATUS[row.status] ?? row.status },
           { key: "records_added", header: "新增" },
           { key: "batches_failed", header: "失败批次" },
+          { key: "notes", header: "说明", renderCell: (row) => row.notes || "—" },
           { key: "relevance_failed", header: "评分失败", renderCell: (row) => row.relevance_failed ?? 0 },
           { key: "email_status", header: "邮件", renderCell: (row) => row.email_status || "—" },
+          {
+            key: "actions",
+            header: "操作",
+            renderCell: (row) => {
+              const open = row.status === "running" || row.status === "partial" || row.status === "failed";
+              if (!open) return "—";
+              return (
+                <HStack gap={1}>
+                  <Button label="重新入队" variant="secondary" size="sm" onClick={() => requeue(row.id)} />
+                  <Button label="取消" variant="ghost" size="sm" onClick={() => cancel(row.id)} />
+                </HStack>
+              );
+            },
+          },
         ]}
       />
       <Heading level={2}>失败批次</Heading>

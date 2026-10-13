@@ -220,8 +220,11 @@ export function DataPage() {
           variant="primary"
           onClick={() => {
             setError("");
-            api<{ runId: string }>("/api/runs", { method: "POST" })
-              .then((result) => setNotice(`已开始运行 ${result.runId}`))
+            api<{ runId: string; warning?: string | null }>("/api/runs", { method: "POST" })
+              .then((result) => {
+                if (result.warning) setError(result.warning);
+                setNotice(result.warning ? `运行 ${result.runId} 已建立，部分批次没有入队` : `已开始运行 ${result.runId}`);
+              })
               .catch((reason: Error) => setError(reason.message));
           }}
         />

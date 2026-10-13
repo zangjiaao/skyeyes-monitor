@@ -20,13 +20,15 @@ import { hideRecords, parseDeleteIds } from "../records/delete";
 import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
+import { enqueueErrorMessage } from "../pipeline/queue-batch";
+import { cancelRun, requeueStuckBatches } from "../pipeline/run";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
 type AppVars = { email: string };
 
-function jsonError(error: unknown, status: 400 | 403 | 500 = 400): Response {
+function jsonError(error: unknown, status: 400 | 403 | 404 | 500 = 400): Response {
   const message = error instanceof Error ? error.message : "请求失败";
   return Response.json({ error: message }, { status });
 }
@@ -363,6 +365,10 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       ).bind(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString()).all(),
     ]);
     const rateLimit = await loadRateLimit(c.env.DB, now, settings.xQps);
+    const stuck = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM batches
+       WHERE status = 'queued' AND (enqueued_at IS NULL OR enqueued_at LIKE 'claim:%')`,
+    ).first<{ n: number }>();
     const countMap = (rows: { country_id: string; n: number }[]) => new Map(rows.map((row) => [row.country_id, row.n]));
     const totalMap = countMap(totals.results);
     const todayMap = countMap(todayCounts.results);
@@ -394,6 +400,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         };
       }),
       runs: runs.results,
+      stuckBatches: stuck?.n ?? 0,
       failedBatches: failed.results,
       apiUsage: usage.results,
       rateLimit,
@@ -875,7 +882,39 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const started = await startManualRun(c.env);
       return c.json(started, 202);
     } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (/15000|Unknown Internal Error|sendBatch/i.test(message)) {
+        return jsonError(new Error(enqueueErrorMessage(error)), 500);
+      }
       return jsonError(error, 500);
+    }
+  });
+
+  app.post("/api/runs/requeue", async (c) => {
+    try {
+      const result = await requeueStuckBatches(c.env, { includeFailed: true });
+      return c.json(result);
+    } catch (error) {
+      return jsonError(new Error(enqueueErrorMessage(error)), 500);
+    }
+  });
+
+  app.post("/api/runs/:id/requeue", async (c) => {
+    try {
+      const result = await requeueStuckBatches(c.env, { runId: c.req.param("id"), includeFailed: true });
+      return c.json(result);
+    } catch (error) {
+      return jsonError(new Error(enqueueErrorMessage(error)), 500);
+    }
+  });
+
+  app.post("/api/runs/:id/cancel", async (c) => {
+    try {
+      const result = await cancelRun(c.env, c.req.param("id"));
+      return c.json(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      return jsonError(error, message === "运行不存在" ? 404 : 400);
     }
   });
 
