@@ -16,7 +16,8 @@ import {
   type ImportPreviewRow,
 } from "../import/table";
 import { storeExcel } from "../pipeline/run";
-import { hideRecords, parseDeleteIds } from "../records/delete";
+import { hideRecords, hideRecordsMatching, parseDeleteIds } from "../records/delete";
+import { RECORD_LIST_SELECT, buildRecordListQuery, recordListInputFromBody } from "../records/list";
 import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
@@ -724,38 +725,46 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   });
 
   app.get("/api/records", async (c) => {
-    const settings = await loadSettings(c.env.DB);
-    const view = c.req.query("view") || "all";
-    const countryId = c.req.query("countryId");
-    const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") || 40)));
-    const offset = Math.max(0, Number(c.req.query("offset") || 0));
-    const clauses = ["deleted_at IS NULL"];
-    const binds: string[] = [];
-    if (countryId) {
-      clauses.push("country_id = ?");
-      binds.push(countryId);
-    }
-    if (view === "today" || view === "yesterday") {
-      const bounds = closedWindow(new Date(), {
+    try {
+      const settings = await loadSettings(c.env.DB);
+      const query = buildRecordListQuery({
+        view: c.req.query("view"),
+        countryId: c.req.query("countryId"),
+        target: c.req.query("target"),
+        targetId: c.req.query("targetId"),
+        source: c.req.query("source"),
+        publishedFrom: c.req.query("publishedFrom"),
+        publishedTo: c.req.query("publishedTo"),
+        relevance: c.req.query("relevance"),
+        relevanceMin: c.req.query("relevanceMin"),
+        translation: c.req.query("translation"),
+        spam: c.req.query("spam"),
+        q: c.req.query("q"),
+        sort: c.req.query("sort"),
+        order: c.req.query("order"),
+        page: c.req.query("page"),
+        pageSize: c.req.query("pageSize"),
+        limit: c.req.query("limit"),
+        offset: c.req.query("offset"),
+      }, {
         timeZone: settings.timeZone,
         scheduleHour: settings.scheduleHour,
         windowHours: settings.windowHours,
-      }, view === "today" ? 0 : 1);
-      clauses.push(DELIVERABLE_SQL);
-      clauses.push("published_at >= ? AND published_at < ?");
-      binds.push(bounds.start.toISOString(), bounds.end.toISOString());
+      });
+      const rows = await c.env.DB.prepare(
+        `${RECORD_LIST_SELECT} WHERE ${query.where} ORDER BY ${query.orderBy} LIMIT ? OFFSET ?`,
+      ).bind(...query.binds, query.limit, query.offset).all();
+      const total = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM records WHERE ${query.where}`)
+        .bind(...query.binds).first<{ n: number }>();
+      return c.json({
+        records: rows.results,
+        total: total?.n ?? 0,
+        page: query.page,
+        pageSize: query.pageSize,
+      });
+    } catch (error) {
+      return jsonError(error);
     }
-    const where = clauses.join(" AND ");
-    const rows = await c.env.DB.prepare(
-      `SELECT id, source, url, country_name, matched_target, matched_term, author_handle, author_name, author_url,
-              original_text, published_at, collected_at, translation_zh, translation_status, translation_error,
-              relevance_score, relevance_error, ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, news_edition,
-              exclude_reason, is_spam, time_status
-       FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,
-    ).bind(...binds, limit, offset).all();
-    const total = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM records WHERE ${where}`)
-      .bind(...binds).first<{ n: number }>();
-    return c.json({ records: rows.results, total: total?.n ?? 0 });
   });
 
   app.delete("/api/records/:id", async (c) => {
@@ -815,6 +824,25 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const body = await readJson(c.req.raw);
       const ids = parseDeleteIds(body.ids);
       const deleted = await hideRecords(c.env.DB, ids);
+      if (deleted === 0) return c.json({ deleted: 0, excel: false, excelError: null });
+      const excel = await refreshWorkbook(c.env);
+      return c.json({ deleted, ...excel });
+    } catch (error) {
+      return jsonError(error);
+    }
+  });
+
+  app.post("/api/records/delete-matching", async (c) => {
+    try {
+      const body = await readJson(c.req.raw);
+      if (body.confirm !== true) throw new Error("请确认后再删除符合筛选的记录");
+      const settings = await loadSettings(c.env.DB);
+      const query = buildRecordListQuery(recordListInputFromBody(body), {
+        timeZone: settings.timeZone,
+        scheduleHour: settings.scheduleHour,
+        windowHours: settings.windowHours,
+      });
+      const deleted = await hideRecordsMatching(c.env.DB, query.where, query.binds);
       if (deleted === 0) return c.json({ deleted: 0, excel: false, excelError: null });
       const excel = await refreshWorkbook(c.env);
       return c.json({ deleted, ...excel });

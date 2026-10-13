@@ -6,6 +6,7 @@ import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table, useTableSelection, useTableSelectionState } from "@astryxdesign/core/Table";
+import { TextInput } from "@astryxdesign/core/TextInput";
 import { api, formatTime } from "../api";
 
 interface RecordRow extends Record<string, unknown> {
@@ -34,14 +35,48 @@ interface RecordRow extends Record<string, unknown> {
   is_spam: number;
 }
 
+interface NamedOption {
+  id: string;
+  name: string;
+}
+
+interface ListPayload {
+  records: RecordRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+const PAGE_SIZES = ["20", "50", "100"];
+
 export function DataPage() {
   const [view, setView] = useState("all");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState("20");
+  const [jump, setJump] = useState("1");
+  const [countryId, setCountryId] = useState("");
+  const [targetId, setTargetId] = useState("");
+  const [source, setSource] = useState("");
+  const [publishedFrom, setPublishedFrom] = useState("");
+  const [publishedTo, setPublishedTo] = useState("");
+  const [relevance, setRelevance] = useState("all");
+  const [relevanceMin, setRelevanceMin] = useState("");
+  const [translation, setTranslation] = useState("all");
+  const [spam, setSpam] = useState("all");
+  const [keywordDraft, setKeywordDraft] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [sort, setSort] = useState("published");
+  const [order, setOrder] = useState("desc");
+  const [countries, setCountries] = useState<NamedOption[]>([]);
+  const [targets, setTargets] = useState<NamedOption[]>([]);
   const [records, setRecords] = useState<RecordRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [pendingIds, setPendingIds] = useState<string[]>([]);
+  const [matchOpen, setMatchOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [scoreMode, setScoreMode] = useState<"" | "selected" | "unscored">("");
   const [scoring, setScoring] = useState(false);
@@ -57,19 +92,91 @@ export function DataPage() {
   });
   const selection = useTableSelection(selectionConfig);
 
-  function load(nextView = view) {
-    return api<{ records: RecordRow[]; total: number }>(`/api/records?view=${nextView}&limit=50`)
-      .then((payload) => {
-        setRecords(payload.records);
-        setTotal(payload.total);
-      });
+  const selectedTarget = targets.find((item) => item.id === targetId);
+  const pageCount = Math.max(1, Math.ceil(total / Number(pageSize)));
+
+  function listParams(): URLSearchParams {
+    const params = new URLSearchParams();
+    params.set("view", view);
+    params.set("page", String(page));
+    params.set("pageSize", pageSize);
+    params.set("sort", sort);
+    params.set("order", order);
+    if (countryId) params.set("countryId", countryId);
+    if (targetId) {
+      params.set("targetId", targetId);
+      if (selectedTarget?.name) params.set("target", selectedTarget.name);
+    }
+    if (source) params.set("source", source);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(publishedFrom)) params.set("publishedFrom", publishedFrom);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(publishedTo)) params.set("publishedTo", publishedTo);
+    if (relevance === "scored" || relevance === "unscored") params.set("relevance", relevance);
+    if ((relevance === "below" || relevance === "at_least") && /^\d+$/.test(relevanceMin) && Number(relevanceMin) <= 100) {
+      params.set("relevance", relevance);
+      params.set("relevanceMin", relevanceMin);
+    }
+    if (translation !== "all") params.set("translation", translation);
+    if (spam !== "all") params.set("spam", spam);
+    if (keyword) params.set("q", keyword);
+    return params;
+  }
+
+  function resetPage() {
+    setSelectedKeys(new Set());
+    setPage(1);
+  }
+
+  function refresh() {
+    setReloadToken((value) => value + 1);
+  }
+
+  function jumpTo() {
+    if (!/^\d+$/.test(jump) || Number(jump) < 1) {
+      setError("页码须是正整数");
+      return;
+    }
+    setError("");
+    setSelectedKeys(new Set());
+    setPage(Math.min(Number(jump), pageCount));
   }
 
   useEffect(() => {
-    load(view).catch((reason: Error) => setError(reason.message));
-    // view 变化时重新拉取。
+    api<{ countries: NamedOption[] }>("/api/countries")
+      .then((payload) => setCountries(payload.countries))
+      .catch((reason: Error) => setError(reason.message));
+  }, []);
+
+  useEffect(() => {
+    const path = countryId ? `/api/targets?countryId=${encodeURIComponent(countryId)}` : "/api/targets";
+    api<{ targets: NamedOption[] }>(path)
+      .then((payload) => setTargets(payload.targets))
+      .catch((reason: Error) => setError(reason.message));
+  }, [countryId]);
+
+  useEffect(() => {
+    const params = listParams();
+    let cancelled = false;
+    api<ListPayload>(`/api/records?${params.toString()}`)
+      .then((payload) => {
+        if (cancelled) return;
+        const pages = Math.max(1, Math.ceil(payload.total / payload.pageSize));
+        if (page > pages) {
+          setPage(pages);
+          return;
+        }
+        setRecords(payload.records);
+        setTotal(payload.total);
+        setJump(String(payload.page));
+      })
+      .catch((reason: Error) => {
+        if (!cancelled) setError(reason.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // listParams 读取当前筛选。筛选变化时重新拉取。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view]);
+  }, [view, page, pageSize, countryId, targetId, source, publishedFrom, publishedTo, relevance, relevanceMin, translation, spam, keyword, sort, order, reloadToken, targets]);
 
   async function runScore() {
     const mode = scoreMode;
@@ -103,7 +210,7 @@ export function DataPage() {
       setScoreMode("");
       setSelectedKeys(new Set());
       setNotice(failed > 0 ? `已评分 ${scored} 条，${failed} 条失败` : `已评分 ${scored} 条`);
-      await load();
+      refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "评分失败");
     } finally {
@@ -143,7 +250,7 @@ export function DataPage() {
       setTranslateMode("");
       setSelectedKeys(new Set());
       setNotice(failed > 0 ? `已翻译 ${translated} 条，${failed} 条失败` : `已翻译 ${translated} 条`);
-      await load();
+      refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "翻译失败");
     } finally {
@@ -183,7 +290,7 @@ export function DataPage() {
       setInterpretMode("");
       setSelectedKeys(new Set());
       setNotice(failed > 0 ? `已解读 ${interpreted} 条，${failed} 条仍有失败` : `已解读 ${interpreted} 条`);
-      await load();
+      refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "解读失败");
     } finally {
@@ -196,7 +303,7 @@ export function DataPage() {
       <VStack gap={1}>
         <Heading level={1}>数据</Heading>
         <Text type="body" color="secondary">
-          {`今日和昨日按发布时间的计划窗口筛选，只含可进入日报的条目。全部视图含时间不明和低相关度记录，供核对。当前筛选共 ${total} 条。表头复选框只选中这一页。删除后记录从列表和 Excel 消失，同一条内容不会再被采集进来。`}
+          {`今日和昨日按发布时间的计划窗口筛选，只含可进入日报的条目。全部视图含时间不明和低相关度记录，供核对。当前筛选共 ${total} 条，第 ${page} / ${pageCount} 页。表头复选框只选中这一页。删除后记录从列表和 Excel 消失，同一条内容不会再被采集进来。`}
         </Text>
       </VStack>
       {error ? <Banner status="error" title="操作失败" description={error} /> : null}
@@ -206,7 +313,7 @@ export function DataPage() {
           label="视图"
           value={view}
           onChange={(value) => {
-            setSelectedKeys(new Set());
+            resetPage();
             setView(value);
           }}
           options={[
@@ -256,6 +363,12 @@ export function DataPage() {
           onClick={() => setPendingIds([...selectedKeys])}
         />
         <Button
+          label={total > 0 ? `删除全部符合筛选的 ${total} 条` : "删除全部符合筛选"}
+          variant="destructive"
+          isDisabled={total === 0 || deleting || translating}
+          onClick={() => setMatchOpen(true)}
+        />
+        <Button
           label="下载 Excel"
           variant="secondary"
           onClick={() => {
@@ -276,6 +389,171 @@ export function DataPage() {
               .catch((reason: Error) => setError(reason.message));
           }}
         />
+      </HStack>
+      <HStack gap={2}>
+        <Selector
+          label="国家"
+          value={countryId}
+          onChange={(value) => {
+            resetPage();
+            setCountryId(value);
+            setTargetId("");
+          }}
+          options={[{ value: "", label: "全部国家" }, ...countries.map((item) => ({ value: item.id, label: item.name }))]}
+        />
+        <Selector
+          label="目标"
+          value={targetId}
+          onChange={(value) => {
+            resetPage();
+            setTargetId(value);
+          }}
+          options={[{ value: "", label: "全部目标" }, ...targets.map((item) => ({ value: item.id, label: item.name }))]}
+        />
+        <Selector
+          label="来源"
+          value={source}
+          onChange={(value) => {
+            resetPage();
+            setSource(value);
+          }}
+          options={[
+            { value: "", label: "全部来源" },
+            { value: "x", label: "X" },
+            { value: "google_news", label: "Google News" },
+            { value: "gdelt", label: "GDELT" },
+          ]}
+        />
+        <TextInput
+          label="发布日起"
+          placeholder="YYYY-MM-DD"
+          value={publishedFrom}
+          onChange={(value) => {
+            setPublishedFrom(value);
+            if (value === "" || /^\d{4}-\d{2}-\d{2}$/.test(value)) resetPage();
+          }}
+        />
+        <TextInput
+          label="发布日止"
+          placeholder="YYYY-MM-DD"
+          value={publishedTo}
+          onChange={(value) => {
+            setPublishedTo(value);
+            if (value === "" || /^\d{4}-\d{2}-\d{2}$/.test(value)) resetPage();
+          }}
+        />
+      </HStack>
+      <HStack gap={2}>
+        <Selector
+          label="相关度"
+          value={relevance}
+          onChange={(value) => {
+            resetPage();
+            setRelevance(value);
+          }}
+          options={[
+            { value: "all", label: "全部" },
+            { value: "scored", label: "已评分" },
+            { value: "unscored", label: "未评分" },
+            { value: "at_least", label: "不低于阈值" },
+            { value: "below", label: "低于阈值" },
+          ]}
+        />
+        {relevance === "at_least" || relevance === "below" ? (
+          <TextInput
+            label="阈值"
+            placeholder="0–100"
+            value={relevanceMin}
+            onChange={(value) => {
+              setRelevanceMin(value);
+              if (value === "" || (/^\d+$/.test(value) && Number(value) <= 100)) resetPage();
+            }}
+          />
+        ) : null}
+        <Selector
+          label="翻译"
+          value={translation}
+          onChange={(value) => {
+            resetPage();
+            setTranslation(value);
+          }}
+          options={[
+            { value: "all", label: "全部" },
+            { value: "ok", label: "已翻译" },
+            { value: "failed", label: "翻译失败" },
+            { value: "empty", label: "空白" },
+          ]}
+        />
+        <Selector
+          label="垃圾"
+          value={spam}
+          onChange={(value) => {
+            resetPage();
+            setSpam(value);
+          }}
+          options={[
+            { value: "all", label: "全部" },
+            { value: "spam", label: "只看垃圾" },
+            { value: "not_spam", label: "隐藏垃圾" },
+          ]}
+        />
+        <TextInput
+          label="关键词"
+          placeholder="原文或译文"
+          value={keywordDraft}
+          onChange={setKeywordDraft}
+          onEnter={() => {
+            resetPage();
+            setKeyword(keywordDraft.trim());
+          }}
+        />
+        <Button
+          label="搜索"
+          variant="secondary"
+          onClick={() => {
+            resetPage();
+            setKeyword(keywordDraft.trim());
+          }}
+        />
+        <Selector
+          label="排序"
+          value={sort}
+          onChange={(value) => {
+            resetPage();
+            setSort(value);
+          }}
+          options={[
+            { value: "published", label: "发布时间" },
+            { value: "score", label: "相关度" },
+          ]}
+        />
+        <Selector
+          label="顺序"
+          value={order}
+          onChange={(value) => {
+            resetPage();
+            setOrder(value);
+          }}
+          options={sort === "score"
+            ? [{ value: "desc", label: "从高到低" }, { value: "asc", label: "从低到高" }]
+            : [{ value: "desc", label: "从新到旧" }, { value: "asc", label: "从旧到新" }]}
+        />
+      </HStack>
+      <HStack gap={2}>
+        <Selector
+          label="每页"
+          value={pageSize}
+          onChange={(value) => {
+            resetPage();
+            setPageSize(value);
+          }}
+          options={PAGE_SIZES.map((size) => ({ value: size, label: `${size} 条` }))}
+        />
+        <Button label="上一页" variant="secondary" isDisabled={page <= 1} onClick={() => { setSelectedKeys(new Set()); setPage(page - 1); }} />
+        <Button label="下一页" variant="secondary" isDisabled={page >= pageCount} onClick={() => { setSelectedKeys(new Set()); setPage(page + 1); }} />
+        <TextInput label="页码" value={jump} onChange={setJump} onEnter={jumpTo} width={88} />
+        <Button label="跳转" variant="secondary" onClick={jumpTo} />
+        <Text type="body" color="secondary">{`本页 ${records.length} 条`}</Text>
       </HStack>
       <Table
         density="compact"
@@ -328,7 +606,7 @@ export function DataPage() {
                   variant="secondary"
                   onClick={() => {
                     api(`/api/records/${row.id}/spam`, { method: "POST", body: JSON.stringify({ blockAuthor: false }) })
-                      .then(() => load())
+                      .then(() => refresh())
                       .catch((reason: Error) => setError(reason.message));
                   }}
                 />
@@ -346,7 +624,7 @@ export function DataPage() {
                     api(`/api/records/${row.id}/spam`, { method: "POST", body: JSON.stringify({ blockAuthor: true }) })
                       .then(() => {
                         setNotice("已标为垃圾，并加入屏蔽名单");
-                        return load();
+                        refresh();
                       })
                       .catch((reason: Error) => setError(reason.message));
                   }}
@@ -513,7 +791,8 @@ export function DataPage() {
                   setSelectedKeys(new Set());
                   if (result.excel) setNotice(`已删除 ${result.deleted} 条，并重新生成 Excel`);
                   else setError(result.excelError || "记录已删除，但 Excel 没有更新。请点重新生成。");
-                  await load();
+                  if (ids.length >= records.length && page > 1) setPage(page - 1);
+                  else refresh();
                 }).catch((reason: Error) => setError(reason.message))
                   .finally(() => setDeleting(false));
               }}
@@ -523,6 +802,57 @@ export function DataPage() {
               variant="secondary"
               isDisabled={deleting}
               onClick={() => setPendingIds([])}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
+      <Dialog
+        isOpen={matchOpen}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setMatchOpen(false);
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={`删除全部符合筛选的 ${total} 条`}
+            onOpenChange={(open) => {
+              if (!open && !deleting) setMatchOpen(false);
+            }}
+          />
+          <Text type="body">
+            {`将删除当前筛选下的全部 ${total} 条记录，不只是这一页的 ${records.length} 条。删除后它们会从数据页和 Excel 里消失，同一条内容不会再被采集进来。这一步不能在页面上撤销。`}
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="删除"
+              variant="destructive"
+              isLoading={deleting}
+              onClick={() => {
+                const filter = Object.fromEntries(listParams());
+                setDeleting(true);
+                setError("");
+                api<{ deleted: number; excel: boolean; excelError: string | null }>("/api/records/delete-matching", {
+                  method: "POST",
+                  body: JSON.stringify({ ...filter, confirm: true }),
+                }).then((result) => {
+                  setMatchOpen(false);
+                  setSelectedKeys(new Set());
+                  if (result.excel) setNotice(`已删除 ${result.deleted} 条，并重新生成 Excel`);
+                  else if (result.deleted === 0) setNotice("没有符合筛选的记录");
+                  else setError(result.excelError || "记录已删除，但 Excel 没有更新。请点重新生成。");
+                  setPage(1);
+                  refresh();
+                }).catch((reason: Error) => setError(reason.message))
+                  .finally(() => setDeleting(false));
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={deleting}
+              onClick={() => setMatchOpen(false)}
             />
           </HStack>
         </VStack>

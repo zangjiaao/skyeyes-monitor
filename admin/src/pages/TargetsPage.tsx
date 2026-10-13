@@ -95,7 +95,7 @@ export function TargetsPage() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [importing, setImporting] = useState(false);
-  const [exportCurrentCountry, setExportCurrentCountry] = useState(true);
+  const [exportCurrentCountry, setExportCurrentCountry] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   function resetTargetForm() {

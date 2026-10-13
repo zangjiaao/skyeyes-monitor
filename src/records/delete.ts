@@ -26,3 +26,16 @@ export async function hideRecords(db: D1Database, ids: string[]): Promise<number
   ).bind(new Date().toISOString(), ...ids).run();
   return result.meta.changes ?? 0;
 }
+
+/** 按列表同一套 WHERE 软删除。调用方必须已经包含 deleted_at IS NULL。 */
+export async function hideRecordsMatching(
+  db: D1Database,
+  where: string,
+  binds: Array<string | number>,
+): Promise<number> {
+  if (!where.includes("deleted_at IS NULL")) throw new Error("筛选条件无效");
+  const result = await db.prepare(
+    `UPDATE records SET deleted_at = ? WHERE ${where}`,
+  ).bind(new Date().toISOString(), ...binds).run();
+  return result.meta.changes ?? 0;
+}
