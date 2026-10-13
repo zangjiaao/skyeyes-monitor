@@ -2,13 +2,25 @@ import { buildXQuery } from "../domain/batch";
 import { makeDedupeKey } from "../domain/dedupe";
 import { matchTarget } from "../domain/match";
 import type { CollectedRecord, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
+import { parseRetryAfter, retryDelaySeconds, shouldWaitInBatch, sleep } from "./x-rate";
 
 const ENDPOINT = "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
 export class RateLimitError extends Error {
-  constructor(message: string) {
+  readonly delaySeconds: number;
+  readonly retryAfterSeconds: number | null;
+  readonly recorded: boolean;
+
+  constructor(message: string, options?: {
+    delaySeconds?: number;
+    retryAfterSeconds?: number | null;
+    recorded?: boolean;
+  }) {
     super(message);
     this.name = "RateLimitError";
+    this.delaySeconds = options?.delaySeconds ?? 45;
+    this.retryAfterSeconds = options?.retryAfterSeconds ?? null;
+    this.recorded = options?.recorded ?? false;
   }
 }
 
@@ -83,6 +95,21 @@ export function tweetsToRecords(tweets: Tweet[], request: SearchRequest): Collec
   return records;
 }
 
+async function noteRateLimit(
+  request: SearchRequest,
+  status: number,
+  retryAfterSeconds: number | null,
+  delaySeconds: number,
+): Promise<boolean> {
+  if (!request.onRateLimit) return false;
+  try {
+    await request.onRateLimit({ status, retryAfterSeconds, delaySeconds });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const xProvider: SourceProvider = {
   id: "x",
   async search(request: SearchRequest): Promise<SearchResult> {
@@ -97,17 +124,37 @@ export const xProvider: SourceProvider = {
     const records: CollectedRecord[] = [];
     let calls = 0;
     let cursor = "";
+    let waits = 0;
+    const pause = request.sleepImpl ?? sleep;
     for (let page = 0; page < maxPages; page += 1) {
       const url = new URL(ENDPOINT);
       url.searchParams.set("query", query);
       url.searchParams.set("queryType", "Latest");
       if (cursor) url.searchParams.set("cursor", cursor);
-      const response = await request.fetchImpl(url, {
-        headers: { "X-API-Key": request.apiKey },
-      });
-      calls += 1;
-      if (response.status === 429 || response.status === 503) {
-        throw new RateLimitError(`twitterapi.io 限流 ${response.status}`);
+      let response: Response;
+      for (;;) {
+        if (request.beforeRequest) await request.beforeRequest();
+        response = await request.fetchImpl(url, {
+          headers: { "X-API-Key": request.apiKey },
+        });
+        calls += 1;
+        if (response.status !== 429 && response.status !== 503) break;
+        const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
+        const delaySeconds = retryDelaySeconds({
+          attempt: (request.queueAttempt ?? 1) - 1 + waits,
+          retryAfterSeconds,
+        });
+        const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
+        if (shouldWaitInBatch(delaySeconds, waits)) {
+          waits += 1;
+          await pause(delaySeconds * 1000);
+          continue;
+        }
+        throw new RateLimitError(`twitterapi.io 限流 ${response.status}`, {
+          delaySeconds,
+          retryAfterSeconds,
+          recorded,
+        });
       }
       if (!response.ok) {
         const detail = await response.text();

@@ -21,6 +21,7 @@ import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
 import { errorMessage, log, logError } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
+import { recordRateEvent, reserveXSlot, sleep } from "../sources/x-rate";
 import { scoreRelevance } from "../domain/relevance";
 import { translateToChinese } from "../translate";
 import type { CollectMessage } from "./messages";
@@ -59,6 +60,7 @@ interface BatchRow {
   source: SourceId;
   target_ids: string;
   status: string;
+  attempts: number;
 }
 
 interface RecordRow {
@@ -227,7 +229,7 @@ async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> 
 
 export async function processBatch(env: Env, runId: string, batchId: string): Promise<void> {
   const batch = await env.DB.prepare(
-    "SELECT id, run_id, country_id, source, target_ids, status FROM batches WHERE id = ?",
+    "SELECT id, run_id, country_id, source, target_ids, status, attempts FROM batches WHERE id = ?",
   ).bind(batchId).first<BatchRow>();
   if (!batch || batch.run_id !== runId || batch.status === "done" || batch.status === "failed") return;
   const run = await env.DB.prepare(
@@ -262,6 +264,15 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       apiKey: batch.source === "x" ? env.TWITTERAPI_IO_KEY : undefined,
       maxPages: settings.xMaxPages,
       excludeRetweets: settings.excludeRetweets,
+      queueAttempt: batch.attempts + 1,
+      beforeRequest: batch.source === "x" ? async () => {
+        const slotAt = await reserveXSlot(env.DB, settings.xQps);
+        const waitMs = Math.max(0, slotAt - Date.now());
+        if (waitMs > 0) await sleep(waitMs);
+      } : undefined,
+      onRateLimit: batch.source === "x" ? async (info) => {
+        await recordRateEvent(env.DB, { source: "x", ...info });
+      } : undefined,
     });
     const unique = dedupeRecords(result.records);
     const collectedAt = new Date().toISOString();
@@ -396,6 +407,18 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     await maybeEnqueueFinalize(env, runId);
   } catch (error) {
     if (isRetryable(error)) {
+      if (error instanceof RateLimitError && !error.recorded) {
+        try {
+          await recordRateEvent(env.DB, {
+            source: batch.source,
+            status: 429,
+            retryAfterSeconds: error.retryAfterSeconds,
+            delaySeconds: error.delaySeconds,
+          });
+        } catch (recordError) {
+          logError("rate event failed", recordError, { runId, batchId });
+        }
+      }
       logError("batch retry", error, { runId, batchId });
       throw error;
     }

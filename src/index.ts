@@ -3,6 +3,7 @@ import { logError } from "./log";
 import { isCollectMessage } from "./pipeline/messages";
 import { handleDeadLetter, processBatch, finalizeRun } from "./pipeline/run";
 import { handleScheduled } from "./schedule";
+import { RateLimitError } from "./sources/x";
 
 const app = createApp();
 
@@ -32,7 +33,9 @@ export default {
       } catch (error) {
         logError("queue message failed", error, { queue: batch.queue });
         if (deadLetter) message.ack();
-        else message.retry({ delaySeconds: 45 });
+        else message.retry({
+          delaySeconds: error instanceof RateLimitError ? error.delaySeconds : 45,
+        });
       }
     }
   },

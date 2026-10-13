@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { assertAllowedEmail, authenticate } from "../auth/access";
-import { EDITABLE_SETTINGS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
+import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule } from "../domain/time";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
@@ -28,6 +28,61 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
 function requireString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label}不能为空`);
   return value.trim();
+}
+
+async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
+  const empty = {
+    xQps,
+    hits24h: 0,
+    hits7d: 0,
+    lastHitAt: null as string | null,
+    lastRetryAfterSeconds: null as number | null,
+    recent: [] as Array<{
+      id: string;
+      source: string;
+      status: number;
+      retryAfterSeconds: number | null;
+      delaySeconds: number;
+      recordedAt: string;
+    }>,
+  };
+  try {
+    const since24 = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const since7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const [day, week, recent] = await Promise.all([
+      db.prepare("SELECT COUNT(*) AS n FROM rate_events WHERE source = 'x' AND recorded_at >= ?").bind(since24).first<{ n: number }>(),
+      db.prepare("SELECT COUNT(*) AS n FROM rate_events WHERE source = 'x' AND recorded_at >= ?").bind(since7).first<{ n: number }>(),
+      db.prepare(
+        `SELECT id, source, status, retry_after_seconds, delay_seconds, recorded_at
+         FROM rate_events WHERE source = 'x' ORDER BY recorded_at DESC LIMIT 8`,
+      ).all<{
+        id: string;
+        source: string;
+        status: number;
+        retry_after_seconds: number | null;
+        delay_seconds: number;
+        recorded_at: string;
+      }>(),
+    ]);
+    const last = recent.results[0];
+    return {
+      xQps,
+      hits24h: Number(day?.n ?? 0),
+      hits7d: Number(week?.n ?? 0),
+      lastHitAt: last?.recorded_at ?? null,
+      lastRetryAfterSeconds: last?.retry_after_seconds ?? null,
+      recent: recent.results.map((row) => ({
+        id: row.id,
+        source: row.source,
+        status: row.status,
+        retryAfterSeconds: row.retry_after_seconds,
+        delaySeconds: row.delay_seconds,
+        recordedAt: row.recorded_at,
+      })),
+    };
+  } catch {
+    return empty;
+  }
 }
 
 export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
@@ -77,6 +132,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
          FROM api_usage WHERE recorded_at >= ? GROUP BY source`,
       ).bind(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString()).all(),
     ]);
+    const rateLimit = await loadRateLimit(c.env.DB, now, settings.xQps);
     const countMap = (rows: { country_id: string; n: number }[]) => new Map(rows.map((row) => [row.country_id, row.n]));
     const totalMap = countMap(totals.results);
     const todayMap = countMap(todayCounts.results);
@@ -110,6 +166,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       runs: runs.results,
       failedBatches: failed.results,
       apiUsage: usage.results,
+      rateLimit,
       sources: {
         x: {
           label: "X / twitterapi.io",
@@ -322,8 +379,10 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
 
   app.get("/api/settings", async (c) => {
     const rows = await c.env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
-    const values: Record<string, string> = {};
-    for (const key of EDITABLE_SETTINGS) values[key] = "";
+    const values: Record<string, string> = { ...SETTING_DEFAULTS };
+    for (const key of EDITABLE_SETTINGS) {
+      if (values[key] === undefined) values[key] = "";
+    }
     for (const row of rows.results) values[row.key] = row.value;
     return c.json({ settings: values });
   });

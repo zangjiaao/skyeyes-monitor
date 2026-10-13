@@ -72,6 +72,8 @@ npx wrangler queues create skyeyes-collect-dlq
 ### 6. 准备 X 和网页数据源
 
 - 在 [twitterapi.io](https://twitterapi.io/) 申请 API key。采集用的是 `GET /twitter/tweet/advanced_search`，时间范围用 `since_time` / `until_time`（Unix 秒）。多个目标会合成一条 `from:账号 OR "机构名" OR "关键词"`，再按批次大小和查询长度拆开，减少调用次数。
+- twitterapi.io 按账号限制每秒请求数（[QPS 说明](https://twitterapi.io/qps-limits)）。从未付费的账号是 **0.2 次/秒**（每 5 秒 1 次），付费账号最高 **20 次/秒**。后台配置项 `x_qps` 默认 **0.2**。所有发往 twitterapi.io 的请求，包括同一查询的翻页，都按这个速率排队，批次之间共用 D1 里的一个时间槽，队列消费者并发也是 1。充值之后在后台「配置」里把「X 每秒请求数」调高即可，例如 `10`，不用重新部署。
+- 接口返回 429 时会读取 `Retry-After`。等待不超过 20 秒、且本批次还没为此睡过 3 次，就在当前批次里等待再请求。更长的等待，或没有 `Retry-After` 时的退避（5 秒、10 秒、20 秒，之后封顶 120 秒），会把队列消息按 `delaySeconds` 推迟重试。重试次数用尽、消息进入死信队列之前，限流不算失败批次。状态页的「X 限流」显示近 24 小时和近 7 日的次数，以及最近几次的 `Retry-After`。
 - Google News RSS 和 GDELT 不需要密钥。新闻的日期过滤是按天的，X 的时间边界是精确到秒的。
 - 后台可以分别开关 X、Google News、GDELT。没配 `TWITTERAPI_IO_KEY` 时，X 会显示为未配置，对应批次会失败并出现在状态页，不会把密钥打进日志以外的页面。
 
@@ -192,6 +194,7 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 | `batch_size` | 12 | 每条搜索最多放多少个目标。查询太长时还会再拆开。 |
 | `timezone` | Asia/Shanghai | 计划时刻、今日/昨日和邮件时间都用此时区。 |
 | `finalize_deadline_minutes` | 60 | 开始后超过这么久仍未收尾，下一次整点 Cron 会把已经入库的内容发出去，并把运行标为未完成。批次如果提前全部结束，会立刻收尾，不必等到截止。 |
+| `x_qps` | 0.2 | twitterapi.io 每秒请求数。未付费账号保持 0.2；充值后可改为 10，上限 20。改完立即生效。 |
 
 改小时后，下一次到达该小时的整点 Cron 才会自动跑。赶不上就用「数据」页的手动运行。手动运行的采集窗口是「现在往前 N 小时」，但 Excel 的「今日」「昨日」始终按上面的计划窗口和发布时间计算。
 
@@ -218,6 +221,8 @@ npm run dev
 
 `npm run dev` 会先构建管理后台到 `admin/dist`，再启动 Wrangler。这个目录被 git 忽略，全新克隆里本来没有它；Wrangler 要求 `assets.directory` 指向的目录已经存在，所以不能跳过这一步直接执行 `wrangler dev`。构建完成后，后台和接口都在 `http://127.0.0.1:8787`。
 
+如果本地库是在这次限流改动之前建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 会加上 X 的共享时间槽和限流记录，并写入默认 `x_qps=0.2`。线上部署时 CI 会对远程库执行同一条迁移。
+
 改界面时可以另开一个终端，用 Vite 热更新，不必每次改完都重新构建：
 
 ```bash
@@ -236,7 +241,7 @@ npm run typecheck
 npm run build
 ```
 
-测试覆盖：上海时区及非东八区的窗口计算、OR 查询分批、按帖子 id / 链接去重、多表 Excel 以及重新生成时保留历史行。
+测试覆盖：上海时区及非东八区的窗口计算、OR 查询分批、按帖子 id / 链接去重、多表 Excel 以及重新生成时保留历史行、X 的 QPS 间隔、`Retry-After` 和批次内重试。
 
 ## 添加一个新数据源
 
@@ -250,7 +255,7 @@ Reddit、Telegram 或其他来源不要写死在调度里。新增时改这些�
 6. 在 `admin/src/pages/SettingsPage.tsx` 加一个开关。
 7. 如果这个来源需要密钥，把名字加进 `wrangler.jsonc` 的 `secrets.required`，用 `wrangler secret put` 注入，并在 README 的密钥表里补一行。
 
-队列、去重、翻译、Excel 和邮件会自动带上新来源，不需要再写一套调度。限流请抛出 `RateLimitError`，队列会按约 45 秒重试，最多 5 次，然后进入死信队列。
+队列、去重、翻译、Excel 和邮件会自动带上新来源，不需要再写一套调度。限流请抛出 `RateLimitError`。X 会按 `Retry-After` 和 `x_qps` 决定在批次内等待还是按 `delaySeconds` 重新入队；其他来源默认约 45 秒后重试。最多 5 次，然后进入死信队列，这时才把批次标为失败。
 
 ## 隐私
 

@@ -45,6 +45,21 @@ interface StatusPayload {
   failedBatches: Array<Record<string, unknown> & { id: string; country_name: string; source: string; error: string | null }>;
   apiUsage: Array<Record<string, unknown> & { source: string; calls: number; items: number }>;
   sources: Record<string, SourceState>;
+  rateLimit: {
+    xQps: number;
+    hits24h: number;
+    hits7d: number;
+    lastHitAt: string | null;
+    lastRetryAfterSeconds: number | null;
+    recent: Array<Record<string, unknown> & {
+      id: string;
+      source: string;
+      status: number;
+      retryAfterSeconds: number | null;
+      delaySeconds: number;
+      recordedAt: string;
+    }>;
+  };
   delivery: {
     emailEnabled: boolean;
     provider: string;
@@ -132,6 +147,22 @@ export function StatusPage() {
           { key: "country_name", header: "国家" },
           { key: "source", header: "来源" },
           { key: "error", header: "错误", renderCell: (row) => row.error || "—" },
+        ]}
+      />
+      <Heading level={2}>X 限流</Heading>
+      <Text type="body" color="secondary">
+        {`当前每秒 ${data.rateLimit.xQps} 次。近 24 小时 ${data.rateLimit.hits24h} 次，近 7 日 ${data.rateLimit.hits7d} 次。最近一次 ${formatTime(data.rateLimit.lastHitAt)}，Retry-After ${data.rateLimit.lastRetryAfterSeconds ?? "—"} 秒。`}
+      </Text>
+      <Table
+        density="compact"
+        idKey="id"
+        data={data.rateLimit.recent}
+        columns={[
+          { key: "recordedAt", header: "时间", renderCell: (row) => formatTime(row.recordedAt) },
+          { key: "source", header: "来源" },
+          { key: "status", header: "状态码" },
+          { key: "retryAfterSeconds", header: "Retry-After", renderCell: (row) => row.retryAfterSeconds ?? "—" },
+          { key: "delaySeconds", header: "等待秒数" },
         ]}
       />
       <Heading level={2}>近 7 日接口用量</Heading>

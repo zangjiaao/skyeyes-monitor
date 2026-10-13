@@ -28,6 +28,7 @@ const FIELDS = [
   ["translation_target_lang", "翻译目标语言代码"],
   ["finalize_deadline_minutes", "收尾截止分钟"],
   ["x_max_pages", "X 每个查询最多翻页"],
+  ["x_qps", "X 每秒请求数。未付费账号保持 0.2（每 5 秒 1 次）；充值后可提高到 10，上限 20"],
   ["excel_key", "R2 中的 Excel 文件名"],
   ["min_text_length", "最短正文长度，0 表示不限制"],
   ["min_followers", "X 最少粉丝数，0 表示不限制；没有粉丝数时不因此排除"],

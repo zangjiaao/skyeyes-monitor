@@ -1,4 +1,5 @@
 import type { SourceId } from "../domain/types";
+import { normalizeXQps, X_QPS_DEFAULT, X_QPS_MAX, X_QPS_MIN } from "../sources/x-rate";
 
 export const SETTING_DEFAULTS: Record<string, string> = {
   schedule_hour: "10",
@@ -20,6 +21,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   app_base_url: "",
   finalize_deadline_minutes: "60",
   x_max_pages: "5",
+  x_qps: "0.2",
   min_text_length: "20",
   exclude_words: "",
   blocked_accounts: "",
@@ -51,6 +53,7 @@ export interface AppSettings {
   appBaseUrl: string;
   finalizeDeadlineMinutes: number;
   xMaxPages: number;
+  xQps: number;
   minTextLength: number;
   excludeWords: string[];
   blockedAccounts: string[];
@@ -128,6 +131,7 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     appBaseUrl: merged.app_base_url.replace(/\/$/, ""),
     finalizeDeadlineMinutes: clampInt(merged.finalize_deadline_minutes, 60, 15, 180),
     xMaxPages: clampInt(merged.x_max_pages, 5, 1, 10),
+    xQps: normalizeXQps(merged.x_qps),
     minTextLength: clampInt(merged.min_text_length, 20, 0, 500),
     excludeWords: parseTermList(merged.exclude_words),
     blockedAccounts: parseTermList(merged.blocked_accounts),
@@ -182,6 +186,17 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
   assertInt(next.min_followers, 0, 10_000_000, "最少粉丝数必须是 0 到 10000000，0 表示不限制");
   assertInt(next.min_account_age_days, 0, 3650, "最少账号天数必须是 0 到 3650，0 表示不限制");
   assertInt(next.relevance_threshold, 0, 100, "相关度阈值必须是 0 到 100，0 表示不因分数排除");
+  if (next.x_qps !== undefined) {
+    if (next.x_qps === "") {
+      next.x_qps = String(X_QPS_DEFAULT);
+    } else {
+      const qps = Number(next.x_qps);
+      if (!Number.isFinite(qps) || qps < X_QPS_MIN || qps > X_QPS_MAX) {
+        throw new Error("X 每秒请求数必须是 0.1 到 20。未付费账号请保持 0.2，充值后最高可到 20");
+      }
+      next.x_qps = String(Math.round(qps * 100) / 100);
+    }
+  }
   if (next.exclude_words !== undefined) next.exclude_words = parseTermList(next.exclude_words).join(",");
   if (next.blocked_accounts !== undefined) next.blocked_accounts = parseTermList(next.blocked_accounts).join(",");
   if ((next.exclude_words?.length ?? 0) > 4000 || (next.blocked_accounts?.length ?? 0) > 4000) {

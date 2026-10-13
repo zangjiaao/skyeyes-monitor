@@ -35,6 +35,12 @@ export interface CollectedRecord {
   publishedAt: string | null;
 }
 
+export interface RateLimitNotice {
+  status: number;
+  retryAfterSeconds: number | null;
+  delaySeconds: number;
+}
+
 export interface SearchRequest {
   targets: QueryTarget[];
   window: TimeWindow;
@@ -43,6 +49,10 @@ export interface SearchRequest {
   apiKey?: string;
   maxPages?: number;
   excludeRetweets?: boolean;
+  beforeRequest?: () => Promise<void>;
+  onRateLimit?: (info: RateLimitNotice) => Promise<void>;
+  sleepImpl?: (ms: number) => Promise<void>;
+  queueAttempt?: number;
 }
 
 export interface SearchResult {
