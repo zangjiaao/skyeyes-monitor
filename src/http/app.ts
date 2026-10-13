@@ -526,7 +526,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const rows = await c.env.DB.prepare(
       `SELECT id, source, url, country_name, matched_target, matched_term, author_handle, author_name, author_url,
               original_text, published_at, collected_at, translation_zh, translation_status, translation_error,
-              relevance_score, relevance_error, ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider,
+              relevance_score, relevance_error, ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, news_edition,
               exclude_reason, is_spam, time_status
        FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,
     ).bind(...binds, limit, offset).all();

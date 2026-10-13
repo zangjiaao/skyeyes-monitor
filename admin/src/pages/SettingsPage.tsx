@@ -79,6 +79,12 @@ export function SettingsPage() {
         <CheckboxInput label="启用 Google News" value={flag("google_news_enabled")} onChange={(checked) => setValues({ ...values, google_news_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="启用 GDELT" value={flag("gdelt_enabled")} onChange={(checked) => setValues({ ...values, gdelt_enabled: checked ? "1" : "0" })} />
       </HStack>
+      <TextInput
+        label="Google News 版本"
+        value={values.google_news_editions ?? ""}
+        onChange={(value) => setValues({ ...values, google_news_editions: value })}
+        description="逗号或换行分隔。默认 en-US,zh-CN。可加 en-PK、ar、ar-EG。每个版本单独查询，不写参数并不是全部语言。"
+      />
       <HStack gap={3}>
         <CheckboxInput label="翻译成中文" value={flag("translation_enabled")} onChange={(checked) => setValues({ ...values, translation_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="相关度评分" value={flag("relevance_enabled")} onChange={(checked) => setValues({ ...values, relevance_enabled: checked ? "1" : "0" })} />

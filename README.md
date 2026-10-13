@@ -74,7 +74,7 @@ npx wrangler queues create skyeyes-collect-dlq
 - 在 [twitterapi.io](https://twitterapi.io/) 申请 API key。采集用的是 `GET /twitter/tweet/advanced_search`，时间范围用 `since_time` / `until_time`（Unix 秒）。每个目标单独查询，目标里的每条检索词再各发一次请求（短语加引号，账号用 `from:`），并带上该目标的排除词。高流量的短词不会占掉其他词的页数。`x_max_pages` 是**每条检索词**最多翻多少页。
 - twitterapi.io 按账号限制每秒请求数（[QPS 说明](https://twitterapi.io/qps-limits)）。从未付费的账号是 **0.2 次/秒**（每 5 秒 1 次），付费账号最高 **20 次/秒**。后台配置项 `x_qps` 默认 **0.2**。所有发往 twitterapi.io 的请求，包括同一查询的翻页，都按这个速率排队，批次之间共用 D1 里的一个时间槽，队列消费者并发也是 1。充值之后在后台「配置」里把「X 每秒请求数」调高即可，例如 `10`，不用重新部署。
 - 接口返回 429 时会读取 `Retry-After`。等待不超过 20 秒、且本批次还没为此睡过 3 次，就在当前批次里等待再请求。更长的等待，或没有 `Retry-After` 时的退避（5 秒、10 秒、20 秒，之后封顶 120 秒），会把队列消息按 `delaySeconds` 推迟重试。重试次数用尽、消息进入死信队列之前，限流不算失败批次。状态页的「X 限流」显示近 24 小时和近 7 日的次数，以及最近几次的 `Retry-After`。
-- Google News RSS 和 GDELT 不需要密钥。新闻的日期过滤是按天的，X 的时间边界是精确到秒的。
+- Google News RSS 和 GDELT 不需要密钥。Google News 必须带版本参数，不写 `hl` / `gl` / `ceid` 并不是全部语言。默认查 `en-US`（`hl=en-US&gl=US&ceid=US:en`）和 `zh-CN`（`hl=zh-CN&gl=CN&ceid=CN:zh-Hans`）。后台「Google News 版本」可以再加 `en-PK`、`ar`（沙特阿拉伯语版 `SA:ar`）、`ar-EG` 等，最多 8 个。每个目标的每条检索词会对每个版本各请求一次，再按链接和标题合并。记录上会留下版本，例如 `en-US`。日期仍是 `after` / `before` 的按天过滤，入库时还要过统一的时间窗口。
 - 后台可以分别开关 X、Google News、GDELT。没配 `TWITTERAPI_IO_KEY` 时，X 会显示为未配置，对应批次会失败并出现在状态页，不会把密钥打进日志以外的页面。
 
 ### 7. 准备发信
@@ -218,6 +218,7 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 | `finalize_deadline_minutes` | 60 | 开始后超过这么久仍未收尾，下一次整点 Cron 会把已经入库的内容发出去，并把运行标为未完成。批次如果提前全部结束，会立刻收尾，不必等到截止。 |
 | `x_qps` | 0.2 | twitterapi.io 每秒请求数。未付费账号保持 0.2；充值后可改为 10，上限 20。改完立即生效。每一次 X 请求（含翻页）都受它限制。 |
 | `x_max_pages` | 5 | 每条检索词在 X 上最多翻多少页。同一目标的每条词各自拥有这个额度。 |
+| `google_news_editions` | en-US,zh-CN | Google News 版本，逗号或换行分隔。每个版本单独查询。`ar` 表示沙特阿拉伯语版。 |
 
 改小时后，下一次到达该小时的整点 Cron 才会自动跑。赶不上就用「数据」页的手动运行。手动运行的采集窗口是「现在往前 N 小时」，但 Excel 的「今日」「昨日」始终按上面的计划窗口和发布时间计算。
 
@@ -246,7 +247,7 @@ npm run dev
 
 `npm run dev` 会先构建管理后台到 `admin/dist`，再启动 Wrangler。这个目录被 git 忽略，全新克隆里本来没有它；Wrangler 要求 `assets.directory` 指向的目录已经存在，所以不能跳过这一步直接执行 `wrangler dev`。构建完成后，后台和接口都在 `http://127.0.0.1:8787`。
 
-如果本地库是更早版本建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 加上 X 的共享时间槽；`0005_target_terms.sql` 给目标加上多条检索词、排除词和大小写开关；`0006_record_deletion.sql` 给采集记录加上 `deleted_at`，用来隐藏已删除的行并保留去重身份。`0007_relevance_errors.sql` 给记录加上评分失败原因，并给运行加上评分失败次数。`0008_translation_status.sql` 给记录加上翻译状态、失败原因和识别出的源语言。`0009_ai_interpretation.sql` 给目标加上背景说明，给记录加上摘要、原因、事件类型和提及的人或地点，并写入 DeepSeek 的默认配置。线上推到 `main` 时 CI 会对远程库执行同一条迁移。已有的单检索词目标不用手工改库，但建议按上一节把缩写、全称和中文名收成同一个目标，并补上排除词。
+如果本地库是更早版本建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 加上 X 的共享时间槽；`0005_target_terms.sql` 给目标加上多条检索词、排除词和大小写开关；`0006_record_deletion.sql` 给采集记录加上 `deleted_at`，用来隐藏已删除的行并保留去重身份。`0007_relevance_errors.sql` 给记录加上评分失败原因，并给运行加上评分失败次数。`0008_translation_status.sql` 给记录加上翻译状态、失败原因和识别出的源语言。`0009_ai_interpretation.sql` 给目标加上背景说明，给记录加上摘要、原因、事件类型和提及的人或地点，并写入 DeepSeek 的默认配置。`0010_google_news_editions.sql` 给记录加上 Google News 版本，并写入默认的 `en-US,zh-CN`。线上推到 `main` 时 CI 会对远程库执行同一条迁移。已有的单检索词目标不用手工改库，但建议按上一节把缩写、全称和中文名收成同一个目标，并补上排除词。
 
 改界面时可以另开一个终端，用 Vite 热更新，不必每次改完都重新构建：
 
@@ -266,7 +267,7 @@ npm run typecheck
 npm run build
 ```
 
-测试覆盖：上海时区及非东八区的窗口计算、每个目标单独成批、每条检索词各自翻页、缩写整词匹配和排除词、多检索词导入、按帖子 id / 链接去重、Google News 同一文章不同参数合并、多表 Excel 以及重新生成时保留历史行、X 的 QPS 间隔、`Retry-After` 和批次内重试。
+测试覆盖：上海时区及非东八区的窗口计算、每个目标单独成批、每条检索词各自翻页、缩写整词匹配和排除词、多检索词导入、按帖子 id / 链接去重、Google News 同一文章不同参数合并、按版本分别查询再按标题合并、多表 Excel 以及重新生成时保留历史行、X 的 QPS 间隔、`Retry-After` 和批次内重试。
 
 ## 添加一个新数据源
 

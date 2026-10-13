@@ -282,6 +282,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       apiKey: batch.source === "x" ? env.TWITTERAPI_IO_KEY : undefined,
       maxPages: settings.xMaxPages,
       excludeRetweets: settings.excludeRetweets,
+      googleNewsEditions: settings.googleNewsEditions,
       queueAttempt: batch.attempts + 1,
       beforeRequest: batch.source === "x" ? async () => {
         const slotAt = await reserveXSlot(env.DB, settings.xQps);
@@ -344,7 +345,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       let translation: string | null = null;
       let translationStatus: string | null = null;
       let translationError: string | null = null;
-      let detectedLang: string | null = null;
+      let detectedLang: string | null = record.sourceLang ?? null;
       let relevanceScore: number | null = null;
       let relevanceError: string | null = null;
       let relevant: boolean | null = null;
@@ -431,11 +432,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       `INSERT INTO records (
         id, dedupe_key, source, external_id, url, country_id, country_name,
         matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
-        original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang,
+        original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang, news_edition,
         ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, run_id,
         title_key, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -458,6 +459,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       record.translationStatus,
       record.translationError,
       record.detectedLang,
+      record.newsEdition ?? null,
       record.aiSummary || null,
       record.aiReason || null,
       record.aiEventType || null,

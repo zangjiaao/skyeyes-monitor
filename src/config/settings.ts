@@ -1,4 +1,5 @@
 import type { SourceId } from "../domain/types";
+import { canonicalGoogleNewsEditions, GOOGLE_NEWS_EDITION_LIMIT, parseGoogleNewsEditions } from "../sources/google-news";
 import { normalizeXQps, X_QPS_DEFAULT, X_QPS_MAX, X_QPS_MIN } from "../sources/x-rate";
 
 export const SETTING_DEFAULTS: Record<string, string> = {
@@ -15,6 +16,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   email_from_name: "SkyEyes",
   x_enabled: "1",
   google_news_enabled: "1",
+  google_news_editions: "en-US,zh-CN",
   gdelt_enabled: "0",
   excel_key: "skyeyes.xlsx",
   allowed_admin_emails: "",
@@ -51,6 +53,7 @@ export interface AppSettings {
   emailFrom: string;
   emailFromName: string;
   sources: Record<SourceId, boolean>;
+  googleNewsEditions: string;
   excelKey: string;
   allowedAdminEmails: string[];
   appBaseUrl: string;
@@ -132,6 +135,7 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
       google_news: flag(merged.google_news_enabled, true),
       gdelt: flag(merged.gdelt_enabled, false),
     },
+    googleNewsEditions: canonicalGoogleNewsEditions(merged.google_news_editions),
     excelKey: merged.excel_key.trim() || "skyeyes.xlsx",
     allowedAdminEmails: parseEmails(merged.allowed_admin_emails),
     appBaseUrl: merged.app_base_url.replace(/\/$/, ""),
@@ -211,6 +215,17 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
       }
       next.x_qps = String(Math.round(qps * 100) / 100);
     }
+  }
+  if (next.google_news_editions !== undefined) {
+    const parsed = parseGoogleNewsEditions(next.google_news_editions);
+    if (parsed.invalid.length > 0) {
+      throw new Error(`无法识别的 Google News 版本：${parsed.invalid.join("、")}。写成 en-US、zh-CN、en-PK 或 ar`);
+    }
+    if (parsed.editions.length === 0) throw new Error("至少填写一个 Google News 版本，例如 en-US,zh-CN");
+    if (next.google_news_editions.split(/[\n,;，]+/).map((part) => part.trim()).filter(Boolean).length > GOOGLE_NEWS_EDITION_LIMIT) {
+      throw new Error(`Google News 版本最多 ${GOOGLE_NEWS_EDITION_LIMIT} 个`);
+    }
+    next.google_news_editions = parsed.editions.map((edition) => edition.id).join(",");
   }
   if (next.exclude_words !== undefined) next.exclude_words = parseTermList(next.exclude_words).join(",");
   if (next.blocked_accounts !== undefined) next.blocked_accounts = parseTermList(next.blocked_accounts).join(",");

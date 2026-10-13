@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { dedupeRecords } from "../src/domain/dedupe";
 import { normalizeTitle } from "../src/domain/gate";
 import type { SearchRequest } from "../src/domain/types";
-import { googleNewsProvider, rssItemsToRecords } from "../src/sources/google-news";
+import { validateSettingsPatch } from "../src/config/settings";
+import { googleNewsProvider, parseGoogleNewsEditions, rssItemsToRecords } from "../src/sources/google-news";
 import { parseRssItems } from "../src/sources/xml";
 
 const HYPHEN = "\u2011";
@@ -61,6 +62,7 @@ const request: SearchRequest = {
   },
   countryName: "巴基斯坦",
   fetchImpl: fetch,
+  googleNewsEditions: "en-US",
 };
 
 describe("Google News 去重", () => {
@@ -98,5 +100,77 @@ describe("Google News 去重", () => {
       fetchImpl: async () => new Response("<rss><channel><item><title>BLA</title><link>not a url</link></item></channel></rss>"),
     });
     expect(broken.records).toEqual([]);
+  });
+
+  it("默认同时查 en-US 和 zh-CN，按链接和标题合并，并记下版本", async () => {
+    const urls: string[] = [];
+    const english = `<?xml version="1.0"?><rss><channel>
+      <item>
+        <title>BLA claims a new attack</title>
+        <link>https://news.google.com/rss/articles/EN1?oc=5</link>
+        <pubDate>Sun, 11 Oct 2026 08:00:00 GMT</pubDate>
+        <description>BLA claims a new attack</description>
+        <source url="https://example.com">Example</source>
+      </item>
+      <item>
+        <title>A different BLA report from London</title>
+        <link>https://news.google.com/rss/articles/EN2</link>
+        <pubDate>Sun, 11 Oct 2026 09:00:00 GMT</pubDate>
+        <description>A different BLA report from London</description>
+      </item>
+    </channel></rss>`;
+    const chinese = `<?xml version="1.0"?><rss><channel>
+      <item>
+        <title>BLA claims a new attack</title>
+        <link>https://news.google.com/rss/articles/ZH1?hl=zh-CN</link>
+        <pubDate>Sun, 11 Oct 2026 08:05:00 GMT</pubDate>
+        <description>BLA claims a new attack</description>
+      </item>
+      <item>
+        <title>俾路支解放军 BLA 宣布行动</title>
+        <link>https://news.google.com/rss/articles/ZH2</link>
+        <pubDate>Sun, 11 Oct 2026 12:00:00 GMT</pubDate>
+        <description>俾路支解放军 BLA 宣布行动</description>
+      </item>
+    </channel></rss>`;
+    const result = await googleNewsProvider.search({
+      ...request,
+      googleNewsEditions: undefined,
+      fetchImpl: async (input) => {
+        const url = new URL(String(input));
+        urls.push(url.toString());
+        expect(url.searchParams.get("q")).toContain("after:2026-10-11");
+        expect(url.searchParams.get("q")).toContain("before:2026-10-13");
+        expect(url.searchParams.get("hl")).toBeTruthy();
+        expect(url.searchParams.get("gl")).toBeTruthy();
+        expect(url.searchParams.get("ceid")).toBeTruthy();
+        return new Response(url.searchParams.get("ceid") === "CN:zh-Hans" ? chinese : english);
+      },
+    });
+    expect(urls.map((value) => new URL(value).searchParams.get("ceid"))).toEqual(["US:en", "CN:zh-Hans"]);
+    expect(new URL(urls[0]).searchParams.get("hl")).toBe("en-US");
+    expect(new URL(urls[0]).searchParams.get("gl")).toBe("US");
+    expect(result.calls).toBe(2);
+    const editions = result.records.map((record) => [record.newsEdition, record.sourceLang, record.url]);
+    expect(editions).toEqual([
+      ["en-US", "en", "https://news.google.com/rss/articles/EN1?oc=5"],
+      ["en-US", "en", "https://news.google.com/rss/articles/EN2"],
+      ["zh-CN", "zh", "https://news.google.com/rss/articles/ZH2"],
+    ]);
+    expect(result.records.find((record) => record.url.includes("ZH2"))?.publishedAt).toBe("2026-10-11T12:00:00.000Z");
+  });
+
+  it("en-PK 和 ar 会变成各自的 hl、gl、ceid", () => {
+    expect(parseGoogleNewsEditions("en-PK, ar").editions).toEqual([
+      { id: "en-PK", hl: "en-PK", gl: "PK", ceid: "PK:en", lang: "en" },
+      { id: "ar", hl: "ar", gl: "SA", ceid: "SA:ar", lang: "ar" },
+    ]);
+    expect(parseGoogleNewsEditions("ar-EG").editions).toEqual([
+      { id: "ar-EG", hl: "ar", gl: "EG", ceid: "EG:ar", lang: "ar" },
+    ]);
+    expect(parseGoogleNewsEditions("US:en, zh-CN").editions.map((edition) => edition.ceid)).toEqual(["US:en", "CN:zh-Hans"]);
+    expect(parseGoogleNewsEditions("").editions.map((edition) => edition.id)).toEqual(["en-US", "zh-CN"]);
+    expect(validateSettingsPatch({ google_news_editions: "en-US, zh-CN, en-PK" }).google_news_editions).toBe("en-US,zh-CN,en-PK");
+    expect(() => validateSettingsPatch({ google_news_editions: "everywhere" })).toThrow(/无法识别/);
   });
 });

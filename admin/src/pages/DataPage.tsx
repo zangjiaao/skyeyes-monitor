@@ -29,6 +29,7 @@ interface RecordRow extends Record<string, unknown> {
   collected_at: string;
   relevance_score: number | null;
   relevance_error: string | null;
+  news_edition: string | null;
   exclude_reason: string | null;
   is_spam: number;
 }
@@ -283,7 +284,11 @@ export function DataPage() {
           { key: "published_at", header: "发布", renderCell: (row) => formatTime(row.published_at) },
           { key: "collected_at", header: "采集", renderCell: (row) => formatTime(row.collected_at) },
           { key: "country_name", header: "国家" },
-          { key: "source", header: "来源" },
+          {
+            key: "source",
+            header: "来源",
+            renderCell: (row) => (row.news_edition ? `${row.source} ${row.news_edition}` : row.source),
+          },
           { key: "matched_target", header: "目标" },
           { key: "matched_term", header: "检索词", renderCell: (row) => row.matched_term || "—" },
           { key: "author_name", header: "作者" },

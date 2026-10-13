@@ -39,8 +39,10 @@ export interface CollectedRecord {
   isAd?: boolean;
   text: string;
   publishedAt: string | null;
-  /** X 等来源自带的语言代码。没有时由正文识别。 */
+  /** X 等来源自带的语言代码。没有时由正文识别。Google News 用版本里的语言作提示。 */
   sourceLang?: string | null;
+  /** Google News 的版本，例如 en-US、zh-CN、ar。 */
+  newsEdition?: string | null;
 }
 
 export interface RateLimitNotice {
@@ -57,6 +59,8 @@ export interface SearchRequest {
   apiKey?: string;
   maxPages?: number;
   excludeRetweets?: boolean;
+  /** Google News 版本列表，逗号分隔。空则用 en-US 和 zh-CN。 */
+  googleNewsEditions?: string;
   beforeRequest?: () => Promise<void>;
   onRateLimit?: (info: RateLimitNotice) => Promise<void>;
   sleepImpl?: (ms: number) => Promise<void>;
