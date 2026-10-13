@@ -5,7 +5,7 @@ import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule } from "../domain/time";
 import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
-import { parseCsv, parseXlsx } from "../import/table";
+import { buildTargetTemplateCsv, buildTargetTemplateXlsx, parseCsv, parseXlsx, previewCsv, previewXlsx } from "../import/table";
 import { storeExcel } from "../pipeline/run";
 import { hideRecords, parseDeleteIds } from "../records/delete";
 import { rescoreRecords } from "../records/rescore";
@@ -364,6 +364,41 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.delete("/api/targets/:id", async (c) => {
     await c.env.DB.prepare("DELETE FROM targets WHERE id = ?").bind(c.req.param("id")).run();
     return c.json({ ok: true });
+  });
+
+  app.get("/api/targets/template.csv", (c) => {
+    return new Response(buildTargetTemplateCsv(), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": 'attachment; filename="skyeyes-targets-template.csv"',
+      },
+    });
+  });
+
+  app.get("/api/targets/template.xlsx", (c) => {
+    return new Response(buildTargetTemplateXlsx(), {
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": 'attachment; filename="skyeyes-targets-template.xlsx"',
+      },
+    });
+  });
+
+  app.post("/api/targets/import/preview", async (c) => {
+    try {
+      const form = await c.req.raw.formData();
+      const file = form.get("file");
+      if (!(file instanceof File)) throw new Error("请上传 file 字段");
+      if (file.size > 2_000_000) throw new Error("文件不能超过 2MB");
+      const countries = await c.env.DB.prepare("SELECT code FROM countries").all<{ code: string }>();
+      const codes = countries.results.map((country) => country.code);
+      const preview = file.name.toLowerCase().endsWith(".csv")
+        ? previewCsv(await file.text(), codes)
+        : previewXlsx(new Uint8Array(await file.arrayBuffer()), codes);
+      return c.json(preview);
+    } catch (error) {
+      return jsonError(error);
+    }
   });
 
   app.post("/api/targets/import", async (c) => {

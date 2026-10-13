@@ -110,6 +110,6 @@ export function termsFromUnknown(value: unknown): string[] {
 export function flagEnabled(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value === 1;
-  if (typeof value === "string") return ["1", "true", "yes", "y"].includes(value.trim().toLowerCase());
+  if (typeof value === "string") return ["1", "true", "yes", "y", "是"].includes(value.trim().toLowerCase());
   return false;
 }

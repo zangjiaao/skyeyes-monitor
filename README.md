@@ -173,13 +173,22 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 1. 用 Access 允许的邮箱打开站点。
 2. 在「监测目标」删除「示例国家甲 / 示例国家乙」和占位关键词。删除国家会一并删除它的目标，已经采集的历史记录会保留国家名称。
 3. 添加真实国家，再添加人物、机构、关键词或 X 账号。一个目标有一个**显示名**和多条**检索词**（后台里一行一条）。账号类型的检索词不要带 `@`。
-4. 或用 CSV / Excel 批量导入。第一行表头：
+4. 或用 CSV / Excel 批量导入。在「监测目标」点「导入 CSV / Excel」，对话框里可以下载 CSV 模板（UTF-8，带 BOM，Excel 能正确打开中文）和 Excel 模板。Excel 模板有两张表：「目标」是要填写的数据，「填写说明」写明每一列和允许的值。选好文件后先预览每一行，标出未知国家代码、类型不对、检索词为空，以及会合并的重复行；没有错误再确认导入。
 
-   ```text
-   country_code,kind,name,query,exclude,case_sensitive,enabled
-   ```
+   模板列和接口接受的列一致，中文表头和英文表头都可以：
 
-   `query` 里多条检索词用 `|` 分开，也可以在带引号的单元格里换行。`exclude` 同样。同一 `country_code` + `kind` + `name` 的多行会合并成一个目标（检索词和排除词取并集）。`terms`、`exclude_terms` 也可以当作表头。`kind` 只能是 `person`、`organization`、`keyword`、`handle`。`country_code` 必须已经存在。不要把这份真实文件提交到 Git。
+   | 中文表头 | 英文表头 | 说明 |
+   | --- | --- | --- |
+   | 国家代码 | `country_code` | 必须已经存在，例如 `pk` |
+   | 类型 | `kind` | `person`、`organization`、`keyword`、`handle`，也可写人物、机构、关键词、X 账号 |
+   | 显示名 | `name` | 日报里的名称 |
+   | 检索词 | `terms` 或 `query` | 必填。多条用 `\|` 或单元格内换行分开 |
+   | 排除词 | `exclude` 或 `exclude_terms` | 可空，分隔方式和检索词相同 |
+   | 背景说明 | `description` | 可空，最多 800 字 |
+   | 启用 | `enabled` | `1` / 是 为启用，`0` / 否 为停用，留空视为启用 |
+   | 英文短语区分大小写 | `case_sensitive` | 可空。`1` 或 是 时更长的英文短语也区分大小写 |
+
+   模板里有两行示例：机构「俾路支解放军」，检索词是 `Baloch Liberation Army|Balochistan Liberation Army|BLA`；以及一个 X 账号。同一国家、类型、显示名的多行会合并成一个目标（检索词和排除词取并集）。不要把这份真实文件提交到 Git。
 
    短缩写不要拆成很多目标。例如把下面这些词放在**同一个**显示名下，每条单独占自己的翻页，命中都记成这个显示名：
 

@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
@@ -37,6 +38,34 @@ const KINDS = [
   { value: "handle", label: "X 账号" },
 ];
 
+const IMPORT_HELP = [
+  ["国家代码", "必须是这里已经建好的国家代码，例如 pk。"],
+  ["类型", "person 人物、organization 机构、keyword 关键词、handle X 账号。也可以写中文。"],
+  ["显示名", "日报里的名称。同一国家、类型、显示名的多行会合并。"],
+  ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。"],
+  ["排除词", "可选。规则与检索词相同，命中就丢掉整条。"],
+  ["背景说明", "可选。交给 AI 解读，最多 800 字。"],
+  ["启用", "1 或 是 为启用，0 或 否 为停用。留空视为启用。"],
+  ["英文短语区分大小写", "可选。1 或 是 时，更长的英文短语也区分大小写。缩写始终区分大小写。"],
+];
+
+interface ImportPreviewRow extends Record<string, unknown> {
+  line: number;
+  countryCode: string;
+  kind: string;
+  name: string;
+  terms: string[];
+  excludeTerms: string[];
+  errors: string[];
+  duplicateOf: number | null;
+}
+
+interface ImportPreview {
+  rows: ImportPreviewRow[];
+  errorCount: number;
+  duplicateCount: number;
+}
+
 export function TargetsPage() {
   const [countries, setCountries] = useState<Country[]>([]);
   const [targets, setTargets] = useState<Target[]>([]);
@@ -52,6 +81,12 @@ export function TargetsPage() {
   const [editingId, setEditingId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [previewError, setPreviewError] = useState("");
+  const [importing, setImporting] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   function resetTargetForm() {
     setEditingId("");
@@ -72,6 +107,59 @@ export function TargetsPage() {
       selected ? `/api/targets?countryId=${encodeURIComponent(selected)}` : "/api/targets",
     );
     setTargets(targetPayload.targets);
+  }
+
+  async function downloadTemplate(format: "csv" | "xlsx") {
+    setError("");
+    const response = await fetch(`/api/targets/template.${format}`);
+    if (!response.ok) {
+      setError("模板下载失败");
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = format === "csv" ? "skyeyes-targets-template.csv" : "skyeyes-targets-template.xlsx";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function loadPreview(file: File) {
+    setImportFile(file);
+    setPreview(null);
+    setPreviewError("");
+    setImporting(true);
+    try {
+      const form = new FormData();
+      form.set("file", file);
+      const result = await api<ImportPreview>("/api/targets/import/preview", { method: "POST", body: form });
+      setPreview(result);
+    } catch (reason) {
+      setPreviewError(reason instanceof Error ? reason.message : "无法预览");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function commitImport() {
+    if (!importFile || !preview || preview.errorCount > 0) return;
+    setImporting(true);
+    setPreviewError("");
+    try {
+      const form = new FormData();
+      form.set("file", importFile);
+      const result = await api<{ imported: number }>("/api/targets/import", { method: "POST", body: form });
+      setImportOpen(false);
+      setImportFile(null);
+      setPreview(null);
+      setNotice(`已导入 ${result.imported} 条`);
+      await reload();
+    } catch (reason) {
+      setPreviewError(reason instanceof Error ? reason.message : "导入失败");
+    } finally {
+      setImporting(false);
+    }
   }
 
   useEffect(() => {
@@ -226,31 +314,7 @@ export function TargetsPage() {
           <Button label="取消编辑" variant="secondary" onClick={resetTargetForm} />
         ) : null}
       </HStack>
-      <Button
-        label="导入 CSV / Excel"
-        variant="secondary"
-        onClick={() => {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".csv,.xlsx";
-          input.onchange = () => {
-            const file = input.files?.[0];
-            if (!file) return;
-            const form = new FormData();
-            form.set("file", file);
-            api<{ imported: number }>("/api/targets/import", { method: "POST", body: form })
-              .then(async (result) => {
-                setNotice(`已导入 ${result.imported} 条`);
-                await reload();
-              })
-              .catch((reason: Error) => setError(reason.message));
-          };
-          input.click();
-        }}
-      />
-      <Text type="supporting" color="secondary">
-        表头：country_code, kind, name, query, exclude, case_sensitive, enabled。可选 description。query 里多条检索词用 | 或换行分开；同一国家、类型、显示名的多行会合并。也可以用 terms、exclude_terms 这两列表头。kind 为 person、organization、keyword 或 handle。
-      </Text>
+      <Button label="导入 CSV / Excel" variant="secondary" onClick={() => setImportOpen(true)} />
       <Table
         density="compact"
         idKey="id"
@@ -317,6 +381,104 @@ export function TargetsPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={importOpen}
+        purpose="form"
+        width={760}
+        onOpenChange={(open) => {
+          if (!open && !importing) {
+            setImportOpen(false);
+            setPreview(null);
+            setImportFile(null);
+            setPreviewError("");
+          }
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title="导入目标"
+            onOpenChange={(open) => {
+              if (!open && !importing) setImportOpen(false);
+            }}
+          />
+          <Text type="body">
+            先下载模板，按列填写。中文表头和英文表头都可以。选择文件后先预览，确认没有错误再写入。
+          </Text>
+          <VStack gap={1}>
+            {IMPORT_HELP.map(([label, help]) => (
+              <Text key={label} type="supporting" color="secondary">{`${label}：${help}`}</Text>
+            ))}
+          </VStack>
+          <HStack gap={2}>
+            <Button label="下载 CSV 模板" variant="secondary" onClick={() => { void downloadTemplate("csv"); }} />
+            <Button label="下载 Excel 模板" variant="secondary" onClick={() => { void downloadTemplate("xlsx"); }} />
+            <Button label="选择文件" variant="primary" onClick={() => fileRef.current?.click()} />
+          </HStack>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv,.xlsx,text/csv"
+            hidden
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void loadPreview(file);
+            }}
+          />
+          {importFile ? <Text type="supporting">{`已选 ${importFile.name}`}</Text> : null}
+          {previewError ? <Banner status="error" title="无法导入" description={previewError} /> : null}
+          {preview && preview.duplicateCount > 0 ? (
+            <Banner status="warning" title={`${preview.duplicateCount} 行与前面的目标重复，确认后会合并检索词和排除词`} />
+          ) : null}
+          {preview && preview.errorCount > 0 ? (
+            <Banner status="error" title={`${preview.errorCount} 行有错误，改正文件后再导入`} />
+          ) : null}
+          {preview ? (
+            <Table
+              density="compact"
+              idKey="line"
+              textOverflow="truncate"
+              data={preview.rows}
+              columns={[
+                { key: "line", header: "行" },
+                { key: "countryCode", header: "国家代码" },
+                { key: "kind", header: "类型" },
+                { key: "name", header: "显示名" },
+                { key: "terms", header: "检索词", renderCell: (row) => row.terms.join(" | ") || "—" },
+                {
+                  key: "errors",
+                  header: "检查",
+                  renderCell: (row) => {
+                    const notes = [...row.errors];
+                    if (row.duplicateOf) notes.push(`与第 ${row.duplicateOf} 行重复，将合并`);
+                    return notes.join("；") || "可以导入";
+                  },
+                },
+              ]}
+            />
+          ) : null}
+          <HStack gap={2}>
+            <Button
+              label="确认导入"
+              variant="primary"
+              isLoading={importing}
+              isDisabled={!preview || preview.errorCount > 0 || preview.rows.length === 0}
+              onClick={() => { void commitImport(); }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={importing}
+              onClick={() => {
+                setImportOpen(false);
+                setPreview(null);
+                setImportFile(null);
+                setPreviewError("");
+              }}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
     </VStack>
   );
 }
