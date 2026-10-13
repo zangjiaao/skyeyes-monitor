@@ -25,6 +25,7 @@ interface Target extends Record<string, unknown> {
   query: string;
   terms: string;
   exclude_terms: string;
+  description: string;
   case_sensitive: number;
   enabled: number;
 }
@@ -45,6 +46,7 @@ export function TargetsPage() {
   const [targetName, setTargetName] = useState("");
   const [terms, setTerms] = useState("");
   const [excludeTerms, setExcludeTerms] = useState("");
+  const [description, setDescription] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [kind, setKind] = useState("keyword");
   const [editingId, setEditingId] = useState("");
@@ -56,6 +58,7 @@ export function TargetsPage() {
     setTargetName("");
     setTerms("");
     setExcludeTerms("");
+    setDescription("");
     setCaseSensitive(false);
     setKind("keyword");
   }
@@ -181,6 +184,13 @@ export function TargetsPage() {
         onChange={setExcludeTerms}
         description="可选，一行一条。命中则丢弃，例如 Biologics License、bla bla。"
       />
+      <TextArea
+        label="背景说明"
+        rows={3}
+        value={description}
+        onChange={setDescription}
+        description="可选。交给 DeepSeek 的监测对象说明，例如组织是谁、要关注哪类事件。"
+      />
       <CheckboxInput
         label="英文短语区分大小写"
         value={caseSensitive}
@@ -199,6 +209,7 @@ export function TargetsPage() {
               name: targetName,
               terms,
               excludeTerms,
+              description,
               caseSensitive,
             });
             const request = editingId
@@ -238,7 +249,7 @@ export function TargetsPage() {
         }}
       />
       <Text type="supporting" color="secondary">
-        表头：country_code, kind, name, query, exclude, case_sensitive, enabled。query 里多条检索词用 | 或换行分开；同一国家、类型、显示名的多行会合并。也可以用 terms、exclude_terms 这两列表头。kind 为 person、organization、keyword 或 handle。
+        表头：country_code, kind, name, query, exclude, case_sensitive, enabled。可选 description。query 里多条检索词用 | 或换行分开；同一国家、类型、显示名的多行会合并。也可以用 terms、exclude_terms 这两列表头。kind 为 person、organization、keyword 或 handle。
       </Text>
       <Table
         density="compact"
@@ -275,6 +286,7 @@ export function TargetsPage() {
                     setTargetName(row.name);
                     setTerms(row.terms || row.query);
                     setExcludeTerms(row.exclude_terms || "");
+                    setDescription(row.description || "");
                     setCaseSensitive(row.case_sensitive === 1);
                     setError("");
                   }}

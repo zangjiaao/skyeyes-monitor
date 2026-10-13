@@ -23,9 +23,8 @@ import { errorMessage, log, logError } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
 import { recordRateEvent, reserveXSlot, sleep } from "../sources/x-rate";
-import { scoreRelevance } from "../domain/relevance";
-import { translationCell, translateToChinese } from "../translate";
-import { detectSourceLang } from "../domain/lang";
+import { interpretRecord } from "../ai/interpret";
+import { translationCell } from "../translate";
 import type { CollectMessage } from "./messages";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -48,6 +47,7 @@ interface TargetRow {
   exclude_terms: string;
   case_sensitive: number;
   enabled: number;
+  description?: string;
 }
 
 interface RunRow {
@@ -83,6 +83,8 @@ interface RecordRow {
   translation_zh: string | null;
   translation_status: string | null;
   translation_error: string | null;
+  relevance_score: number | null;
+  ai_summary: string | null;
 }
 
 async function runChunk(db: D1Database, statements: D1PreparedStatement[]): Promise<D1Result[]> {
@@ -142,6 +144,7 @@ function toQueryTarget(target: TargetRow): QueryTarget {
     terms,
     excludeTerms: splitLines(target.exclude_terms),
     caseSensitive: target.case_sensitive === 1,
+    description: target.description ?? "",
   };
 }
 
@@ -196,7 +199,7 @@ export async function startRun(env: Env, input: {
 
   for (const country of countries.results) {
     const targets = await env.DB.prepare(
-      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
        FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
     const queryTargets = targets.results.map(toQueryTarget);
@@ -241,7 +244,7 @@ async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> 
   if (ids.length === 0) return [];
   const marks = ids.map(() => "?").join(",");
   const result = await db.prepare(
-    `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled
+    `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
      FROM targets WHERE id IN (${marks})`,
   ).bind(...ids).all<TargetRow>();
   return result.results;
@@ -303,6 +306,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       detectedLang: string | null;
       relevanceScore: number | null;
       relevanceError: string | null;
+      aiSummary: string;
+      aiReason: string;
+      aiEventType: string;
+      aiMentions: string;
+      aiProvider: string;
       timeStatus: string;
       excludeReason: string | null;
       titleKey: string;
@@ -336,31 +344,50 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       let translation: string | null = null;
       let translationStatus: string | null = null;
       let translationError: string | null = null;
-      const detectedLang = detectSourceLang(record.text, record.sourceLang, settings.translationSourceLang);
+      let detectedLang: string | null = null;
       let relevanceScore: number | null = null;
       let relevanceError: string | null = null;
-      if (timeOnly.timeStatus === "in_window" && settings.translationEnabled && record.text) {
-        const outcome = await translateToChinese(
-          env.AI,
-          record.text,
-          record.sourceLang ?? null,
-          settings.translationTargetLang,
-          settings.translationSourceLang,
-        );
-        translation = outcome.text;
-        translationStatus = outcome.status;
-        translationError = outcome.error;
-        if (outcome.status === "translation_failed") {
-          logError("translation failed", new Error(outcome.error || "翻译失败"), { dedupeKey: record.dedupeKey });
-        }
-      }
-      if (timeOnly.timeStatus === "in_window" && settings.relevanceEnabled && record.text) {
-        const outcome = await scoreRelevance(env.AI, record.text, record.matchedTarget);
+      let relevant: boolean | null = null;
+      let aiSummary = "";
+      let aiReason = "";
+      let aiEventType = "";
+      let aiMentions = "";
+      let aiProvider = "";
+      const shouldInterpret = timeOnly.timeStatus === "in_window"
+        && record.text
+        && (settings.aiEnabled || settings.translationEnabled || settings.relevanceEnabled);
+      if (shouldInterpret) {
+        const target = targets.find((item) => item.id === record.matchedTargetId);
+        const terms = splitLines(target?.terms || target?.query || record.matchedTerm || "");
+        const outcome = await interpretRecord({
+          ai: env.AI,
+          apiKey: env.DEEPSEEK_API_KEY || "",
+          settings,
+          text: record.text,
+          hintedLang: record.sourceLang,
+          targetName: record.matchedTarget,
+          terms,
+          description: target?.description ?? "",
+          fetchImpl: globalThis.fetch.bind(globalThis),
+        });
+        translation = outcome.translation;
+        translationStatus = outcome.translationStatus;
+        translationError = outcome.translationError;
+        detectedLang = outcome.sourceLang;
         relevanceScore = outcome.score;
-        relevanceError = outcome.error;
-        if (outcome.error) {
+        relevanceError = outcome.relevanceError;
+        relevant = outcome.relevant;
+        aiSummary = outcome.summary;
+        aiReason = outcome.reason;
+        aiEventType = outcome.eventType;
+        aiMentions = outcome.mentions;
+        aiProvider = outcome.provider;
+        if (outcome.translationStatus === "translation_failed") {
+          logError("translation failed", new Error(outcome.translationError || "翻译失败"), { dedupeKey: record.dedupeKey });
+        }
+        if (outcome.relevanceError) {
           relevanceFailures += 1;
-          logError("relevance score failed", new Error(outcome.error), { dedupeKey: record.dedupeKey });
+          logError("relevance score failed", new Error(outcome.relevanceError), { dedupeKey: record.dedupeKey });
         }
       }
       const admission = decideAdmission({
@@ -371,6 +398,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         relevanceEnabled: settings.relevanceEnabled,
         relevanceScore,
         relevanceThreshold: settings.relevanceThreshold,
+        relevant,
       });
       if (admission.action === "drop") continue;
       if (admission.timeStatus === "in_window") {
@@ -384,6 +412,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         detectedLang,
         relevanceScore,
         relevanceError,
+        aiSummary,
+        aiReason,
+        aiEventType,
+        aiMentions,
+        aiProvider,
         timeStatus: admission.timeStatus,
         excludeReason: admission.excludeReason,
         titleKey,
@@ -398,10 +431,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       `INSERT INTO records (
         id, dedupe_key, source, external_id, url, country_id, country_name,
         matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
-        original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang, run_id,
+        original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang,
+        ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, run_id,
         title_key, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -424,6 +458,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       record.translationStatus,
       record.translationError,
       record.detectedLang,
+      record.aiSummary || null,
+      record.aiReason || null,
+      record.aiEventType || null,
+      record.aiMentions || null,
+      record.aiProvider || null,
       runId,
       record.titleKey,
       record.urlKey,
@@ -517,7 +556,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
     const page = await db.prepare(
        `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
               source, url, matched_target, matched_term, collected_at, translation_zh,
-              translation_status, translation_error
+              translation_status, translation_error, relevance_score, ai_summary
        FROM records WHERE ${DELIVERABLE_SQL}
        ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
     ).bind(pageSize, offset).all<RecordRow>();
@@ -537,6 +576,8 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
         matchedTerm: row.matched_term,
         collectedAt: row.collected_at,
         translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
+        relevanceScore: row.relevance_score == null ? "" : String(row.relevance_score),
+        summaryZh: row.ai_summary ?? "",
       });
     }
     offset += page.results.length;
@@ -637,6 +678,17 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     }
     const downloadUrl = settings.appBaseUrl ? `${settings.appBaseUrl}/api/export/excel` : null;
     const attached = stored.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES;
+    const highlightRows = await env.DB.prepare(
+      `SELECT matched_target, ai_summary, translation_zh, relevance_score
+       FROM records
+       WHERE run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?
+       ORDER BY published_at DESC LIMIT 12`,
+    ).bind(runId, run.window_start, run.window_end).all<{
+      matched_target: string;
+      ai_summary: string | null;
+      translation_zh: string | null;
+      relevance_score: number | null;
+    }>();
     const digest = buildDigest({
       incomplete,
       windowStart: run.window_start,
@@ -647,6 +699,12 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       downloadUrl,
       attached,
       notes,
+      highlights: highlightRows.results.map((row) => ({
+        target: row.matched_target,
+        summary: row.ai_summary ?? "",
+        translation: row.translation_zh ?? "",
+        score: row.relevance_score == null ? "" : String(row.relevance_score),
+      })),
     });
     const sent = await sendDigest(env, settings, {
       from: settings.emailFrom,

@@ -108,6 +108,7 @@ npx wrangler queues create skyeyes-collect-dlq
 
 ```bash
 npx wrangler secret put TWITTERAPI_IO_KEY
+npx wrangler secret put DEEPSEEK_API_KEY
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put TEAM_DOMAIN
 npx wrangler secret put POLICY_AUD
@@ -116,6 +117,7 @@ npx wrangler secret put POLICY_AUD
 | 密钥 | 内容 |
 | --- | --- |
 | `TWITTERAPI_IO_KEY` | twitterapi.io 的 key。不用 X 时可以先不设。 |
+| `DEEPSEEK_API_KEY` | DeepSeek 的 API key。留空时解读会改用 Workers AI，记录不会丢掉。 |
 | `RESEND_API_KEY` | Resend 的 key。只用 Cloudflare Email 时可以先不设。 |
 | `TEAM_DOMAIN` | `https://<团队名>.cloudflareaccess.com`，不要末尾斜杠。 |
 | `POLICY_AUD` | Access 应用的 AUD tag。 |
@@ -227,7 +229,7 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 - 发布时间在窗口外：直接丢弃，不入库。
 - 同一规范化链接，或标题规范化后几乎相同的旧文（忽略标点和空格，相似度很高），只要数据库里已经有过，就不再当作新内容。
 - 入库前的规则过滤可在「配置」里改：最短正文、排除词、屏蔽账号或域名、排除转推、排除广告。X 若返回了粉丝数或注册时间，还可以设最少粉丝数和最少账号天数；没有这些字段时不因此排除。
-- 翻译先按正文识别语种（阿拉伯文、乌尔都语、波斯语等），X 若带回 `lang` 且和文字一致就用它。配置里的源语言只给没有标明语种的拉丁文字，默认 `en`。`@cf/meta/m2m100-1.2b` 用这个代码翻译。译文为空或明显没译成中文时，改用 `@cf/google/gemma-3-12b-it`，并要求只输出简体中文。仍然失败则 `translation_status` 写成 `translation_failed`，数据页和 Excel 的中文列显示原因，不再留空。数据页可以「为所选翻译」，或「重译失败或空白」（每次 20 条）。
+- 过了检索词、整词、排除词和屏蔽作者这些规则、并且发布时间在窗口内的记录，才会做 AI 解读。配置里的解读服务默认是 DeepSeek：一条记录调用一次 `https://api.deepseek.com/chat/completions`，模型默认 `deepseek-chat`，要求 JSON。返回相关与否、0–100 分、中文原因、源语言、全文简体中文、一句摘要、事件类型（statement / attack / meeting / other）以及提到的人和地点。目标上的「背景说明」会一起传给模型。相关度为假或低于阈值的记录留在数据库，不进 Excel 和邮件。DeepSeek 按 token 计费，每条过了规则的窗口内记录一次调用；正文截到 2500 字。同一批次里逐条调用，遇到 429 或 5xx 会按 Retry-After 或退避重试，最多 3 次。没有 `DEEPSEEK_API_KEY`、或调用失败时，翻译改用 Workers AI：先按文字和 X 的 `lang` 识别阿拉伯文、乌尔都语、波斯语等，再交给 `@cf/meta/m2m100-1.2b`，空译文再用 `@cf/google/gemma-3-12b-it`。仍然没有中文就标成「翻译失败」并写上原因，中文列不会留空。评分失败时记录保留，相关度列显示原因，不再是「—」。把解读服务改成 Workers AI 时，评分仍用原来的 `@cf/meta/llama-3.2-3b-instruct`。数据页可以「为所选解读」，或「解读未完成记录」（还没有分数，或译文为空、翻译失败），每次 8 条。
 - 相关度用 `@cf/meta/llama-3.2-3b-instruct` 打 0–100 分，只对发布时间落在窗口内、且打开了「相关度评分」的新记录调用。低于「相关度阈值」的条目留在数据库供核对，不进入 Excel 和邮件。阈值设为 0 表示不因分数排除。模型如果多写了几个字，只要回复里有一个 0–100 的整数，就取最后一个。完全解析不了或调用失败时，分数留空，相关度列显示原因，这次运行的「评分失败」加一，条目本身仍保留。打开开关不会回溯旧记录。数据页可以「为所选评分」，或「为未评分记录打分」（还没有分数、也没有失败原因的记录，每次 20 条）。
 - 数据页可以把一条标为垃圾，或屏蔽作者。屏蔽会把账号（没有账号时用站点域名）写入屏蔽名单，之后的运行会在入库前丢掉该作者。
 - 数据页可以删除一条，或勾选当前这一页后批量删除（一次最多 100 条）。删除前会要求确认。删除不是把行从数据库抹掉：`deleted_at` 记下删除时间，`dedupe_key`、规范化链接和标题都留着。因此同一条帖子或新闻不会因为删过一次就在下次运行里变成新内容；标题几乎相同的旧文也不会再入库。这个限制不限于当天窗口。页面上没有撤销。删完会立刻重写 R2 里的 Excel，下载文件里不再有这些行。
@@ -244,7 +246,7 @@ npm run dev
 
 `npm run dev` 会先构建管理后台到 `admin/dist`，再启动 Wrangler。这个目录被 git 忽略，全新克隆里本来没有它；Wrangler 要求 `assets.directory` 指向的目录已经存在，所以不能跳过这一步直接执行 `wrangler dev`。构建完成后，后台和接口都在 `http://127.0.0.1:8787`。
 
-如果本地库是更早版本建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 加上 X 的共享时间槽；`0005_target_terms.sql` 给目标加上多条检索词、排除词和大小写开关；`0006_record_deletion.sql` 给采集记录加上 `deleted_at`，用来隐藏已删除的行并保留去重身份。`0007_relevance_errors.sql` 给记录加上评分失败原因，并给运行加上评分失败次数。`0008_translation_status.sql` 给记录加上翻译状态、失败原因和识别出的源语言。线上推到 `main` 时 CI 会对远程库执行同一条迁移。已有的单检索词目标不用手工改库，但建议按上一节把缩写、全称和中文名收成同一个目标，并补上排除词。
+如果本地库是更早版本建的，把上面的迁移命令再执行一次。`0004_x_rate.sql` 加上 X 的共享时间槽；`0005_target_terms.sql` 给目标加上多条检索词、排除词和大小写开关；`0006_record_deletion.sql` 给采集记录加上 `deleted_at`，用来隐藏已删除的行并保留去重身份。`0007_relevance_errors.sql` 给记录加上评分失败原因，并给运行加上评分失败次数。`0008_translation_status.sql` 给记录加上翻译状态、失败原因和识别出的源语言。`0009_ai_interpretation.sql` 给目标加上背景说明，给记录加上摘要、原因、事件类型和提及的人或地点，并写入 DeepSeek 的默认配置。线上推到 `main` 时 CI 会对远程库执行同一条迁移。已有的单检索词目标不用手工改库，但建议按上一节把缩写、全称和中文名收成同一个目标，并补上排除词。
 
 改界面时可以另开一个终端，用 Vite 热更新，不必每次改完都重新构建：
 

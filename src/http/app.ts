@@ -10,6 +10,7 @@ import { storeExcel } from "../pipeline/run";
 import { hideRecords, parseDeleteIds } from "../records/delete";
 import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
+import { interpretStoredRecords } from "../records/interpret";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -27,6 +28,13 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
     throw new Error("请求体必须是 JSON 对象");
   }
   return payload as Record<string, unknown>;
+}
+
+function descriptionText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const text = value.trim();
+  if (text.length > 800) throw new Error("背景说明不能超过 800 字");
+  return text;
 }
 
 function requireString(value: unknown, label: string): string {
@@ -213,6 +221,9 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         fromConfigured: Boolean(settings.emailFrom),
         translationEnabled: settings.translationEnabled,
         accessConfigured: Boolean(c.env.TEAM_DOMAIN && c.env.POLICY_AUD),
+        aiProvider: settings.aiProvider,
+        aiEnabled: settings.aiEnabled,
+        deepseekConfigured: Boolean(c.env.DEEPSEEK_API_KEY),
       },
     });
   });
@@ -288,8 +299,8 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
         `INSERT INTO targets (
-          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         countryId,
@@ -299,6 +310,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         joinTerms(terms),
         joinTerms(excludeTerms),
         caseSensitive,
+        descriptionText(body.description),
         body.enabled === false ? 0 : 1,
         new Date().toISOString(),
       ).run();
@@ -339,6 +351,10 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       if (typeof body.enabled === "boolean") {
         await c.env.DB.prepare("UPDATE targets SET enabled = ? WHERE id = ?").bind(body.enabled ? 1 : 0, id).run();
       }
+      if (typeof body.description === "string") {
+        await c.env.DB.prepare("UPDATE targets SET description = ? WHERE id = ?")
+          .bind(descriptionText(body.description), id).run();
+      }
       return c.json({ ok: true });
     } catch (error) {
       return jsonError(error);
@@ -369,13 +385,14 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         const countryId = byCode.get(row.countryCode);
         if (!countryId) throw new Error(`未知国家代码 ${row.countryCode}，请先创建国家`);
         const existing = await c.env.DB.prepare(
-          `SELECT id, terms, exclude_terms, case_sensitive FROM targets
+          `SELECT id, terms, exclude_terms, case_sensitive, description FROM targets
            WHERE country_id = ? AND kind = ? AND name = ?`,
         ).bind(countryId, row.kind, row.name).first<{
           id: string;
           terms: string;
           exclude_terms: string;
           case_sensitive: number;
+          description: string;
         }>();
         const terms = uniqueTerms([...splitLines(existing?.terms), ...row.terms]);
         const excludeTerms = uniqueTerms([...splitLines(existing?.exclude_terms), ...row.excludeTerms]);
@@ -383,14 +400,22 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         if (existing) {
           await c.env.DB.prepare(
             `UPDATE targets
-             SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?
+             SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?
              WHERE id = ?`,
-          ).bind(terms[0], joinTerms(terms), joinTerms(excludeTerms), caseSensitive, row.enabled ? 1 : 0, existing.id).run();
+          ).bind(
+            terms[0],
+            joinTerms(terms),
+            joinTerms(excludeTerms),
+            caseSensitive,
+            row.enabled ? 1 : 0,
+            row.description || existing.description || "",
+            existing.id,
+          ).run();
         } else {
           await c.env.DB.prepare(
             `INSERT INTO targets (
-              id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
             crypto.randomUUID(),
             countryId,
@@ -400,6 +425,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
             joinTerms(terms),
             joinTerms(excludeTerms),
             caseSensitive,
+            row.description,
             row.enabled ? 1 : 0,
             now,
           ).run();
@@ -500,7 +526,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const rows = await c.env.DB.prepare(
       `SELECT id, source, url, country_name, matched_target, matched_term, author_handle, author_name, author_url,
               original_text, published_at, collected_at, translation_zh, translation_status, translation_error,
-              relevance_score, relevance_error,
+              relevance_score, relevance_error, ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider,
               exclude_reason, is_spam, time_status
        FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,
     ).bind(...binds, limit, offset).all();
@@ -519,6 +545,19 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       return c.json({ deleted, ...excel });
     } catch (error) {
       return jsonError(error, 500);
+    }
+  });
+
+  app.post("/api/records/interpret", async (c) => {
+    try {
+      const body = await readJson(c.req.raw);
+      const mode = body.mode === "selected" || body.mode === "pending" ? body.mode : "";
+      if (!mode) throw new Error("mode 必须是 selected 或 pending");
+      const ids = mode === "selected" ? parseDeleteIds(body.ids, "解读") : [];
+      const result = await interpretStoredRecords(c.env, { mode, ids });
+      return c.json(result);
+    } catch (error) {
+      return jsonError(error);
     }
   });
 

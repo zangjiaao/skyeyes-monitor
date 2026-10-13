@@ -14,6 +14,7 @@ export interface DigestInput {
   downloadUrl: string | null;
   attached: boolean;
   notes: string;
+  highlights?: Array<{ target: string; summary: string; translation: string; score: string }>;
 }
 
 function escapeHtml(value: string): string {
@@ -54,6 +55,14 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
       ? "附件 skyeyes.xlsx 会覆盖更新。国家表是已通过时间校验的历史；「今日」「昨日」只按发布时间落入计划窗口的条目，不含缺时间、窗口外、旧文重发、规则过滤或低相关度的内容。"
       : "Excel 较大，未放入附件。",
   ];
+  const highlights = (input.highlights ?? []).slice(0, 12);
+  if (highlights.length > 0) {
+    lines.push("", "本轮条目（摘要 / 译文 / 相关度）:");
+    for (const item of highlights) {
+      const summary = item.summary || item.translation || "无摘要";
+      lines.push(`- ${item.target}: ${summary}（译文：${item.translation || "无"}；相关度 ${item.score || "—"}）`);
+    }
+  }
   if (input.downloadUrl) lines.push(`下载: ${input.downloadUrl}`);
   if (input.notes) lines.push("", input.notes);
   const text = lines.join("\n");

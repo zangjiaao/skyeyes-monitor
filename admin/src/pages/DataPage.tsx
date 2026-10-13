@@ -20,6 +20,10 @@ interface RecordRow extends Record<string, unknown> {
   translation_zh: string | null;
   translation_status: string | null;
   translation_error: string | null;
+  ai_summary: string | null;
+  ai_reason: string | null;
+  ai_event_type: string | null;
+  ai_provider: string | null;
   url: string;
   published_at: string | null;
   collected_at: string;
@@ -42,6 +46,8 @@ export function DataPage() {
   const [scoring, setScoring] = useState(false);
   const [translateMode, setTranslateMode] = useState<"" | "selected" | "failed">("");
   const [translating, setTranslating] = useState(false);
+  const [interpretMode, setInterpretMode] = useState<"" | "selected" | "pending">("");
+  const [interpreting, setInterpreting] = useState(false);
   const { selectionConfig } = useTableSelectionState({
     data: records,
     idKey: "id",
@@ -144,6 +150,46 @@ export function DataPage() {
     }
   }
 
+  async function runInterpret() {
+    const mode = interpretMode;
+    if (!mode) return;
+    setInterpreting(true);
+    setError("");
+    let interpreted = 0;
+    let failed = 0;
+    try {
+      if (mode === "selected") {
+        const ids = [...selectedKeys];
+        for (let index = 0; index < ids.length; index += 8) {
+          const result = await api<{ interpreted: number; failed: number }>("/api/records/interpret", {
+            method: "POST",
+            body: JSON.stringify({ mode: "selected", ids: ids.slice(index, index + 8) }),
+          });
+          interpreted += result.interpreted;
+          failed += result.failed;
+        }
+      } else {
+        for (let round = 0; round < 8; round += 1) {
+          const result = await api<{ interpreted: number; failed: number; remaining: number }>("/api/records/interpret", {
+            method: "POST",
+            body: JSON.stringify({ mode: "pending" }),
+          });
+          interpreted += result.interpreted;
+          failed += result.failed;
+          if (result.interpreted === 0 || result.remaining === 0) break;
+        }
+      }
+      setInterpretMode("");
+      setSelectedKeys(new Set());
+      setNotice(failed > 0 ? `已解读 ${interpreted} 条，${failed} 条仍有失败` : `已解读 ${interpreted} 条`);
+      await load();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "解读失败");
+    } finally {
+      setInterpreting(false);
+    }
+  }
+
   return (
     <VStack gap={4}>
       <VStack gap={1}>
@@ -188,28 +234,16 @@ export function DataPage() {
           }}
         />
         <Button
-          label={selectedKeys.size > 0 ? `为所选评分 ${selectedKeys.size} 条` : "为所选评分"}
+          label={selectedKeys.size > 0 ? `为所选解读 ${selectedKeys.size} 条` : "为所选解读"}
           variant="secondary"
-          isDisabled={selectedKeys.size === 0 || scoring || deleting || translating}
-          onClick={() => setScoreMode("selected")}
+          isDisabled={selectedKeys.size === 0 || scoring || deleting || translating || interpreting}
+          onClick={() => setInterpretMode("selected")}
         />
         <Button
-          label="为未评分记录打分"
+          label="解读未完成记录"
           variant="secondary"
-          isDisabled={scoring || deleting || translating}
-          onClick={() => setScoreMode("unscored")}
-        />
-        <Button
-          label={selectedKeys.size > 0 ? `为所选翻译 ${selectedKeys.size} 条` : "为所选翻译"}
-          variant="secondary"
-          isDisabled={selectedKeys.size === 0 || scoring || deleting || translating}
-          onClick={() => setTranslateMode("selected")}
-        />
-        <Button
-          label="重译失败或空白"
-          variant="secondary"
-          isDisabled={scoring || deleting || translating}
-          onClick={() => setTranslateMode("failed")}
+          isDisabled={scoring || deleting || translating || interpreting}
+          onClick={() => setInterpretMode("pending")}
         />
         <Button
           label={selectedKeys.size > 0 ? `删除所选 ${selectedKeys.size} 条` : "删除所选"}
@@ -258,13 +292,17 @@ export function DataPage() {
             header: "相关度",
             renderCell: (row) => row.relevance_score ?? row.relevance_error ?? "—",
           },
+          { key: "ai_reason", header: "原因", renderCell: (row) => row.ai_reason || "—" },
+          { key: "ai_summary", header: "摘要", renderCell: (row) => row.ai_summary || "—" },
           { key: "exclude_reason", header: "排除", renderCell: (row) => row.exclude_reason || (row.is_spam ? "spam" : "—") },
           { key: "original_text", header: "原文" },
           {
             key: "translation_zh",
             header: "中文",
             renderCell: (row) => {
-              if (row.translation_zh) return row.translation_zh;
+              if (row.translation_zh) {
+                return row.ai_provider === "deepseek" ? `AI译文 ${row.translation_zh}` : row.translation_zh;
+              }
               if (row.translation_status === "translation_failed") {
                 return row.translation_error ? `翻译失败：${row.translation_error}` : "翻译失败";
               }
@@ -349,6 +387,44 @@ export function DataPage() {
               variant="secondary"
               isDisabled={translating}
               onClick={() => setTranslateMode("")}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
+      <Dialog
+        isOpen={interpretMode !== ""}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !interpreting) setInterpretMode("");
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={interpretMode === "selected" ? `为所选 ${selectedKeys.size} 条解读` : "解读未完成记录"}
+            onOpenChange={(open) => {
+              if (!open && !interpreting) setInterpretMode("");
+            }}
+          />
+          <Text type="body">
+            {interpretMode === "selected"
+              ? "会按当前配置重新评分、翻译并写摘要。DeepSeek 不可用时改用 Workers AI 翻译。每次 8 条。"
+              : "处理还没有相关度，或译文为空、翻译失败的记录。每次 8 条。"}
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="开始解读"
+              variant="primary"
+              isLoading={interpreting}
+              onClick={() => {
+                void runInterpret();
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={interpreting}
+              onClick={() => setInterpretMode("")}
             />
           </HStack>
         </VStack>

@@ -11,6 +11,7 @@ export interface ImportRow {
   excludeTerms: string[];
   caseSensitive: boolean;
   enabled: boolean;
+  description: string;
 }
 
 function parseCsvRows(text: string): string[][] {
@@ -93,6 +94,7 @@ export function recordsFromRows(rows: Record<string, string>[]): ImportRow[] {
       excludeTerms,
       caseSensitive: flagEnabled(cell(row, "case_sensitive", "caseSensitive")),
       enabled: !["0", "false", "no"].includes(enabledRaw),
+      description: cell(row, "description").slice(0, 800),
     };
   });
 }
@@ -115,6 +117,7 @@ export function mergeImportRows(rows: ImportRow[]): ImportRow[] {
     existing.query = existing.terms[0] ?? existing.query;
     existing.caseSensitive = existing.caseSensitive || row.caseSensitive;
     existing.enabled = row.enabled;
+    if (row.description) existing.description = row.description;
   }
   return [...merged.values()];
 }

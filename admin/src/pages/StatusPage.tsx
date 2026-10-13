@@ -68,6 +68,8 @@ interface StatusPayload {
     fromConfigured: boolean;
     translationEnabled: boolean;
     accessConfigured: boolean;
+    deepseekConfigured?: boolean;
+    aiProvider?: string;
   };
 }
 
@@ -97,6 +99,7 @@ export function StatusPage() {
       <HStack gap={2}>
         {flag(data.delivery.accessConfigured, "Access 已配置", "Access 未配置")}
         {flag(data.delivery.translationEnabled, "翻译开启", "翻译关闭")}
+        {flag(Boolean(data.delivery.deepseekConfigured), "DeepSeek 已配置", "DeepSeek 未配置")}
         {flag(data.delivery.emailEnabled && data.delivery.fromConfigured, "邮件可发送", "邮件未就绪")}
       </HStack>
       <Heading level={2}>数据源</Heading>

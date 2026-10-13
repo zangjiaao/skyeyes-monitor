@@ -30,7 +30,7 @@
   },
   // 密钥只通过 wrangler secret put 注入，禁止把真实值写进本文件。
   "secrets": {
-    "required": ["TWITTERAPI_IO_KEY", "RESEND_API_KEY", "TEAM_DOMAIN", "POLICY_AUD"]
+    "required": ["TWITTERAPI_IO_KEY", "RESEND_API_KEY", "TEAM_DOMAIN", "POLICY_AUD", "DEEPSEEK_API_KEY"]
   },
   "d1_databases": [
     {

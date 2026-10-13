@@ -13,6 +13,7 @@ export interface QueryTarget {
   terms?: string[];
   excludeTerms?: string[];
   caseSensitive?: boolean;
+  description?: string;
 }
 
 export interface TimeWindow {

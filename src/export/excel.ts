@@ -14,6 +14,8 @@ export interface ExcelRecord {
   matchedTerm?: string;
   collectedAt: string;
   translationZh: string;
+  relevanceScore?: string;
+  summaryZh?: string;
 }
 
 export interface WorkbookInput {
@@ -39,6 +41,8 @@ const HEADERS = [
   "中文译文",
   "时段",
   "命中检索词",
+  "相关度",
+  "中文摘要",
 ];
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -76,6 +80,8 @@ function row(record: ExcelRecord, period: PeriodLabel): string[] {
     record.translationZh,
     period,
     record.matchedTerm ?? "",
+    record.relevanceScore ?? "",
+    record.summaryZh ?? "",
   ];
 }
 

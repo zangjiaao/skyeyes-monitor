@@ -24,6 +24,7 @@ const FIELDS = [
   ["email_from_name", "发件人名称"],
   ["app_base_url", "站点地址（邮件里的下载链接）"],
   ["allowed_admin_emails", "管理员邮箱，逗号分隔；留空则接受任何通过 Access 的用户"],
+  ["ai_model", "DeepSeek 模型名"],
   ["translation_source_lang", "拉丁文字未标明语种时的源语言代码"],
   ["translation_target_lang", "翻译目标语言代码"],
   ["finalize_deadline_minutes", "收尾截止分钟"],
@@ -81,10 +82,20 @@ export function SettingsPage() {
       <HStack gap={3}>
         <CheckboxInput label="翻译成中文" value={flag("translation_enabled")} onChange={(checked) => setValues({ ...values, translation_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="相关度评分" value={flag("relevance_enabled")} onChange={(checked) => setValues({ ...values, relevance_enabled: checked ? "1" : "0" })} />
+        <CheckboxInput label="启用 AI 解读" value={flag("ai_enabled")} onChange={(checked) => setValues({ ...values, ai_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="发送每日邮件" value={flag("email_enabled")} onChange={(checked) => setValues({ ...values, email_enabled: checked ? "1" : "0" })} />
         <CheckboxInput label="排除转推" value={flag("exclude_retweets")} onChange={(checked) => setValues({ ...values, exclude_retweets: checked ? "1" : "0" })} />
         <CheckboxInput label="排除广告" value={flag("exclude_ads")} onChange={(checked) => setValues({ ...values, exclude_ads: checked ? "1" : "0" })} />
       </HStack>
+      <Selector
+        label="解读服务"
+        value={values.ai_provider || "deepseek"}
+        onChange={(value) => setValues({ ...values, ai_provider: value })}
+        options={[
+          { value: "deepseek", label: "DeepSeek" },
+          { value: "workers", label: "Workers AI" },
+        ]}
+      />
       <Selector
         label="邮件服务"
         value={values.email_provider || "resend"}

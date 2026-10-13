@@ -141,6 +141,7 @@ export function decideAdmission(input: {
   relevanceEnabled: boolean;
   relevanceScore: number | null;
   relevanceThreshold: number;
+  relevant?: boolean | null;
 }): Admission {
   const timeStatus = classifyPublishTime(input.publishedAt, input.window);
   if (timeStatus === "out_of_window") {
@@ -154,6 +155,9 @@ export function decideAdmission(input: {
   }
   if (input.republish) {
     return { action: "drop", timeStatus, excludeReason: "republish" };
+  }
+  if (input.relevanceEnabled && input.relevant === false) {
+    return { action: "store_only", timeStatus, excludeReason: "relevance" };
   }
   if (
     input.relevanceEnabled
