@@ -27,6 +27,19 @@ interface CountryCount extends Record<string, unknown> {
   yesterday: number;
 }
 
+interface RunProgress {
+  pending: number;
+  enqueued: number;
+  running: number;
+  done: number;
+  failed: number;
+  cancelled: number;
+  fetched: number;
+  deduped: number;
+  filtered: number;
+  added: number;
+}
+
 interface RunRow extends Record<string, unknown> {
   id: string;
   trigger: string;
@@ -37,6 +50,7 @@ interface RunRow extends Record<string, unknown> {
   relevance_failed: number;
   email_status: string | null;
   notes: string | null;
+  progress?: RunProgress;
 }
 
 interface SourceState extends Record<string, unknown> {
@@ -110,7 +124,7 @@ export function StatusPage() {
     const path = runId ? `/api/runs/${runId}/requeue` : "/api/runs/requeue";
     api<{ batches: number; warning: string | null }>(path, { method: "POST" })
       .then((result) => {
-        setNotice(result.warning ?? `已重新入队 ${result.batches} 个批次`);
+        setNotice(result.warning ?? `已恢复 ${result.batches} 个批次`);
         if (result.warning) setActionError(result.warning);
         reload();
       })
@@ -121,7 +135,9 @@ export function StatusPage() {
     setActionError("");
     api<{ cancelledBatches: number }>(`/api/runs/${runId}/cancel`, { method: "POST" })
       .then((result) => {
-        setNotice(`已取消 ${result.cancelledBatches} 个尚未入队的批次`);
+        setNotice(result.cancelledBatches > 0
+          ? `已取消 ${result.cancelledBatches} 个未完成批次`
+          : "运行已取消");
         reload();
       })
       .catch((reason: Error) => setActionError(reason.message));
@@ -175,12 +191,12 @@ export function StatusPage() {
       {(data.stuckBatches ?? 0) > 0 ? (
         <Banner
           status="warning"
-          title={`${data.stuckBatches} 个批次已写入数据库，但还没有进入采集队列`}
-          description="重新入队会补发这些批次。取消只会停下尚未入队的批次，已经在采集的批次会继续。"
+          title={`${data.stuckBatches} 个批次卡住了`}
+          description="包括还没入队、入队超过 15 分钟仍无进展，以及租约已过期仍停在进行中的批次。恢复会立刻收回进行中的批次，以及已入队但队列消息已经丢失的批次。本地 wrangler dev 的队列在内存里，重启后消息会丢，D1 仍显示已入队，用恢复即可。"
         />
       ) : null}
       <HStack gap={2}>
-        <Button label="重新入队卡住的批次" variant="secondary" onClick={() => requeue()} />
+        <Button label="恢复卡住的批次" variant="secondary" onClick={() => requeue()} />
       </HStack>
       <Heading level={2}>最近运行</Heading>
       <Table
@@ -192,8 +208,24 @@ export function StatusPage() {
           { key: "started_at", header: timeHeader("开始", data.timezone, data.utcOffset), renderCell: (row) => formatTime(row.started_at, data.timezone) },
           { key: "trigger", header: "触发" },
           { key: "status", header: "状态", renderCell: (row) => RUN_STATUS[row.status] ?? row.status },
-          { key: "records_added", header: "新增" },
-          { key: "batches_failed", header: "失败批次" },
+          {
+            key: "progress",
+            header: "批次",
+            renderCell: (row) => {
+              const progress = row.progress;
+              if (!progress) return `失败 ${row.batches_failed}`;
+              return `待入队 ${progress.pending} · 已入队 ${progress.enqueued} · 进行 ${progress.running} · 完成 ${progress.done} · 失败 ${progress.failed} · 取消 ${progress.cancelled}`;
+            },
+          },
+          {
+            key: "items",
+            header: "条目",
+            renderCell: (row) => {
+              const progress = row.progress;
+              if (!progress) return `新增 ${row.records_added}`;
+              return `抓取 ${progress.fetched} · 去重 ${progress.deduped} · 过滤 ${progress.filtered} · 新增 ${progress.added}`;
+            },
+          },
           { key: "notes", header: "说明", renderCell: (row) => row.notes || "—" },
           { key: "relevance_failed", header: "评分失败", renderCell: (row) => row.relevance_failed ?? 0 },
           { key: "email_status", header: "邮件", renderCell: (row) => row.email_status || "—" },
@@ -201,11 +233,11 @@ export function StatusPage() {
             key: "actions",
             header: "操作",
             renderCell: (row) => {
-              const open = row.status === "running" || row.status === "partial" || row.status === "failed";
+              const open = row.status === "running" || row.status === "partial" || row.status === "failed" || row.status === "incomplete";
               if (!open) return "—";
               return (
                 <HStack gap={1}>
-                  <Button label="重新入队" variant="secondary" size="sm" onClick={() => requeue(row.id)} />
+                  <Button label="恢复" variant="secondary" size="sm" onClick={() => requeue(row.id)} />
                   <Button label="取消" variant="ghost" size="sm" onClick={() => cancel(row.id)} />
                 </HStack>
               );

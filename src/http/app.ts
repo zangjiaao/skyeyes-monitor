@@ -22,7 +22,7 @@ import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
 import { enqueueErrorMessage } from "../pipeline/queue-batch";
-import { cancelRun, requeueStuckBatches } from "../pipeline/run";
+import { ActiveRunError, cancelRun, requeueStuckBatches } from "../pipeline/run";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -307,6 +307,72 @@ async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
   }
 }
 
+interface RunProgress {
+  pending: number;
+  enqueued: number;
+  running: number;
+  done: number;
+  failed: number;
+  cancelled: number;
+  fetched: number;
+  deduped: number;
+  filtered: number;
+  added: number;
+}
+
+const EMPTY_PROGRESS: RunProgress = {
+  pending: 0,
+  enqueued: 0,
+  running: 0,
+  done: 0,
+  failed: 0,
+  cancelled: 0,
+  fetched: 0,
+  deduped: 0,
+  filtered: 0,
+  added: 0,
+};
+
+async function attachRunProgress<T extends { id: string }>(db: D1Database, runs: T[]): Promise<Array<T & { progress: RunProgress }>> {
+  if (runs.length === 0) return [];
+  const marks = runs.map(() => "?").join(", ");
+  const rows = await db.prepare(
+    `SELECT run_id,
+       SUM(CASE WHEN status = 'queued' AND enqueued_at IS NULL THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN status = 'queued' AND enqueued_at IS NOT NULL THEN 1 ELSE 0 END) AS enqueued,
+       SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+       SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+       SUM(items_fetched) AS fetched,
+       SUM(items_deduped) AS deduped,
+       SUM(items_filtered) AS filtered,
+       SUM(items_added) AS added
+     FROM batches WHERE run_id IN (${marks}) GROUP BY run_id`,
+  ).bind(...runs.map((run) => run.id)).all<RunProgress & { run_id: string }>();
+  const byRun = new Map(rows.results.map((row) => [row.run_id, row]));
+  return runs.map((run) => {
+    const row = byRun.get(run.id);
+    return {
+      ...run,
+      progress: row
+        ? {
+          pending: row.pending ?? 0,
+          enqueued: row.enqueued ?? 0,
+          running: row.running ?? 0,
+          done: row.done ?? 0,
+          failed: row.failed ?? 0,
+          cancelled: row.cancelled ?? 0,
+          fetched: row.fetched ?? 0,
+          deduped: row.deduped ?? 0,
+          filtered: row.filtered ?? 0,
+          added: row.added ?? 0,
+        }
+        : EMPTY_PROGRESS,
+    };
+  });
+}
+
 async function refreshWorkbook(env: Env): Promise<{ excel: boolean; excelError: string | null }> {
   try {
     const settings = await loadSettings(env.DB);
@@ -367,9 +433,14 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     ]);
     const rateLimit = await loadRateLimit(c.env.DB, now, settings.xQps);
     const stuck = await c.env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM batches
-       WHERE status = 'queued' AND (enqueued_at IS NULL OR enqueued_at LIKE 'claim:%')`,
-    ).first<{ n: number }>();
+      `SELECT COUNT(*) AS n FROM batches b
+       JOIN runs r ON r.id = b.run_id
+       WHERE r.status IN ('running', 'partial', 'failed', 'incomplete')
+         AND (
+           (b.status = 'queued' AND (b.enqueued_at IS NULL OR b.enqueued_at <= ?))
+           OR (b.status = 'running' AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= ?))
+         )`,
+    ).bind(new Date(now.getTime() - 15 * 60 * 1000).toISOString(), now.toISOString()).first<{ n: number }>();
     const countMap = (rows: { country_id: string; n: number }[]) => new Map(rows.map((row) => [row.country_id, row.n]));
     const totalMap = countMap(totals.results);
     const todayMap = countMap(todayCounts.results);
@@ -401,7 +472,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
           yesterday: yesterdayMap.get(row.id) ?? 0,
         };
       }),
-      runs: runs.results,
+      runs: await attachRunProgress(c.env.DB, runs.results as Array<Record<string, unknown> & { id: string }>),
       stuckBatches: stuck?.n ?? 0,
       failedBatches: failed.results,
       apiUsage: usage.results,
@@ -917,9 +988,17 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
 
   app.post("/api/runs", async (c) => {
     try {
-      const started = await startManualRun(c.env);
+      let confirm = false;
+      if ((c.req.header("content-type") ?? "").includes("application/json")) {
+        const body = await readJson(c.req.raw);
+        confirm = body.confirm === true;
+      }
+      const started = await startManualRun(c.env, new Date(), { confirm });
       return c.json(started, 202);
     } catch (error) {
+      if (error instanceof ActiveRunError) {
+        return c.json({ error: error.message, code: "active_run", activeRunId: error.activeRunId }, 409);
+      }
       const message = error instanceof Error ? error.message : "";
       if (/15000|Unknown Internal Error|sendBatch/i.test(message)) {
         return jsonError(new Error(enqueueErrorMessage(error)), 500);
@@ -930,7 +1009,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
 
   app.post("/api/runs/requeue", async (c) => {
     try {
-      const result = await requeueStuckBatches(c.env, { includeFailed: true });
+      const result = await requeueStuckBatches(c.env, { includeFailed: true, force: true });
       return c.json(result);
     } catch (error) {
       return jsonError(new Error(enqueueErrorMessage(error)), 500);
@@ -939,7 +1018,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
 
   app.post("/api/runs/:id/requeue", async (c) => {
     try {
-      const result = await requeueStuckBatches(c.env, { runId: c.req.param("id"), includeFailed: true });
+      const result = await requeueStuckBatches(c.env, { runId: c.req.param("id"), includeFailed: true, force: true });
       return c.json(result);
     } catch (error) {
       return jsonError(new Error(enqueueErrorMessage(error)), 500);

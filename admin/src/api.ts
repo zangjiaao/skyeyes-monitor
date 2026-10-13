@@ -1,8 +1,12 @@
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  activeRunId?: string;
+  constructor(status: number, message: string, extra?: { code?: string; activeRunId?: string }) {
     super(message);
     this.status = status;
+    this.code = extra?.code;
+    this.activeRunId = extra?.activeRunId;
   }
 }
 
@@ -15,10 +19,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
     try {
-      const payload = await response.json() as { error?: string };
+      const payload = await response.json() as { error?: string; code?: string; activeRunId?: string };
       if (payload.error) message = payload.error;
-    } catch {
-      // 非 JSON 错误页保持状态码说明。
+      throw new ApiError(response.status, message, { code: payload.code, activeRunId: payload.activeRunId });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
     }
     throw new ApiError(response.status, message);
   }

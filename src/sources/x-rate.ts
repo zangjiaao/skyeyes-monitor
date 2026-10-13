@@ -64,6 +64,31 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export async function tryReserveXSlot(
+  db: D1Database,
+  qps: number,
+  inlineLimitMs: number,
+  nowMs = Date.now(),
+): Promise<{ ok: true; waitMs: number } | { ok: false; waitMs: number }> {
+  const intervalMs = intervalMsForQps(qps);
+  await db.prepare(
+    "INSERT OR IGNORE INTO rate_slots (name, next_at_ms) VALUES (?, 0)",
+  ).bind(X_RATE_SLOT).run();
+  const reserved = await db.prepare(
+    `UPDATE rate_slots
+     SET next_at_ms = MAX(next_at_ms, ?1) + ?2
+     WHERE name = ?3 AND next_at_ms <= ?4
+     RETURNING next_at_ms`,
+  ).bind(nowMs, intervalMs, X_RATE_SLOT, nowMs + inlineLimitMs).first<{ next_at_ms: number }>();
+  if (reserved) {
+    return { ok: true, waitMs: Math.max(0, reserved.next_at_ms - intervalMs - nowMs) };
+  }
+  const current = await db.prepare(
+    "SELECT next_at_ms FROM rate_slots WHERE name = ?",
+  ).bind(X_RATE_SLOT).first<{ next_at_ms: number }>();
+  return { ok: false, waitMs: Math.max(0, (current?.next_at_ms ?? nowMs) - nowMs) };
+}
+
 export async function reserveXSlot(db: D1Database, qps: number, nowMs = Date.now()): Promise<number> {
   const intervalMs = intervalMsForQps(qps);
   await db.prepare(

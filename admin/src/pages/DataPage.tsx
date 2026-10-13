@@ -7,7 +7,7 @@ import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table, useTableSelection, useTableSelectionState } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
-import { api, formatTime, timeHeader } from "../api";
+import { ApiError, api, formatTime, timeHeader } from "../api";
 
 interface RecordRow extends Record<string, unknown> {
   id: string;
@@ -81,6 +81,7 @@ export function DataPage() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [pendingIds, setPendingIds] = useState<string[]>([]);
   const [matchOpen, setMatchOpen] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [scoreMode, setScoreMode] = useState<"" | "selected" | "unscored">("");
   const [scoring, setScoring] = useState(false);
@@ -338,7 +339,13 @@ export function DataPage() {
                 if (result.warning) setError(result.warning);
                 setNotice(result.warning ? `运行 ${result.runId} 已建立，部分批次没有入队` : `已开始运行 ${result.runId}`);
               })
-              .catch((reason: Error) => setError(reason.message));
+              .catch((reason: Error) => {
+                if (reason instanceof ApiError && reason.code === "active_run" && reason.activeRunId) {
+                  setActiveRunId(reason.activeRunId);
+                  return;
+                }
+                setError(reason.message);
+              });
           }}
         />
         <Button
@@ -809,6 +816,44 @@ export function DataPage() {
               isDisabled={deleting}
               onClick={() => setPendingIds([])}
             />
+          </HStack>
+        </VStack>
+      </Dialog>
+      <Dialog
+        isOpen={activeRunId !== null}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open) setActiveRunId(null);
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title="已有运行进行中"
+            onOpenChange={(open) => {
+              if (!open) setActiveRunId(null);
+            }}
+          />
+          <Text type="body">
+            另一次采集还没结束。先取消它的全部未完成批次，再开始这次手动运行。已经完成的批次会保留。
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="取消进行中的运行并开始"
+              variant="primary"
+              onClick={() => {
+                setError("");
+                api<{ runId: string; warning?: string | null }>("/api/runs", {
+                  method: "POST",
+                  body: JSON.stringify({ confirm: true }),
+                }).then((result) => {
+                  setActiveRunId(null);
+                  if (result.warning) setError(result.warning);
+                  setNotice(result.warning ? `运行 ${result.runId} 已建立，部分批次没有入队` : `已开始运行 ${result.runId}`);
+                }).catch((reason: Error) => setError(reason.message));
+              }}
+            />
+            <Button label="留下当前运行" variant="secondary" onClick={() => setActiveRunId(null)} />
           </HStack>
         </VStack>
       </Dialog>

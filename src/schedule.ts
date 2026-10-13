@@ -1,8 +1,8 @@
 import { loadSettings } from "./config/settings";
 import { decideSchedule, rollingWindow } from "./domain/time";
-import { logError } from "./log";
+import { log, logError } from "./log";
 import { STUCK_BATCH_GRACE_MS } from "./pipeline/queue-batch";
-import { finalizeOverdue, requeueStuckBatches, startRun } from "./pipeline/run";
+import { ActiveRunError, finalizeOverdue, requeueStuckBatches, startRun } from "./pipeline/run";
 
 export async function handleScheduled(env: Env, scheduledTime: number): Promise<void> {
   const now = new Date(scheduledTime);
@@ -35,12 +35,16 @@ export async function handleScheduled(env: Env, scheduledTime: number): Promise<
       windowEnd: decision.end,
     });
   } catch (error) {
+    if (error instanceof ActiveRunError) {
+      log("schedule skipped because a run is active", { activeRunId: error.activeRunId, slotKey: decision.slotKey });
+      return;
+    }
     logError("scheduled run failed", error, { slotKey: decision.slotKey });
     throw error;
   }
 }
 
-export async function startManualRun(env: Env, now = new Date()): Promise<{
+export async function startManualRun(env: Env, now = new Date(), options: { confirm?: boolean } = {}): Promise<{
   runId: string;
   batches: number;
   enqueued: number;
@@ -59,6 +63,7 @@ export async function startManualRun(env: Env, now = new Date()): Promise<{
     slotKey: "",
     windowStart: window.start,
     windowEnd: window.end,
+    confirm: options.confirm,
   });
   return {
     runId: started.runId,

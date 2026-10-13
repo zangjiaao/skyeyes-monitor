@@ -1,6 +1,7 @@
 import { createApp } from "./http/app";
 import { logError } from "./log";
 import { isCollectMessage } from "./pipeline/messages";
+import { DeferredBatchError } from "./pipeline/lease";
 import { continueEnqueue, handleDeadLetter, processBatch, finalizeRun } from "./pipeline/run";
 import { handleScheduled } from "./schedule";
 import { RateLimitError } from "./sources/x";
@@ -36,7 +37,9 @@ export default {
         logError("queue message failed", error, { queue: batch.queue });
         if (deadLetter) message.ack();
         else message.retry({
-          delaySeconds: error instanceof RateLimitError ? error.delaySeconds : 45,
+          delaySeconds: error instanceof RateLimitError || error instanceof DeferredBatchError
+            ? error.delaySeconds
+            : 45,
         });
       }
     }

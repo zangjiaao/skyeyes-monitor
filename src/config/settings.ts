@@ -36,6 +36,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   ai_provider: "deepseek",
   ai_model: "deepseek-chat",
   ai_enabled: "1",
+  queue_concurrency: "4",
 };
 
 export const EDITABLE_SETTINGS = Object.keys(SETTING_DEFAULTS);
@@ -72,6 +73,7 @@ export interface AppSettings {
   aiProvider: "deepseek" | "workers";
   aiModel: string;
   aiEnabled: boolean;
+  queueConcurrency: number;
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -154,6 +156,7 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     aiProvider: merged.ai_provider === "workers" ? "workers" : "deepseek",
     aiModel: merged.ai_model.trim() || "deepseek-chat",
     aiEnabled: flag(merged.ai_enabled, true),
+    queueConcurrency: clampInt(merged.queue_concurrency, 4, 1, 8),
   };
 }
 
@@ -199,6 +202,7 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
   assertInt(next.min_followers, 0, 10_000_000, "最少粉丝数必须是 0 到 10000000，0 表示不限制");
   assertInt(next.min_account_age_days, 0, 3650, "最少账号天数必须是 0 到 3650，0 表示不限制");
   assertInt(next.relevance_threshold, 0, 100, "相关度阈值必须是 0 到 100，0 表示不因分数排除");
+  assertInt(next.queue_concurrency, 1, 8, "同时采集批次数必须是 1 到 8");
   if (next.ai_provider && next.ai_provider !== "deepseek" && next.ai_provider !== "workers") {
     throw new Error("解读服务只能是 deepseek 或 workers");
   }
