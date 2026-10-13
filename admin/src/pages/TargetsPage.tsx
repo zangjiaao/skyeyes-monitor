@@ -39,18 +39,27 @@ const KINDS = [
 ];
 
 const IMPORT_HELP = [
+  ["目标ID", "留空则新建；填写导出的 ID 则覆盖该目标；删行不会删除数据库里的目标。"],
   ["国家代码", "必须是这里已经建好的国家代码，例如 pk。"],
   ["类型", "person 人物、organization 机构、keyword 关键词、handle X 账号。也可以写中文。"],
-  ["显示名", "日报里的名称。同一国家、类型、显示名的多行会合并。"],
-  ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。"],
+  ["显示名", "日报里的名称。没有目标 ID 时，同一国家、类型、显示名的多行会合并。"],
+  ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。带目标 ID 的行会按文件里的检索词整列覆盖。"],
   ["排除词", "可选。规则与检索词相同，命中就丢掉整条。"],
   ["背景说明", "可选。交给 AI 解读，最多 800 字。"],
   ["启用", "1 或 是 为启用，0 或 否 为停用。留空视为启用。"],
   ["英文短语区分大小写", "可选。1 或 是 时，更长的英文短语也区分大小写。缩写始终区分大小写。"],
 ];
 
+const ACTION_LABEL = {
+  create: "新建",
+  update: "更新",
+  unchanged: "无变化",
+} as const;
+
 interface ImportPreviewRow extends Record<string, unknown> {
   line: number;
+  id: string;
+  action: keyof typeof ACTION_LABEL;
   countryCode: string;
   kind: string;
   name: string;
@@ -86,6 +95,7 @@ export function TargetsPage() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [importing, setImporting] = useState(false);
+  const [exportCurrentCountry, setExportCurrentCountry] = useState(true);
   const fileRef = useRef<HTMLInputElement>(null);
 
   function resetTargetForm() {
@@ -125,6 +135,23 @@ export function TargetsPage() {
     URL.revokeObjectURL(url);
   }
 
+  async function downloadExport(format: "csv" | "xlsx") {
+    setError("");
+    const params = exportCurrentCountry && countryId ? `?countryId=${encodeURIComponent(countryId)}` : "";
+    const response = await fetch(`/api/targets/export.${format}${params}`);
+    if (!response.ok) {
+      setError("导出失败");
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = format === "csv" ? "skyeyes-targets.csv" : "skyeyes-targets.xlsx";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   async function loadPreview(file: File) {
     setImportFile(file);
     setPreview(null);
@@ -149,11 +176,11 @@ export function TargetsPage() {
     try {
       const form = new FormData();
       form.set("file", importFile);
-      const result = await api<{ imported: number }>("/api/targets/import", { method: "POST", body: form });
+      const result = await api<{ created: number; updated: number; unchanged: number }>("/api/targets/import", { method: "POST", body: form });
       setImportOpen(false);
       setImportFile(null);
       setPreview(null);
-      setNotice(`已导入 ${result.imported} 条`);
+      setNotice(`新建 ${result.created} 条，更新 ${result.updated} 条，无变化 ${result.unchanged} 条`);
       await reload();
     } catch (reason) {
       setPreviewError(reason instanceof Error ? reason.message : "导入失败");
@@ -314,7 +341,16 @@ export function TargetsPage() {
           <Button label="取消编辑" variant="secondary" onClick={resetTargetForm} />
         ) : null}
       </HStack>
-      <Button label="导入 CSV / Excel" variant="secondary" onClick={() => setImportOpen(true)} />
+      <HStack gap={2}>
+        <Button label="导出 CSV" variant="secondary" onClick={() => { void downloadExport("csv"); }} />
+        <Button label="导出 Excel" variant="secondary" onClick={() => { void downloadExport("xlsx"); }} />
+        <CheckboxInput
+          label="只导出当前国家"
+          value={exportCurrentCountry}
+          onChange={setExportCurrentCountry}
+        />
+        <Button label="导入 CSV / Excel" variant="secondary" onClick={() => setImportOpen(true)} />
+      </HStack>
       <Table
         density="compact"
         idKey="id"
@@ -402,7 +438,7 @@ export function TargetsPage() {
             }}
           />
           <Text type="body">
-            先下载模板，按列填写。中文表头和英文表头都可以。选择文件后先预览，确认没有错误再写入。
+            导出的表格和模板列相同，改完可以再导入。目标 ID 留空会新建；填写导出的 ID 会覆盖该目标。文件里没有的目标会保留，只有页面上的删除才会删掉目标。
           </Text>
           <VStack gap={1}>
             {IMPORT_HELP.map(([label, help]) => (
@@ -434,6 +470,11 @@ export function TargetsPage() {
             <Banner status="error" title={`${preview.errorCount} 行有错误，改正文件后再导入`} />
           ) : null}
           {preview ? (
+            <Text type="supporting">
+              {`新建 ${preview.rows.filter((row) => row.errors.length === 0 && row.action === "create").length}，更新 ${preview.rows.filter((row) => row.errors.length === 0 && row.action === "update").length}，无变化 ${preview.rows.filter((row) => row.errors.length === 0 && row.action === "unchanged").length}。文件中没有的目标不会删除。`}
+            </Text>
+          ) : null}
+          {preview ? (
             <Table
               density="compact"
               idKey="line"
@@ -451,7 +492,8 @@ export function TargetsPage() {
                   renderCell: (row) => {
                     const notes = [...row.errors];
                     if (row.duplicateOf) notes.push(`与第 ${row.duplicateOf} 行重复，将合并`);
-                    return notes.join("；") || "可以导入";
+                    if (notes.length > 0) return notes.join("；");
+                    return ACTION_LABEL[row.action];
                   },
                 },
               ]}

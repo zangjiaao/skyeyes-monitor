@@ -5,7 +5,16 @@ import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule } from "../domain/time";
 import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
-import { buildTargetTemplateCsv, buildTargetTemplateXlsx, parseCsv, parseXlsx, previewCsv, previewXlsx } from "../import/table";
+import {
+  buildTargetExportCsv,
+  buildTargetExportXlsx,
+  buildTargetTemplateCsv,
+  buildTargetTemplateXlsx,
+  previewCsv,
+  previewXlsx,
+  type ExistingTarget,
+  type ImportPreviewRow,
+} from "../import/table";
 import { storeExcel } from "../pipeline/run";
 import { hideRecords, parseDeleteIds } from "../records/delete";
 import { rescoreRecords } from "../records/rescore";
@@ -40,6 +49,204 @@ function descriptionText(value: unknown): string {
 function requireString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label}不能为空`);
   return value.trim();
+}
+
+interface StoredTargetRow {
+  id: string;
+  country_id: string;
+  country_code: string;
+  kind: string;
+  name: string;
+  query: string;
+  terms: string;
+  exclude_terms: string;
+  description: string | null;
+  enabled: number;
+  case_sensitive: number;
+}
+
+interface IndexedTarget extends ExistingTarget {
+  countryId: string;
+}
+
+function sameTerms(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function targetNameKey(target: { countryCode: string; kind: string; name: string }): string {
+  return `${target.countryCode}\0${target.kind}\0${target.name}`;
+}
+
+async function loadExistingTargets(db: D1Database, countryId?: string): Promise<IndexedTarget[]> {
+  const sql = `SELECT t.id, t.country_id, c.code AS country_code, t.kind, t.name, t.query, t.terms,
+                      t.exclude_terms, t.description, t.enabled, t.case_sensitive
+               FROM targets t
+               JOIN countries c ON c.id = t.country_id
+               ${countryId ? "WHERE t.country_id = ?" : ""}
+               ORDER BY c.code, t.kind, t.name`;
+  const statement = countryId ? db.prepare(sql).bind(countryId) : db.prepare(sql);
+  const rows = await statement.all<StoredTargetRow>();
+  return rows.results.map((row) => {
+    const terms = splitLines(row.terms);
+    return {
+      id: row.id,
+      countryId: row.country_id,
+      countryCode: row.country_code,
+      kind: row.kind,
+      name: row.name,
+      terms: terms.length > 0 ? terms : splitLines(row.query),
+      excludeTerms: splitLines(row.exclude_terms),
+      description: row.description ?? "",
+      enabled: row.enabled === 1,
+      caseSensitive: row.case_sensitive === 1,
+    };
+  });
+}
+
+async function applyTargetImport(
+  db: D1Database,
+  rows: ImportPreviewRow[],
+  countryIdByCode: Map<string, string>,
+  existing: IndexedTarget[],
+): Promise<{ created: number; updated: number; unchanged: number }> {
+  const byId = new Map(existing.map((target) => [target.id, {
+    ...target,
+    terms: [...target.terms],
+    excludeTerms: [...target.excludeTerms],
+  }]));
+  const byName = new Map<string, IndexedTarget>();
+  for (const target of byId.values()) {
+    const key = targetNameKey(target);
+    if (!byName.has(key)) byName.set(key, target);
+  }
+  let created = 0;
+  let updated = 0;
+  let unchanged = 0;
+  const now = new Date().toISOString();
+  for (const row of rows) {
+    const countryId = countryIdByCode.get(row.countryCode);
+    if (!countryId) throw new Error(`未知国家代码 ${row.countryCode}，请先创建国家`);
+    if (row.id) {
+      const current = byId.get(row.id);
+      if (!current) throw new Error("未知目标 ID");
+      const same = current.countryId === countryId
+        && current.countryCode === row.countryCode
+        && current.kind === row.kind
+        && current.name === row.name
+        && sameTerms(current.terms, row.terms)
+        && sameTerms(current.excludeTerms, row.excludeTerms)
+        && current.description === row.description
+        && current.enabled === row.enabled
+        && current.caseSensitive === row.caseSensitive;
+      if (same) {
+        unchanged += 1;
+        continue;
+      }
+      await db.prepare(
+        `UPDATE targets
+         SET country_id = ?, kind = ?, name = ?, query = ?, terms = ?, exclude_terms = ?,
+             case_sensitive = ?, enabled = ?, description = ?
+         WHERE id = ?`,
+      ).bind(
+        countryId,
+        row.kind,
+        row.name,
+        row.terms[0],
+        joinTerms(row.terms),
+        joinTerms(row.excludeTerms),
+        row.caseSensitive ? 1 : 0,
+        row.enabled ? 1 : 0,
+        row.description,
+        row.id,
+      ).run();
+      const oldKey = targetNameKey(current);
+      if (byName.get(oldKey)?.id === current.id) byName.delete(oldKey);
+      current.countryId = countryId;
+      current.countryCode = row.countryCode;
+      current.kind = row.kind;
+      current.name = row.name;
+      current.terms = [...row.terms];
+      current.excludeTerms = [...row.excludeTerms];
+      current.description = row.description;
+      current.enabled = row.enabled;
+      current.caseSensitive = row.caseSensitive;
+      byName.set(targetNameKey(current), current);
+      updated += 1;
+      continue;
+    }
+    const key = targetNameKey(row);
+    const current = byName.get(key);
+    if (!current) {
+      const id = crypto.randomUUID();
+      await db.prepare(
+        `INSERT INTO targets (
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        id,
+        countryId,
+        row.kind,
+        row.name,
+        row.terms[0],
+        joinTerms(row.terms),
+        joinTerms(row.excludeTerms),
+        row.caseSensitive ? 1 : 0,
+        row.description,
+        row.enabled ? 1 : 0,
+        now,
+      ).run();
+      const createdTarget: IndexedTarget = {
+        id,
+        countryId,
+        countryCode: row.countryCode,
+        kind: row.kind,
+        name: row.name,
+        terms: [...row.terms],
+        excludeTerms: [...row.excludeTerms],
+        description: row.description,
+        enabled: row.enabled,
+        caseSensitive: row.caseSensitive,
+      };
+      byId.set(id, createdTarget);
+      byName.set(key, createdTarget);
+      created += 1;
+      continue;
+    }
+    const terms = uniqueTerms([...current.terms, ...row.terms]);
+    const excludeTerms = uniqueTerms([...current.excludeTerms, ...row.excludeTerms]);
+    const caseSensitive = current.caseSensitive || row.caseSensitive;
+    const description = row.description || current.description;
+    const enabled = row.enabled;
+    const changed = !sameTerms(terms, current.terms)
+      || !sameTerms(excludeTerms, current.excludeTerms)
+      || caseSensitive !== current.caseSensitive
+      || description !== current.description
+      || enabled !== current.enabled;
+    if (!changed) {
+      unchanged += 1;
+      continue;
+    }
+    await db.prepare(
+      `UPDATE targets
+       SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?
+       WHERE id = ?`,
+    ).bind(
+      terms[0],
+      joinTerms(terms),
+      joinTerms(excludeTerms),
+      caseSensitive ? 1 : 0,
+      enabled ? 1 : 0,
+      description,
+      current.id,
+    ).run();
+    current.terms = terms;
+    current.excludeTerms = excludeTerms;
+    current.caseSensitive = caseSensitive;
+    current.description = description;
+    current.enabled = enabled;
+    updated += 1;
+  }
+  return { created, updated, unchanged };
 }
 
 async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
@@ -375,11 +582,31 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     });
   });
 
-  app.get("/api/targets/template.xlsx", (c) => {
-    return new Response(buildTargetTemplateXlsx(), {
+  app.get("/api/targets/template.xlsx", async (c) => {
+    return new Response(await buildTargetTemplateXlsx(), {
       headers: {
-        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Type": EXCEL_TYPE,
         "Content-Disposition": 'attachment; filename="skyeyes-targets-template.xlsx"',
+      },
+    });
+  });
+
+  app.get("/api/targets/export.csv", async (c) => {
+    const targets = await loadExistingTargets(c.env.DB, c.req.query("countryId"));
+    return new Response(buildTargetExportCsv(targets), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": 'attachment; filename="skyeyes-targets.csv"',
+      },
+    });
+  });
+
+  app.get("/api/targets/export.xlsx", async (c) => {
+    const targets = await loadExistingTargets(c.env.DB, c.req.query("countryId"));
+    return new Response(await buildTargetExportXlsx(targets), {
+      headers: {
+        "Content-Type": EXCEL_TYPE,
+        "Content-Disposition": 'attachment; filename="skyeyes-targets.xlsx"',
       },
     });
   });
@@ -392,9 +619,10 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       if (file.size > 2_000_000) throw new Error("文件不能超过 2MB");
       const countries = await c.env.DB.prepare("SELECT code FROM countries").all<{ code: string }>();
       const codes = countries.results.map((country) => country.code);
+      const existing = await loadExistingTargets(c.env.DB);
       const preview = file.name.toLowerCase().endsWith(".csv")
-        ? previewCsv(await file.text(), codes)
-        : previewXlsx(new Uint8Array(await file.arrayBuffer()), codes);
+        ? previewCsv(await file.text(), codes, existing)
+        : previewXlsx(new Uint8Array(await file.arrayBuffer()), codes, existing);
       return c.json(preview);
     } catch (error) {
       return jsonError(error);
@@ -407,66 +635,19 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const file = form.get("file");
       if (!(file instanceof File)) throw new Error("请上传 file 字段");
       if (file.size > 2_000_000) throw new Error("文件不能超过 2MB");
-      const name = file.name.toLowerCase();
-      const rows = name.endsWith(".csv")
-        ? parseCsv(await file.text())
-        : parseXlsx(new Uint8Array(await file.arrayBuffer()));
-      if (rows.length === 0) throw new Error("文件里没有数据行");
-      if (rows.length > 5000) throw new Error("一次最多导入 5000 行");
       const countries = await c.env.DB.prepare("SELECT id, code FROM countries").all<{ id: string; code: string }>();
       const byCode = new Map(countries.results.map((country) => [country.code, country.id]));
-      const now = new Date().toISOString();
-      for (const row of rows) {
-        const countryId = byCode.get(row.countryCode);
-        if (!countryId) throw new Error(`未知国家代码 ${row.countryCode}，请先创建国家`);
-        const existing = await c.env.DB.prepare(
-          `SELECT id, terms, exclude_terms, case_sensitive, description FROM targets
-           WHERE country_id = ? AND kind = ? AND name = ?`,
-        ).bind(countryId, row.kind, row.name).first<{
-          id: string;
-          terms: string;
-          exclude_terms: string;
-          case_sensitive: number;
-          description: string;
-        }>();
-        const terms = uniqueTerms([...splitLines(existing?.terms), ...row.terms]);
-        const excludeTerms = uniqueTerms([...splitLines(existing?.exclude_terms), ...row.excludeTerms]);
-        const caseSensitive = existing?.case_sensitive === 1 || row.caseSensitive ? 1 : 0;
-        if (existing) {
-          await c.env.DB.prepare(
-            `UPDATE targets
-             SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?
-             WHERE id = ?`,
-          ).bind(
-            terms[0],
-            joinTerms(terms),
-            joinTerms(excludeTerms),
-            caseSensitive,
-            row.enabled ? 1 : 0,
-            row.description || existing.description || "",
-            existing.id,
-          ).run();
-        } else {
-          await c.env.DB.prepare(
-            `INSERT INTO targets (
-              id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).bind(
-            crypto.randomUUID(),
-            countryId,
-            row.kind,
-            row.name,
-            terms[0],
-            joinTerms(terms),
-            joinTerms(excludeTerms),
-            caseSensitive,
-            row.description,
-            row.enabled ? 1 : 0,
-            now,
-          ).run();
-        }
-      }
-      return c.json({ imported: rows.length });
+      const existing = await loadExistingTargets(c.env.DB);
+      const name = file.name.toLowerCase();
+      const preview = name.endsWith(".csv")
+        ? previewCsv(await file.text(), countries.results.map((country) => country.code), existing)
+        : previewXlsx(new Uint8Array(await file.arrayBuffer()), countries.results.map((country) => country.code), existing);
+      if (preview.rows.length === 0) throw new Error("文件里没有数据行");
+      if (preview.rows.length > 5000) throw new Error("一次最多导入 5000 行");
+      const failed = preview.rows.find((row) => row.errors.length > 0);
+      if (failed) throw new Error(`第 ${failed.line} 行${failed.errors[0]}`);
+      const counts = await applyTargetImport(c.env.DB, preview.rows, byCode, existing);
+      return c.json({ imported: preview.rows.length, ...counts });
     } catch (error) {
       return jsonError(error);
     }

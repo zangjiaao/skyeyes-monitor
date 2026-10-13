@@ -1,8 +1,10 @@
 import * as XLSX from "xlsx";
 import { assertTermList, flagEnabled, splitImportTerms, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
+import { freezeFirstSheet } from "./xlsx-zip";
 
 export interface ImportRow {
+  id: string;
   countryCode: string;
   kind: TargetKind;
   name: string;
@@ -14,8 +16,23 @@ export interface ImportRow {
   description: string;
 }
 
+export type ImportAction = "create" | "update" | "unchanged";
+
+export interface ExistingTarget {
+  id: string;
+  countryCode: string;
+  kind: string;
+  name: string;
+  terms: string[];
+  excludeTerms: string[];
+  description: string;
+  enabled: boolean;
+  caseSensitive: boolean;
+}
+
 export interface ImportPreviewRow {
   line: number;
+  id: string;
   countryCode: string;
   kind: string;
   name: string;
@@ -26,6 +43,7 @@ export interface ImportPreviewRow {
   caseSensitive: boolean;
   errors: string[];
   duplicateOf: number | null;
+  action: ImportAction;
 }
 
 export interface ImportPreview {
@@ -35,6 +53,7 @@ export interface ImportPreview {
 }
 
 export const TEMPLATE_HEADERS = [
+  "目标ID",
   "国家代码",
   "类型",
   "显示名",
@@ -44,6 +63,8 @@ export const TEMPLATE_HEADERS = [
   "启用",
   "英文短语区分大小写",
 ] as const;
+
+const COLUMN_WIDTHS = [38, 12, 16, 24, 56, 28, 36, 10, 24];
 
 export const TEMPLATE_EXAMPLES: string[][] = [
   [
@@ -70,6 +91,7 @@ export const TEMPLATE_EXAMPLES: string[][] = [
 
 const TEMPLATE_HELP: string[][] = [
   ["列", "必填", "允许的值", "说明"],
+  ["目标ID", "否", "导出的目标 ID，或留空", "留空则新建。填写后按这个 ID 覆盖原目标，不会另建一条。从文件里删掉一行不会删除数据库里的目标。表头也可以写 id。"],
   ["国家代码", "是", "已存在的国家代码，例如 pk", "必须先在监测目标页建好国家。大小写不限。表头也可以写 country_code。"],
   ["类型", "是", "person、organization、keyword、handle，或 人物、机构、关键词、X 账号", "决定这条目标怎么匹配。表头也可以写 kind。"],
   ["显示名", "是", "任意文字", "日报里看到的名称。同一国家、类型、显示名的多行会合并成一个目标。表头也可以写 name。"],
@@ -81,6 +103,10 @@ const TEMPLATE_HELP: string[][] = [
 ];
 
 const HEADER_ALIASES: Record<string, string> = {
+  id: "id",
+  target_id: "id",
+  targetid: "id",
+  目标id: "id",
   country_code: "country_code",
   countrycode: "country_code",
   country: "country_code",
@@ -139,17 +165,76 @@ function csvCell(value: string): string {
   return value;
 }
 
-export function buildTargetTemplateCsv(): string {
-  const lines = [[...TEMPLATE_HEADERS], ...TEMPLATE_EXAMPLES].map((row) => row.map(csvCell).join(","));
+function templateExampleRows(): string[][] {
+  return TEMPLATE_EXAMPLES.map((row) => ["", ...row]);
+}
+
+export function joinExportTerms(terms: string[]): string {
+  const clean = terms.map((term) => term.trim()).filter(Boolean);
+  if (clean.some((term) => term.includes("|"))) return clean.join("\n");
+  return clean.join("|");
+}
+
+export function targetCells(target: ExistingTarget): string[] {
+  return [
+    target.id,
+    target.countryCode,
+    target.kind,
+    target.name,
+    joinExportTerms(target.terms),
+    joinExportTerms(target.excludeTerms),
+    target.description,
+    target.enabled ? "1" : "0",
+    target.caseSensitive ? "1" : "0",
+  ];
+}
+
+function csvFromRows(rows: string[][]): string {
+  const lines = [[...TEMPLATE_HEADERS], ...rows].map((row) => row.map(csvCell).join(","));
   return `\uFEFF${lines.join("\r\n")}\r\n`;
 }
 
-export function buildTargetTemplateXlsx(): Uint8Array {
+export function buildTargetTemplateCsv(): string {
+  return csvFromRows(templateExampleRows());
+}
+
+export function buildTargetExportCsv(targets: ExistingTarget[]): string {
+  return csvFromRows(targets.map(targetCells));
+}
+
+function formatTargetSheet(sheet: XLSX.WorkSheet, rowCount: number): void {
+  const lastRow = Math.max(rowCount, 1);
+  const lastColumn = XLSX.utils.encode_col(TEMPLATE_HEADERS.length - 1);
+  sheet["!autofilter"] = { ref: `A1:${lastColumn}${lastRow}` };
+  sheet["!cols"] = COLUMN_WIDTHS.map((wch) => ({ wch }));
+}
+
+async function workbookBytes(rows: string[][]): Promise<Uint8Array> {
   const book = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet([[...TEMPLATE_HEADERS], ...TEMPLATE_EXAMPLES]), "目标");
+  const sheet = XLSX.utils.aoa_to_sheet([[...TEMPLATE_HEADERS], ...rows]);
+  formatTargetSheet(sheet, rows.length + 1);
+  XLSX.utils.book_append_sheet(book, sheet, "目标");
   XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet(TEMPLATE_HELP), "填写说明");
   const bytes = XLSX.write(book, { type: "array", bookType: "xlsx" });
-  return new Uint8Array(bytes);
+  return freezeFirstSheet(new Uint8Array(bytes));
+}
+
+export function buildTargetTemplateXlsx(): Promise<Uint8Array> {
+  return workbookBytes(templateExampleRows());
+}
+
+export function buildTargetExportXlsx(targets: ExistingTarget[]): Promise<Uint8Array> {
+  return workbookBytes(targets.map(targetCells));
+}
+
+const TARGET_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+
+function sameList(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function nameKey(countryCode: string, kind: string, name: string): string {
+  return `${countryCode}\0${kind}\0${name}`;
 }
 
 function parseCsvRows(text: string): string[][] {
@@ -232,12 +317,14 @@ function cell(row: Record<string, string>, key: string): string {
 }
 
 function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
+  const id = cell(row, "id");
   const countryCode = cell(row, "country_code").toLowerCase();
   const kindRaw = cell(row, "kind");
   const kind = normalizeKind(kindRaw);
   const name = cell(row, "name");
   const termsRaw = cell(row, "terms");
   const errors: string[] = [];
+  if (id && !TARGET_ID_PATTERN.test(id)) errors.push("目标 ID 格式不正确");
   if (!countryCode) errors.push("缺少国家代码");
   if (!name) errors.push("缺少显示名");
   if (!kindRaw) errors.push("缺少类型");
@@ -262,6 +349,7 @@ function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
   }
   return {
     line,
+    id,
     countryCode,
     kind: kind ?? kindRaw,
     name,
@@ -272,14 +360,66 @@ function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
     caseSensitive: flagEnabled(cell(row, "case_sensitive")),
     errors,
     duplicateOf: null,
+    action: "create",
   };
 }
 
-export function previewMatrix(matrix: Matrix, countryCodes?: Iterable<string>): ImportPreview {
+function sameStoredTarget(found: ExistingTarget, raw: ImportPreviewRow): boolean {
+  return found.countryCode.trim().toLowerCase() === raw.countryCode
+    && found.kind === raw.kind
+    && found.name === raw.name
+    && sameList(found.terms, raw.terms)
+    && sameList(found.excludeTerms, raw.excludeTerms)
+    && found.description === raw.description
+    && found.enabled === raw.enabled
+    && found.caseSensitive === raw.caseSensitive;
+}
+
+function classifyRow(
+  raw: ImportPreviewRow,
+  existing: ExistingTarget[] | undefined,
+  byId: Map<string, ExistingTarget>,
+  byName: Map<string, ExistingTarget>,
+): ImportAction {
+  if (raw.errors.length > 0) return "create";
+  if (raw.id) {
+    const found = byId.get(raw.id);
+    if (!found) return "create";
+    return sameStoredTarget(found, raw) ? "unchanged" : "update";
+  }
+  if (raw.duplicateOf !== null) return "update";
+  if (!existing) return "create";
+  const found = byName.get(nameKey(raw.countryCode, raw.kind, raw.name));
+  if (!found) return "create";
+  const terms = uniqueTerms([...found.terms, ...raw.terms]);
+  const excludeTerms = uniqueTerms([...found.excludeTerms, ...raw.excludeTerms]);
+  const description = raw.description || found.description;
+  const caseSensitive = found.caseSensitive || raw.caseSensitive;
+  const same = sameList(terms, found.terms)
+    && sameList(excludeTerms, found.excludeTerms)
+    && description === found.description
+    && raw.enabled === found.enabled
+    && caseSensitive === found.caseSensitive;
+  return same ? "unchanged" : "update";
+}
+
+export function previewMatrix(
+  matrix: Matrix,
+  countryCodes?: Iterable<string>,
+  existing?: ExistingTarget[],
+): ImportPreview {
   const known = new Set([...(countryCodes ?? [])].map((code) => code.trim().toLowerCase()).filter(Boolean));
   const checkCountries = countryCodes !== undefined;
   const headers = matrix.headers.map(canonicalHeader);
   const seen = new Map<string, number>();
+  const seenIds = new Map<string, number>();
+  const byId = new Map<string, ExistingTarget>();
+  const byName = new Map<string, ExistingTarget>();
+  for (const target of existing ?? []) {
+    byId.set(target.id, target);
+    const key = nameKey(target.countryCode.trim().toLowerCase(), target.kind, target.name);
+    if (!byName.has(key)) byName.set(key, target);
+  }
   const rows = matrix.rows.map(({ line, cells }) => {
     const record: Record<string, string> = {};
     headers.forEach((header, index) => {
@@ -289,12 +429,21 @@ export function previewMatrix(matrix: Matrix, countryCodes?: Iterable<string>): 
     if (checkCountries && raw.countryCode && !known.has(raw.countryCode)) {
       raw.errors.push(`未知国家代码 ${raw.countryCode}`);
     }
-    if (raw.countryCode && raw.kind && raw.name && TARGET_KINDS.includes(raw.kind as TargetKind)) {
-      const key = `${raw.countryCode}\0${raw.kind}\0${raw.name}`;
-      const previous = seen.get(key);
-      if (previous !== undefined) raw.duplicateOf = previous;
-      else seen.set(key, line);
+    if (raw.id && !raw.errors.includes("目标 ID 格式不正确")) {
+      const previousId = seenIds.get(raw.id);
+      if (previousId !== undefined) raw.errors.push(`目标 ID 与第 ${previousId} 行重复`);
+      else {
+        seenIds.set(raw.id, line);
+        if (existing && !byId.has(raw.id)) raw.errors.push("未知目标 ID");
+      }
     }
+    if (raw.countryCode && raw.kind && raw.name && TARGET_KINDS.includes(raw.kind as TargetKind)) {
+      const key = nameKey(raw.countryCode, raw.kind, raw.name);
+      const previous = seen.get(key);
+      if (!raw.id && previous !== undefined) raw.duplicateOf = previous;
+      if (previous === undefined) seen.set(key, line);
+    }
+    raw.action = classifyRow(raw, existing, byId, byName);
     return raw;
   });
   return {
@@ -308,6 +457,7 @@ function rowsFromPreview(preview: ImportPreview): ImportRow[] {
   const failed = preview.rows.find((row) => row.errors.length > 0);
   if (failed) throw new Error(`第 ${failed.line} 行${failed.errors[0]}`);
   return mergeImportRows(preview.rows.map((row) => ({
+    id: row.id,
     countryCode: row.countryCode,
     kind: row.kind as TargetKind,
     name: row.name,
@@ -320,12 +470,12 @@ function rowsFromPreview(preview: ImportPreview): ImportRow[] {
   })));
 }
 
-export function previewCsv(text: string, countryCodes?: Iterable<string>): ImportPreview {
-  return previewMatrix(matrixFromCsv(text), countryCodes);
+export function previewCsv(text: string, countryCodes?: Iterable<string>, existing?: ExistingTarget[]): ImportPreview {
+  return previewMatrix(matrixFromCsv(text), countryCodes, existing);
 }
 
-export function previewXlsx(bytes: Uint8Array, countryCodes?: Iterable<string>): ImportPreview {
-  return previewMatrix(matrixFromXlsx(bytes), countryCodes);
+export function previewXlsx(bytes: Uint8Array, countryCodes?: Iterable<string>, existing?: ExistingTarget[]): ImportPreview {
+  return previewMatrix(matrixFromXlsx(bytes), countryCodes, existing);
 }
 
 export function recordsFromRows(rows: Record<string, string>[]): ImportRow[] {
@@ -342,7 +492,7 @@ export function recordsFromRows(rows: Record<string, string>[]): ImportRow[] {
 export function mergeImportRows(rows: ImportRow[]): ImportRow[] {
   const merged = new Map<string, ImportRow>();
   for (const row of rows) {
-    const key = `${row.countryCode}\0${row.kind}\0${row.name}`;
+    const key = row.id ? `id\0${row.id}` : nameKey(row.countryCode, row.kind, row.name);
     const existing = merged.get(key);
     if (!existing) {
       merged.set(key, {
