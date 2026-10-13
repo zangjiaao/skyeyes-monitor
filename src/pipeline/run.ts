@@ -8,6 +8,7 @@ import {
   isRepublish,
   normalizeTitle,
   ruleRejectReason,
+  titlePrefix,
   urlKeyFor,
   type ExistingIdentity,
   type FilterRules,
@@ -24,6 +25,7 @@ import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
 import { recordRateEvent, reserveXSlot, sleep } from "../sources/x-rate";
 import { interpretRecord } from "../ai/interpret";
+import { findSimilarRecords } from "../records/similar";
 import { translationCell } from "../translate";
 import type { CollectMessage } from "./messages";
 import {
@@ -113,31 +115,6 @@ function rulesFromSettings(settings: AppSettings): FilterRules {
     excludeRetweets: settings.excludeRetweets,
     excludeAds: settings.excludeAds,
   };
-}
-
-function likePrefix(value: string): string {
-  return `${value.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
-}
-
-async function findSimilar(db: D1Database, urlKey: string, titleKey: string): Promise<ExistingIdentity[]> {
-  const prefix = titleKey.slice(0, 24);
-  // 已删除的行仍参与链接和标题比对，同一条内容不会因为删过一次就再入库。
-  const rows = await db.prepare(
-    `SELECT url_key, title_key, published_at FROM records
-     WHERE url_key = ?
-        OR title_key = ?
-        OR (? <> '' AND title_key LIKE ? ESCAPE '\\')
-     LIMIT 40`,
-  ).bind(urlKey, titleKey, prefix.length >= 12 ? prefix : "", prefix.length >= 12 ? likePrefix(prefix) : "").all<{
-    url_key: string;
-    title_key: string;
-    published_at: string | null;
-  }>();
-  return rows.results.map((row) => ({
-    urlKey: row.url_key,
-    titleKey: row.title_key,
-    publishedAt: row.published_at,
-  }));
 }
 
 function toQueryTarget(target: TargetRow): QueryTarget {
@@ -570,7 +547,13 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       if (timeOnly.timeStatus === "out_of_window" || ruleReason) continue;
       let republish = false;
       if (timeOnly.timeStatus === "in_window") {
-        const existing = await findSimilar(env.DB, urlKey, titleKey);
+        // 比对失败也不能丢掉这条。已删除的行仍参与链接和标题比对。
+        let existing: ExistingIdentity[] = [];
+        try {
+          existing = await findSimilarRecords(env.DB, urlKey, titleKey);
+        } catch (error) {
+          logError("dedupe lookup failed", error, { runId, batchId, url: record.url });
+        }
         republish = isRepublish({ urlKey, titleKey }, [...existing, ...accepted]);
         if (republish) continue;
       }
@@ -666,9 +649,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
         original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang, news_edition,
         ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, run_id,
-        title_key, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
+        title_key, title_prefix, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -699,6 +682,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       record.aiProvider || null,
       runId,
       record.titleKey,
+      titlePrefix(record.titleKey),
       record.urlKey,
       record.timeStatus,
       record.relevanceScore,

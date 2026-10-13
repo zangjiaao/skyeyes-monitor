@@ -49,6 +49,17 @@ export function normalizeTitle(text: string): string {
     .slice(0, 120);
 }
 
+/** 前 12 个码位。每个码位最多 4 个 UTF-8 字节，所以前缀不超过 48 字节，低于 D1 对 LIKE 模式 50 字节的上限。 */
+export const TITLE_PREFIX_CHARS = 12;
+export const TITLE_PREFIX_MAX_BYTES = 48;
+
+export function titlePrefix(titleKey: string): string {
+  const prefix = Array.from(titleKey).slice(0, TITLE_PREFIX_CHARS).join("");
+  if (Array.from(prefix).length < TITLE_PREFIX_CHARS) return "";
+  if (new TextEncoder().encode(prefix).length > TITLE_PREFIX_MAX_BYTES) return "";
+  return prefix;
+}
+
 export function authorBlockKey(input: { authorHandle?: string; authorUrl?: string; url?: string }): string {
   const handle = input.authorHandle?.trim().replace(/^@/, "").toLowerCase() ?? "";
   if (handle) return handle;
