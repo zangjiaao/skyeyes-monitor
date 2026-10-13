@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Selector } from "@astryxdesign/core/Selector";
-import { Table } from "@astryxdesign/core/Table";
+import { Table, useTableSelection, useTableSelectionState } from "@astryxdesign/core/Table";
 import { api, formatTime } from "../api";
 
 interface RecordRow extends Record<string, unknown> {
@@ -31,6 +32,16 @@ export function DataPage() {
   const [total, setTotal] = useState(0);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [pendingIds, setPendingIds] = useState<string[]>([]);
+  const [deleting, setDeleting] = useState(false);
+  const { selectionConfig } = useTableSelectionState({
+    data: records,
+    idKey: "id",
+    selectedKeys,
+    setSelectedKeys,
+  });
+  const selection = useTableSelection(selectionConfig);
 
   function load(nextView = view) {
     return api<{ records: RecordRow[]; total: number }>(`/api/records?view=${nextView}&limit=50`)
@@ -51,7 +62,7 @@ export function DataPage() {
       <VStack gap={1}>
         <Heading level={1}>数据</Heading>
         <Text type="body" color="secondary">
-          {`今日和昨日按发布时间的计划窗口筛选，只含可进入日报的条目。全部视图含时间不明和低相关度记录，供核对。当前筛选共 ${total} 条。`}
+          {`今日和昨日按发布时间的计划窗口筛选，只含可进入日报的条目。全部视图含时间不明和低相关度记录，供核对。当前筛选共 ${total} 条。表头复选框只选中这一页。删除后记录从列表和 Excel 消失，同一条内容不会再被采集进来。`}
         </Text>
       </VStack>
       {error ? <Banner status="error" title="操作失败" description={error} /> : null}
@@ -60,7 +71,10 @@ export function DataPage() {
         <Selector
           label="视图"
           value={view}
-          onChange={setView}
+          onChange={(value) => {
+            setSelectedKeys(new Set());
+            setView(value);
+          }}
           options={[
             { value: "all", label: "全部" },
             { value: "today", label: "今日" },
@@ -85,6 +99,12 @@ export function DataPage() {
               .then(() => setNotice("已覆盖 skyeyes.xlsx"))
               .catch((reason: Error) => setError(reason.message));
           }}
+        />
+        <Button
+          label={selectedKeys.size > 0 ? `删除所选 ${selectedKeys.size} 条` : "删除所选"}
+          variant="destructive"
+          isDisabled={selectedKeys.size === 0 || deleting}
+          onClick={() => setPendingIds([...selectedKeys])}
         />
         <Button
           label="下载 Excel"
@@ -113,6 +133,7 @@ export function DataPage() {
         idKey="id"
         textOverflow="truncate"
         data={records}
+        plugins={{ selection }}
         columns={[
           { key: "published_at", header: "发布", renderCell: (row) => formatTime(row.published_at) },
           { key: "collected_at", header: "采集", renderCell: (row) => formatTime(row.collected_at) },
@@ -141,6 +162,12 @@ export function DataPage() {
                   }}
                 />
                 <Button
+                  label="删除"
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => setPendingIds([row.id])}
+                />
+                <Button
                   label="屏蔽作者"
                   size="sm"
                   variant="ghost"
@@ -163,6 +190,58 @@ export function DataPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={pendingIds.length > 0}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setPendingIds([]);
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={pendingIds.length > 1 ? `删除 ${pendingIds.length} 条记录` : "删除这条记录"}
+            onOpenChange={(open) => {
+              if (!open && !deleting) setPendingIds([]);
+            }}
+          />
+          <Text type="body">
+            删除后它会从数据页和 Excel 里消失。同一链接、同一外部编号，以及标题几乎相同的内容都不会再入库。这一步不能在页面上撤销。
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="删除"
+              variant="destructive"
+              isLoading={deleting}
+              onClick={() => {
+                const ids = pendingIds;
+                setDeleting(true);
+                setError("");
+                const request = ids.length === 1
+                  ? api<{ deleted: number; excel: boolean; excelError: string | null }>(`/api/records/${ids[0]}`, { method: "DELETE" })
+                  : api<{ deleted: number; excel: boolean; excelError: string | null }>("/api/records/delete", {
+                    method: "POST",
+                    body: JSON.stringify({ ids }),
+                  });
+                request.then(async (result) => {
+                  setPendingIds([]);
+                  setSelectedKeys(new Set());
+                  if (result.excel) setNotice(`已删除 ${result.deleted} 条，并重新生成 Excel`);
+                  else setError(result.excelError || "记录已删除，但 Excel 没有更新。请点重新生成。");
+                  await load();
+                }).catch((reason: Error) => setError(reason.message))
+                  .finally(() => setDeleting(false));
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={deleting}
+              onClick={() => setPendingIds([])}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
     </VStack>
   );
 }

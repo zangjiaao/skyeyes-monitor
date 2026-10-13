@@ -109,6 +109,7 @@ function likePrefix(value: string): string {
 
 async function findSimilar(db: D1Database, urlKey: string, titleKey: string): Promise<ExistingIdentity[]> {
   const prefix = titleKey.slice(0, 24);
+  // 已删除的行仍参与链接和标题比对，同一条内容不会因为删过一次就再入库。
   const rows = await db.prepare(
     `SELECT url_key, title_key, published_at FROM records
      WHERE url_key = ?

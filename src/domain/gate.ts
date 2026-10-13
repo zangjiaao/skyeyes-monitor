@@ -2,7 +2,7 @@ import { normalizeUrl } from "./dedupe";
 import type { CollectedRecord, SourceId, TimeWindow } from "./types";
 
 export const DELIVERABLE_SQL =
-  "time_status = 'in_window' AND is_spam = 0 AND COALESCE(exclude_reason, '') = '' AND published_at IS NOT NULL AND published_at <> ''";
+  "deleted_at IS NULL AND time_status = 'in_window' AND is_spam = 0 AND COALESCE(exclude_reason, '') = '' AND published_at IS NOT NULL AND published_at <> ''";
 
 export type TimeStatus = "in_window" | "unknown" | "out_of_window";
 export type AdmissionAction = "deliver" | "store_only" | "drop";

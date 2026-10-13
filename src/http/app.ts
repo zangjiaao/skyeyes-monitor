@@ -7,6 +7,7 @@ import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, u
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 import { parseCsv, parseXlsx } from "../import/table";
 import { storeExcel } from "../pipeline/run";
+import { hideRecords, parseDeleteIds } from "../records/delete";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -83,6 +84,17 @@ async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
     };
   } catch {
     return empty;
+  }
+}
+
+async function refreshWorkbook(env: Env): Promise<{ excel: boolean; excelError: string | null }> {
+  try {
+    const settings = await loadSettings(env.DB);
+    await storeExcel(env, settings);
+    return { excel: true, excelError: null };
+  } catch (error) {
+    const excelError = error instanceof Error ? error.message : "Excel 生成失败";
+    return { excel: false, excelError };
   }
 }
 
@@ -466,7 +478,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const countryId = c.req.query("countryId");
     const limit = Math.min(100, Math.max(1, Number(c.req.query("limit") || 40)));
     const offset = Math.max(0, Number(c.req.query("offset") || 0));
-    const clauses = ["1 = 1"];
+    const clauses = ["deleted_at IS NULL"];
     const binds: string[] = [];
     if (countryId) {
       clauses.push("country_id = ?");
@@ -492,6 +504,32 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const total = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM records WHERE ${where}`)
       .bind(...binds).first<{ n: number }>();
     return c.json({ records: rows.results, total: total?.n ?? 0 });
+  });
+
+  app.delete("/api/records/:id", async (c) => {
+    try {
+      const id = c.req.param("id").trim();
+      if (!id || id.length > 80) return c.json({ error: "记录不存在" }, 404);
+      const deleted = await hideRecords(c.env.DB, [id]);
+      if (deleted === 0) return c.json({ error: "记录不存在" }, 404);
+      const excel = await refreshWorkbook(c.env);
+      return c.json({ deleted, ...excel });
+    } catch (error) {
+      return jsonError(error, 500);
+    }
+  });
+
+  app.post("/api/records/delete", async (c) => {
+    try {
+      const body = await readJson(c.req.raw);
+      const ids = parseDeleteIds(body.ids);
+      const deleted = await hideRecords(c.env.DB, ids);
+      if (deleted === 0) return c.json({ deleted: 0, excel: false, excelError: null });
+      const excel = await refreshWorkbook(c.env);
+      return c.json({ deleted, ...excel });
+    } catch (error) {
+      return jsonError(error);
+    }
   });
 
   app.post("/api/records/:id/spam", async (c) => {
