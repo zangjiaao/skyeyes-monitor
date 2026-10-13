@@ -39,6 +39,7 @@ interface Tweet {
   id?: string;
   url?: string;
   text?: string;
+  lang?: string;
   createdAt?: string;
   author?: TweetAuthor;
   retweeted_tweet?: unknown;
@@ -96,6 +97,7 @@ export function tweetsToRecords(
       isAd: tweet.promoted === true || tweet.isAd === true || tweet.is_promoted === true,
       text,
       publishedAt: parseXCreatedAt(tweet.createdAt),
+      sourceLang: tweet.lang?.trim() || null,
     });
   }
   return records;

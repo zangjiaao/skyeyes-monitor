@@ -18,6 +18,8 @@ interface RecordRow extends Record<string, unknown> {
   author_handle: string;
   original_text: string;
   translation_zh: string | null;
+  translation_status: string | null;
+  translation_error: string | null;
   url: string;
   published_at: string | null;
   collected_at: string;
@@ -38,6 +40,8 @@ export function DataPage() {
   const [deleting, setDeleting] = useState(false);
   const [scoreMode, setScoreMode] = useState<"" | "selected" | "unscored">("");
   const [scoring, setScoring] = useState(false);
+  const [translateMode, setTranslateMode] = useState<"" | "selected" | "failed">("");
+  const [translating, setTranslating] = useState(false);
   const { selectionConfig } = useTableSelectionState({
     data: records,
     idKey: "id",
@@ -100,6 +104,46 @@ export function DataPage() {
     }
   }
 
+  async function runTranslate() {
+    const mode = translateMode;
+    if (!mode) return;
+    setTranslating(true);
+    setError("");
+    let translated = 0;
+    let failed = 0;
+    try {
+      if (mode === "selected") {
+        const ids = [...selectedKeys];
+        for (let index = 0; index < ids.length; index += 20) {
+          const result = await api<{ translated: number; failed: number }>("/api/records/retranslate", {
+            method: "POST",
+            body: JSON.stringify({ mode: "selected", ids: ids.slice(index, index + 20) }),
+          });
+          translated += result.translated;
+          failed += result.failed;
+        }
+      } else {
+        for (let round = 0; round < 15; round += 1) {
+          const result = await api<{ translated: number; failed: number; remaining: number }>("/api/records/retranslate", {
+            method: "POST",
+            body: JSON.stringify({ mode: "failed" }),
+          });
+          translated += result.translated;
+          failed += result.failed;
+          if (result.translated === 0 || result.remaining === 0) break;
+        }
+      }
+      setTranslateMode("");
+      setSelectedKeys(new Set());
+      setNotice(failed > 0 ? `已翻译 ${translated} 条，${failed} 条失败` : `已翻译 ${translated} 条`);
+      await load();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "翻译失败");
+    } finally {
+      setTranslating(false);
+    }
+  }
+
   return (
     <VStack gap={4}>
       <VStack gap={1}>
@@ -146,19 +190,31 @@ export function DataPage() {
         <Button
           label={selectedKeys.size > 0 ? `为所选评分 ${selectedKeys.size} 条` : "为所选评分"}
           variant="secondary"
-          isDisabled={selectedKeys.size === 0 || scoring || deleting}
+          isDisabled={selectedKeys.size === 0 || scoring || deleting || translating}
           onClick={() => setScoreMode("selected")}
         />
         <Button
           label="为未评分记录打分"
           variant="secondary"
-          isDisabled={scoring || deleting}
+          isDisabled={scoring || deleting || translating}
           onClick={() => setScoreMode("unscored")}
+        />
+        <Button
+          label={selectedKeys.size > 0 ? `为所选翻译 ${selectedKeys.size} 条` : "为所选翻译"}
+          variant="secondary"
+          isDisabled={selectedKeys.size === 0 || scoring || deleting || translating}
+          onClick={() => setTranslateMode("selected")}
+        />
+        <Button
+          label="重译失败或空白"
+          variant="secondary"
+          isDisabled={scoring || deleting || translating}
+          onClick={() => setTranslateMode("failed")}
         />
         <Button
           label={selectedKeys.size > 0 ? `删除所选 ${selectedKeys.size} 条` : "删除所选"}
           variant="destructive"
-          isDisabled={selectedKeys.size === 0 || deleting}
+          isDisabled={selectedKeys.size === 0 || deleting || translating}
           onClick={() => setPendingIds([...selectedKeys])}
         />
         <Button
@@ -204,7 +260,17 @@ export function DataPage() {
           },
           { key: "exclude_reason", header: "排除", renderCell: (row) => row.exclude_reason || (row.is_spam ? "spam" : "—") },
           { key: "original_text", header: "原文" },
-          { key: "translation_zh", header: "中文", renderCell: (row) => row.translation_zh || "—" },
+          {
+            key: "translation_zh",
+            header: "中文",
+            renderCell: (row) => {
+              if (row.translation_zh) return row.translation_zh;
+              if (row.translation_status === "translation_failed") {
+                return row.translation_error ? `翻译失败：${row.translation_error}` : "翻译失败";
+              }
+              return "—";
+            },
+          },
           {
             key: "actions",
             header: "审核",
@@ -249,6 +315,44 @@ export function DataPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={translateMode !== ""}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !translating) setTranslateMode("");
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={translateMode === "selected" ? `为所选 ${selectedKeys.size} 条翻译` : "重译失败或空白"}
+            onOpenChange={(open) => {
+              if (!open && !translating) setTranslateMode("");
+            }}
+          />
+          <Text type="body">
+            {translateMode === "selected"
+              ? "会按正文重新识别语种并翻译成简体中文，覆盖原来的译文或失败原因。每次 20 条。"
+              : "只处理译文为空，或状态是翻译失败的记录。每次 20 条。这一批全部失败时会停下来。"}
+          </Text>
+          <HStack gap={2}>
+            <Button
+              label="开始翻译"
+              variant="primary"
+              isLoading={translating}
+              onClick={() => {
+                void runTranslate();
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={translating}
+              onClick={() => setTranslateMode("")}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
       <Dialog
         isOpen={scoreMode !== ""}
         purpose="form"

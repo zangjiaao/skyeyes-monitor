@@ -24,7 +24,7 @@ const FIELDS = [
   ["email_from_name", "发件人名称"],
   ["app_base_url", "站点地址（邮件里的下载链接）"],
   ["allowed_admin_emails", "管理员邮箱，逗号分隔；留空则接受任何通过 Access 的用户"],
-  ["translation_source_lang", "翻译源语言代码"],
+  ["translation_source_lang", "拉丁文字未标明语种时的源语言代码"],
   ["translation_target_lang", "翻译目标语言代码"],
   ["finalize_deadline_minutes", "收尾截止分钟"],
   ["x_max_pages", "X 每条检索词最多翻页。同一目标的每条词各自占用这些页"],

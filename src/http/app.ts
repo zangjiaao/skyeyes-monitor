@@ -9,6 +9,7 @@ import { parseCsv, parseXlsx } from "../import/table";
 import { storeExcel } from "../pipeline/run";
 import { hideRecords, parseDeleteIds } from "../records/delete";
 import { rescoreRecords } from "../records/rescore";
+import { retranslateRecords } from "../records/retranslate";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -498,7 +499,8 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const where = clauses.join(" AND ");
     const rows = await c.env.DB.prepare(
       `SELECT id, source, url, country_name, matched_target, matched_term, author_handle, author_name, author_url,
-              original_text, published_at, collected_at, translation_zh, relevance_score, relevance_error,
+              original_text, published_at, collected_at, translation_zh, translation_status, translation_error,
+              relevance_score, relevance_error,
               exclude_reason, is_spam, time_status
        FROM records WHERE ${where} ORDER BY COALESCE(published_at, collected_at) DESC LIMIT ? OFFSET ?`,
     ).bind(...binds, limit, offset).all();
@@ -517,6 +519,19 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       return c.json({ deleted, ...excel });
     } catch (error) {
       return jsonError(error, 500);
+    }
+  });
+
+  app.post("/api/records/retranslate", async (c) => {
+    try {
+      const body = await readJson(c.req.raw);
+      const mode = body.mode === "selected" || body.mode === "failed" ? body.mode : "";
+      if (!mode) throw new Error("mode 必须是 selected 或 failed");
+      const ids = mode === "selected" ? parseDeleteIds(body.ids, "翻译") : [];
+      const result = await retranslateRecords(c.env, { mode, ids });
+      return c.json(result);
+    } catch (error) {
+      return jsonError(error);
     }
   });
 

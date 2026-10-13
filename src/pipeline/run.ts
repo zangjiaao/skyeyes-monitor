@@ -24,7 +24,8 @@ import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
 import { recordRateEvent, reserveXSlot, sleep } from "../sources/x-rate";
 import { scoreRelevance } from "../domain/relevance";
-import { translateToChinese } from "../translate";
+import { translationCell, translateToChinese } from "../translate";
+import { detectSourceLang } from "../domain/lang";
 import type { CollectMessage } from "./messages";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -80,6 +81,8 @@ interface RecordRow {
   matched_term: string;
   collected_at: string;
   translation_zh: string | null;
+  translation_status: string | null;
+  translation_error: string | null;
 }
 
 async function runChunk(db: D1Database, statements: D1PreparedStatement[]): Promise<D1Result[]> {
@@ -295,6 +298,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     let relevanceFailures = 0;
     const kept: Array<CollectedRecord & {
       translation: string | null;
+      translationStatus: string | null;
+      translationError: string | null;
+      detectedLang: string | null;
       relevanceScore: number | null;
       relevanceError: string | null;
       timeStatus: string;
@@ -328,18 +334,24 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         if (republish) continue;
       }
       let translation: string | null = null;
+      let translationStatus: string | null = null;
+      let translationError: string | null = null;
+      const detectedLang = detectSourceLang(record.text, record.sourceLang, settings.translationSourceLang);
       let relevanceScore: number | null = null;
       let relevanceError: string | null = null;
       if (timeOnly.timeStatus === "in_window" && settings.translationEnabled && record.text) {
-        try {
-          translation = await translateToChinese(
-            env.AI,
-            record.text,
-            settings.translationSourceLang,
-            settings.translationTargetLang,
-          );
-        } catch (error) {
-          logError("translation failed", error, { dedupeKey: record.dedupeKey });
+        const outcome = await translateToChinese(
+          env.AI,
+          record.text,
+          record.sourceLang ?? null,
+          settings.translationTargetLang,
+          settings.translationSourceLang,
+        );
+        translation = outcome.text;
+        translationStatus = outcome.status;
+        translationError = outcome.error;
+        if (outcome.status === "translation_failed") {
+          logError("translation failed", new Error(outcome.error || "翻译失败"), { dedupeKey: record.dedupeKey });
         }
       }
       if (timeOnly.timeStatus === "in_window" && settings.relevanceEnabled && record.text) {
@@ -367,6 +379,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       kept.push({
         ...record,
         translation,
+        translationStatus,
+        translationError,
+        detectedLang,
         relevanceScore,
         relevanceError,
         timeStatus: admission.timeStatus,
@@ -383,10 +398,10 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       `INSERT INTO records (
         id, dedupe_key, source, external_id, url, country_id, country_name,
         matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
-        original_text, published_at, collected_at, translation_zh, run_id,
+        original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang, run_id,
         title_key, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
         author_followers, author_created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING`,
     ).bind(
       crypto.randomUUID(),
@@ -406,6 +421,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       record.publishedAt,
       collectedAt,
       record.translation,
+      record.translationStatus,
+      record.translationError,
+      record.detectedLang,
       runId,
       record.titleKey,
       record.urlKey,
@@ -498,7 +516,8 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
   while (newestFirst.length < MAX_EXCEL_ROWS) {
     const page = await db.prepare(
        `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
-              source, url, matched_target, matched_term, collected_at, translation_zh
+              source, url, matched_target, matched_term, collected_at, translation_zh,
+              translation_status, translation_error
        FROM records WHERE ${DELIVERABLE_SQL}
        ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
     ).bind(pageSize, offset).all<RecordRow>();
@@ -517,7 +536,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
         matchedTarget: row.matched_target,
         matchedTerm: row.matched_term,
         collectedAt: row.collected_at,
-        translationZh: row.translation_zh ?? "",
+        translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
       });
     }
     offset += page.results.length;

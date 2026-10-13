@@ -38,6 +38,8 @@ export interface CollectedRecord {
   isAd?: boolean;
   text: string;
   publishedAt: string | null;
+  /** X 等来源自带的语言代码。没有时由正文识别。 */
+  sourceLang?: string | null;
 }
 
 export interface RateLimitNotice {
