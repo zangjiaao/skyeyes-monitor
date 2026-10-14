@@ -37,7 +37,7 @@
       "binding": "DB",
       "database_name": "skyeyes-monitor",
       // 创建 D1 后，把 wrangler d1 create 输出的 UUID 填到这里。
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "8dcc0318-9742-414f-9edb-fe4ba4562527",
       "migrations_dir": "migrations"
     }
   ],
