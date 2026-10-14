@@ -1,6 +1,14 @@
 import type { SourceId } from "../domain/types";
 import { canonicalGoogleNewsEditions, GOOGLE_NEWS_EDITION_LIMIT, parseGoogleNewsEditions } from "../sources/google-news";
-import { normalizeXQps, X_QPS_DEFAULT, X_QPS_MAX, X_QPS_MIN } from "../sources/x-rate";
+import {
+  GDELT_MIN_INTERVAL_SEC_DEFAULT,
+  GOOGLE_NEWS_MIN_INTERVAL_SEC_DEFAULT,
+  normalizeMinIntervalSec,
+  normalizeXQps,
+  X_QPS_DEFAULT,
+  X_QPS_MAX,
+  X_QPS_MIN,
+} from "../sources/x-rate";
 
 export const SETTING_DEFAULTS: Record<string, string> = {
   schedule_hour: "10",
@@ -24,6 +32,8 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   finalize_deadline_minutes: "60",
   x_max_pages: "5",
   x_qps: "0.2",
+  gdelt_min_interval_sec: String(GDELT_MIN_INTERVAL_SEC_DEFAULT),
+  google_news_min_interval_sec: String(GOOGLE_NEWS_MIN_INTERVAL_SEC_DEFAULT),
   min_text_length: "20",
   exclude_words: "",
   blocked_accounts: "",
@@ -61,6 +71,8 @@ export interface AppSettings {
   finalizeDeadlineMinutes: number;
   xMaxPages: number;
   xQps: number;
+  gdeltMinIntervalSec: number;
+  googleNewsMinIntervalSec: number;
   minTextLength: number;
   excludeWords: string[];
   blockedAccounts: string[];
@@ -144,6 +156,8 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     finalizeDeadlineMinutes: clampInt(merged.finalize_deadline_minutes, 60, 15, 180),
     xMaxPages: clampInt(merged.x_max_pages, 5, 1, 10),
     xQps: normalizeXQps(merged.x_qps),
+    gdeltMinIntervalSec: normalizeMinIntervalSec(merged.gdelt_min_interval_sec, GDELT_MIN_INTERVAL_SEC_DEFAULT, 1, 300),
+    googleNewsMinIntervalSec: normalizeMinIntervalSec(merged.google_news_min_interval_sec, GOOGLE_NEWS_MIN_INTERVAL_SEC_DEFAULT, 0, 60),
     minTextLength: clampInt(merged.min_text_length, 20, 0, 500),
     excludeWords: parseTermList(merged.exclude_words),
     blockedAccounts: parseTermList(merged.blocked_accounts),
@@ -219,6 +233,14 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
       }
       next.x_qps = String(Math.round(qps * 100) / 100);
     }
+  }
+  if (next.gdelt_min_interval_sec !== undefined) {
+    assertInt(next.gdelt_min_interval_sec, 1, 300, "GDELT 最小间隔必须是 1 到 300 秒");
+    if (next.gdelt_min_interval_sec === "") next.gdelt_min_interval_sec = String(GDELT_MIN_INTERVAL_SEC_DEFAULT);
+  }
+  if (next.google_news_min_interval_sec !== undefined) {
+    assertInt(next.google_news_min_interval_sec, 0, 60, "Google News 最小间隔必须是 0 到 60 秒，0 表示不限速");
+    if (next.google_news_min_interval_sec === "") next.google_news_min_interval_sec = String(GOOGLE_NEWS_MIN_INTERVAL_SEC_DEFAULT);
   }
   if (next.google_news_editions !== undefined) {
     const parsed = parseGoogleNewsEditions(next.google_news_editions);

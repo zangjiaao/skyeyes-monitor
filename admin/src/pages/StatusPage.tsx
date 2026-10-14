@@ -76,8 +76,11 @@ interface StatusPayload {
   sources: Record<string, SourceState>;
   rateLimit: {
     xQps: number;
+    gdeltMinIntervalSec?: number;
     hits24h: number;
     hits7d: number;
+    gdeltHits24h?: number;
+    gdeltHits7d?: number;
     lastHitAt: string | null;
     lastRetryAfterSeconds: number | null;
     recent: Array<Record<string, unknown> & {
@@ -256,9 +259,12 @@ export function StatusPage() {
           { key: "error", header: "错误", renderCell: (row) => row.error || "—" },
         ]}
       />
-      <Heading level={2}>X 限流</Heading>
+      <Heading level={2}>限流</Heading>
       <Text type="body" color="secondary">
-        {`当前每秒 ${data.rateLimit.xQps} 次。近 24 小时 ${data.rateLimit.hits24h} 次，近 7 日 ${data.rateLimit.hits7d} 次。最近一次 ${formatTime(data.rateLimit.lastHitAt, data.timezone)}，Retry-After ${data.rateLimit.lastRetryAfterSeconds ?? "—"} 秒。`}
+        {`X 当前每秒 ${data.rateLimit.xQps} 次。近 24 小时 ${data.rateLimit.hits24h} 次，近 7 日 ${data.rateLimit.hits7d} 次。最近一次 ${formatTime(data.rateLimit.lastHitAt, data.timezone)}，Retry-After ${data.rateLimit.lastRetryAfterSeconds ?? "—"} 秒。`}
+      </Text>
+      <Text type="body" color="secondary">
+        {`GDELT 最小间隔 ${data.rateLimit.gdeltMinIntervalSec ?? 6} 秒。近 24 小时 ${data.rateLimit.gdeltHits24h ?? 0} 次，近 7 日 ${data.rateLimit.gdeltHits7d ?? 0} 次。`}
       </Text>
       <Table
         density="compact"

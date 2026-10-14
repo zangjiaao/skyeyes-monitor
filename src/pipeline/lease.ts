@@ -1,6 +1,8 @@
 export const LEASE_MS = 10 * 60 * 1000;
 export const STALE_ENQUEUE_MS = 15 * 60 * 1000;
 export const MAX_BATCH_ATTEMPTS = 5;
+export const MAX_DEFER_COUNT = 2_000;
+export const MAX_DEFER_WAIT_SEC = 6 * 60 * 60;
 export const PACE_INLINE_MS = 2_000;
 export const PLATFORM_CONCURRENCY = 8;
 export const QUEUE_CONCURRENCY_DEFAULT = 4;

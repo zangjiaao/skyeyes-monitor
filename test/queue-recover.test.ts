@@ -29,6 +29,7 @@ interface BatchRow {
   status: string;
   attempts: number;
   enqueued_at: string | null;
+  next_wake_at?: string | null;
   lease_expires_at: string | null;
   lease_token: string | null;
   created_at: string;
@@ -137,9 +138,13 @@ function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
     if (sql.includes("SET enqueued_at = NULL") && sql.includes("enqueued_at IS NOT NULL")) {
       const force = Number(binds[0]) === 1;
       const staleBefore = String(binds[1]);
+      const respectsWake = sql.includes("next_wake_at");
+      const wakeForce = respectsWake ? Number(binds[2]) === 1 : true;
+      const nowIso = respectsWake ? String(binds[3]) : "";
       let changes = 0;
       for (const batch of recoverableBatches(runId)) {
-        if (batch.status === "queued" && batch.enqueued_at && (force || batch.enqueued_at <= staleBefore)) {
+        const wakeDue = !respectsWake || wakeForce || !batch.next_wake_at || batch.next_wake_at <= nowIso;
+        if (batch.status === "queued" && batch.enqueued_at && (force || batch.enqueued_at <= staleBefore) && wakeDue) {
           batch.enqueued_at = null;
           changes += 1;
         }
@@ -150,10 +155,14 @@ function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
     if (sql.includes("SELECT DISTINCT run_id")) {
       const force = Number(binds[0]) === 1;
       const createdBefore = String(binds[1]);
+      const respectsWake = sql.includes("next_wake_at");
+      const wakeForce = respectsWake ? Number(binds[2]) === 1 : true;
+      const nowIso = respectsWake ? String(binds[3]) : "";
       const ids = [...batches.values()]
         .filter((batch) => batch.status === "queued" && batch.enqueued_at == null)
         .filter((batch) => !runId || batch.run_id === runId)
         .filter((batch) => force || batch.created_at <= createdBefore)
+        .filter((batch) => !respectsWake || wakeForce || !batch.next_wake_at || batch.next_wake_at <= nowIso)
         .map((batch) => batch.run_id);
       const results = [...new Set(ids)].map((id) => ({ run_id: id }));
       return { results, first: results[0] ?? null, changes: 0 };
@@ -500,6 +509,26 @@ describe("队列以 D1 为准", () => {
     const forced = await requeueStuckBatches(harness.env, { now, force: true, runId: "run-1" });
     expect(forced.batches).toBeGreaterThan(0);
     expect(harness.sent.some((message) => (message.body as { batchId: string }).batchId === "fresh")).toBe(true);
+  });
+
+  it("还没到唤醒时间的批次不会被提前重发，手动恢复可以立刻重发", async () => {
+    const now = new Date("2026-10-13T03:00:00.000Z");
+    const stale = new Date(now.getTime() - STALE_ENQUEUE_MS - 60_000).toISOString();
+    const future = new Date(now.getTime() + 60_000).toISOString();
+    const harness = createHarness({
+      runs: [run()],
+      batches: [
+        batch({ id: "waiting", enqueued_at: stale, created_at: stale, next_wake_at: future }),
+      ],
+    });
+    const recovered = await requeueStuckBatches(harness.env, { now, runId: "run-1" });
+    expect(recovered.batches).toBe(0);
+    expect(harness.batches.get("waiting")?.enqueued_at).toBe(stale);
+    expect(harness.sent).toHaveLength(0);
+
+    const forced = await requeueStuckBatches(harness.env, { now, force: true, runId: "run-1" });
+    expect(forced.batches).toBe(1);
+    expect(harness.sent.map((message) => (message.body as { batchId: string }).batchId)).toEqual(["waiting"]);
   });
 
   it("租约还在时重复投递不会再次领取", async () => {

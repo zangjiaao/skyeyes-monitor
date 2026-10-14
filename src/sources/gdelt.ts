@@ -1,9 +1,10 @@
-import { buildGdeltTermQuery, searchPlan } from "../domain/batch";
+import { packGdeltQueries } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { cleanText, verifyHit } from "../domain/terms";
 import { formatGdelt } from "../domain/time";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
+import { gdeltRetryDelaySeconds, parseRetryAfter } from "./x-rate";
 
 interface GdeltArticle {
   url?: string;
@@ -49,51 +50,90 @@ export function gdeltArticlesToRecords(
   });
 }
 
+function attributeTerm(text: string, target: QueryTarget, terms: string[]): string | null {
+  const scoped = { ...target, terms, query: terms[0] ?? target.query };
+  const hits = terms
+    .map((term) => verifyHit({ text, authorHandle: "", target: scoped, queriedTerm: term }))
+    .filter((verdict) => verdict.ok && verdict.term)
+    .sort((left, right) => (right.term?.length ?? 0) - (left.term?.length ?? 0));
+  return hits[0]?.term ?? null;
+}
+
+async function noteRateLimit(
+  request: SearchRequest,
+  status: number,
+  retryAfterSeconds: number | null,
+  delaySeconds: number,
+): Promise<boolean> {
+  if (!request.onRateLimit) return false;
+  try {
+    await request.onRateLimit({ status, retryAfterSeconds, delaySeconds });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const gdeltProvider: SourceProvider = {
   id: "gdelt",
   async search(request: SearchRequest): Promise<SearchResult> {
+    const groups = request.targets.flatMap((target) => packGdeltQueries(target).map((group) => ({ target, group })));
     const records: CollectedRecord[] = [];
     let calls = 0;
     let filtered = 0;
-    for (const step of searchPlan(request.targets)) {
-      const query = buildGdeltTermQuery(step.target, step.term);
-      if (!query) continue;
+    const resume = request.resume?.source === "gdelt" ? request.resume : null;
+    let stepIndex = resume?.step ?? 0;
+    for (; stepIndex < groups.length; stepIndex += 1) {
+      const { target, group } = groups[stepIndex];
       const url = new URL("https://api.gdeltproject.org/api/v2/doc/doc");
-      url.searchParams.set("query", query);
+      url.searchParams.set("query", group.query);
       url.searchParams.set("mode", "artlist");
       url.searchParams.set("format", "json");
       url.searchParams.set("maxrecords", "75");
       url.searchParams.set("startdatetime", formatGdelt(request.window.start));
       url.searchParams.set("enddatetime", formatGdelt(request.window.end));
+      if (request.beforeRequest) await request.beforeRequest();
       const response = await request.fetchImpl(url);
       calls += 1;
       if (response.status === 429 || response.status === 503) {
-        throw new RateLimitError(`GDELT 限流 ${response.status}`);
+        const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
+        const delaySeconds = gdeltRetryDelaySeconds({
+          attempt: Math.max(0, (request.queueAttempt ?? 1) - 1),
+          retryAfterSeconds,
+        });
+        const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
+        throw new RateLimitError(`GDELT 限流 ${response.status}`, {
+          delaySeconds,
+          retryAfterSeconds,
+          recorded,
+        });
       }
       if (!response.ok) throw new Error(`GDELT ${response.status}`);
       const payload = await response.json() as { articles?: GdeltArticle[] };
       const articles = Array.isArray(payload.articles) ? payload.articles : [];
+      const pageRecords: CollectedRecord[] = [];
       for (const article of articles) {
         let converted: CollectedRecord[] = [];
         try {
-          converted = gdeltArticlesToRecords([article], request, { target: step.target, term: step.term });
+          converted = gdeltArticlesToRecords([article], request, { target, term: group.terms[0] ?? "" });
         } catch {
           filtered += 1;
           continue;
         }
         for (const record of converted) {
-          const verdict = verifyHit({
-            text: record.text,
-            authorHandle: record.authorHandle,
-            target: step.target,
-            queriedTerm: step.term,
-          });
-          if (!verdict.ok || !verdict.term) {
+          const term = attributeTerm(record.text, target, group.terms);
+          if (!term) {
             filtered += 1;
             continue;
           }
-          records.push({ ...record, matchedTerm: verdict.term });
+          pageRecords.push({ ...record, matchedTerm: term });
         }
+      }
+      const nextResume = { source: "gdelt" as const, step: stepIndex + 1, page: 0, cursor: "" };
+      if (request.onPage) {
+        await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
+      } else {
+        records.push(...pageRecords);
       }
     }
     return { records: dedupeRecords(records), calls, filtered };

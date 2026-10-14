@@ -13,17 +13,17 @@ import {
   type ExistingIdentity,
   type FilterRules,
 } from "../domain/gate";
-import type { CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
+import type { BatchResume, CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
 import { sendWithCloudflare } from "../email/cloudflare";
 import { sendWithResend } from "../email/resend";
 import { ATTACHMENT_LIMIT_BYTES, type OutboundEmail } from "../email/types";
 import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
-import { errorMessage, log, logError } from "../log";
+import { errorMessage, log, logError, logWarn } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
-import { recordRateEvent, sleep, tryReserveXSlot } from "../sources/x-rate";
+import { GDELT_RATE_SLOT, GOOGLE_NEWS_RATE_SLOT, recordRateEvent, sleep, tryReserveSlot, tryReserveXSlot } from "../sources/x-rate";
 import { interpretRecord } from "../ai/interpret";
 import { findSimilarRecords } from "../records/similar";
 import { translationCell } from "../translate";
@@ -32,6 +32,8 @@ import {
   DeferredBatchError,
   LEASE_MS,
   MAX_BATCH_ATTEMPTS,
+  MAX_DEFER_COUNT,
+  MAX_DEFER_WAIT_SEC,
   PACE_INLINE_MS,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
@@ -84,6 +86,15 @@ interface BatchRow {
   target_ids: string;
   status: string;
   attempts: number;
+  resume_json?: string | null;
+  defer_count?: number | null;
+}
+
+class BatchLostError extends Error {
+  constructor() {
+    super("批次租约已失效");
+    this.name = "BatchLostError";
+  }
 }
 
 interface RecordRow {
@@ -143,8 +154,9 @@ function toQueryTarget(target: TargetRow): QueryTarget {
 
 function isRetryable(error: unknown): boolean {
   if (error instanceof RateLimitError || error instanceof DeferredBatchError) return true;
+  if (error instanceof SyntaxError) return true;
   if (!(error instanceof Error)) return false;
-  return /限流|429|502|503|504|network|ECONN|fetch failed/i.test(error.message);
+  return /限流|429|\b[45]\d\d\b|network|ECONN|fetch failed|未配置 TWITTERAPI_IO_KEY|Unexpected token|JSON/i.test(error.message);
 }
 
 export class ActiveRunError extends Error {
@@ -341,12 +353,14 @@ export async function requeueStuckBatches(env: Env, options: {
     `UPDATE batches SET enqueued_at = NULL
      WHERE status = 'queued' AND enqueued_at IS NOT NULL
        AND (? = 1 OR enqueued_at <= ?)
+       AND (? = 1 OR next_wake_at IS NULL OR next_wake_at <= ?)
        AND ${recoverable} ${scope}`,
-  ).bind(force ? 1 : 0, staleBefore, ...scopeBinds).run();
+  ).bind(force ? 1 : 0, staleBefore, force ? 1 : 0, nowIso, ...scopeBinds).run();
   const runs = await env.DB.prepare(
     `SELECT DISTINCT run_id FROM batches
-     WHERE status = 'queued' AND enqueued_at IS NULL AND (? = 1 OR created_at <= ?) ${scope}`,
-  ).bind(force ? 1 : 0, createdBefore, ...scopeBinds).all<{ run_id: string }>();
+     WHERE status = 'queued' AND enqueued_at IS NULL AND (? = 1 OR created_at <= ?)
+       AND (? = 1 OR next_wake_at IS NULL OR next_wake_at <= ?) ${scope}`,
+  ).bind(force ? 1 : 0, createdBefore, force ? 1 : 0, nowIso, ...scopeBinds).all<{ run_id: string }>();
   let batches = 0;
   let warning: string | null = null;
   for (const row of runs.results) {
@@ -508,7 +522,7 @@ export async function claimBatch(
   const lease = new Date(now.getTime() + LEASE_MS).toISOString();
   const result = await env.DB.prepare(
     `UPDATE batches
-     SET status = 'running', lease_token = ?, lease_expires_at = ?
+     SET status = 'running', lease_token = ?, lease_expires_at = ?, next_wake_at = NULL
      WHERE id = ? AND run_id = ? AND attempts < ?
        AND (status = 'queued' OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))`,
   ).bind(token, lease, batchId, runId, MAX_BATCH_ATTEMPTS, now.toISOString()).run();
@@ -549,9 +563,320 @@ async function renewLease(env: Env, batchId: string, token: string, now = new Da
   return (result.meta.changes ?? 0) > 0;
 }
 
+async function storeCollected(env: Env, input: {
+  run: RunRow;
+  runId: string;
+  batchId: string;
+  leaseToken: string;
+  country: CountryRow;
+  targets: TargetRow[];
+  settings: AppSettings;
+  records: CollectedRecord[];
+}): Promise<{ added: number; filtered: number; deduped: number; relevanceFailures: number } | null> {
+  const unique = dedupeRecords(input.records);
+  const fetched = input.records.length;
+  let deduped = fetched - unique.length;
+  let filtered = 0;
+  const collectedAt = new Date().toISOString();
+  const window = { start: new Date(input.run.window_start), end: new Date(input.run.window_end) };
+  const rules = rulesFromSettings(input.settings);
+  const accepted: ExistingIdentity[] = [];
+  let relevanceFailures = 0;
+  const kept: Array<CollectedRecord & {
+    translation: string | null;
+    translationStatus: string | null;
+    translationError: string | null;
+    detectedLang: string | null;
+    relevanceScore: number | null;
+    relevanceError: string | null;
+    aiSummary: string;
+    aiReason: string;
+    aiEventType: string;
+    aiMentions: string;
+    aiProvider: string;
+    timeStatus: string;
+    excludeReason: string | null;
+    titleKey: string;
+    urlKey: string;
+  }> = [];
+  for (const record of unique) {
+    if (!record.matchedTargetId || !record.matchedTerm?.trim()) {
+      filtered += 1;
+      continue;
+    }
+    try {
+      const titleKey = normalizeTitle(record.text);
+      const urlKey = urlKeyFor(record.url);
+      const ruleReason = ruleRejectReason(record, rules, new Date(collectedAt));
+      const timeOnly = decideAdmission({
+        publishedAt: record.publishedAt,
+        window,
+        ruleReason: null,
+        republish: false,
+        relevanceEnabled: false,
+        relevanceScore: null,
+        relevanceThreshold: input.settings.relevanceThreshold,
+      });
+      if (timeOnly.timeStatus === "out_of_window" || ruleReason) {
+        filtered += 1;
+        continue;
+      }
+      let republish = false;
+      if (timeOnly.timeStatus === "in_window") {
+        let existing: ExistingIdentity[] = [];
+        try {
+          existing = await findSimilarRecords(env.DB, urlKey, titleKey);
+        } catch (error) {
+          logError("dedupe lookup failed", error, { runId: input.runId, batchId: input.batchId, url: record.url });
+        }
+        republish = isRepublish({ urlKey, titleKey }, [...existing, ...accepted]);
+        if (republish) {
+          deduped += 1;
+          continue;
+        }
+      }
+      let translation: string | null = null;
+      let translationStatus: string | null = null;
+      let translationError: string | null = null;
+      let detectedLang: string | null = record.sourceLang ?? null;
+      let relevanceScore: number | null = null;
+      let relevanceError: string | null = null;
+      let relevant: boolean | null = null;
+      let aiSummary = "";
+      let aiReason = "";
+      let aiEventType = "";
+      let aiMentions = "";
+      let aiProvider = "";
+      const shouldInterpret = timeOnly.timeStatus === "in_window"
+        && record.text
+        && (input.settings.aiEnabled || input.settings.translationEnabled || input.settings.relevanceEnabled);
+      if (shouldInterpret) {
+        if (!(await renewLease(env, input.batchId, input.leaseToken))) return null;
+        const target = input.targets.find((item) => item.id === record.matchedTargetId);
+        const terms = splitLines(target?.terms || target?.query || record.matchedTerm || "");
+        const outcome = await interpretRecord({
+          ai: env.AI,
+          apiKey: env.DEEPSEEK_API_KEY || "",
+          settings: input.settings,
+          text: record.text,
+          hintedLang: record.sourceLang,
+          targetName: record.matchedTarget,
+          terms,
+          description: target?.description ?? "",
+          fetchImpl: globalThis.fetch.bind(globalThis),
+        });
+        translation = outcome.translation;
+        translationStatus = outcome.translationStatus;
+        translationError = outcome.translationError;
+        detectedLang = outcome.sourceLang;
+        relevanceScore = outcome.score;
+        relevanceError = outcome.relevanceError;
+        relevant = outcome.relevant;
+        aiSummary = outcome.summary;
+        aiReason = outcome.reason;
+        aiEventType = outcome.eventType;
+        aiMentions = outcome.mentions;
+        aiProvider = outcome.provider;
+        if (outcome.translationStatus === "translation_failed") {
+          logError("translation failed", new Error(outcome.translationError || "翻译失败"), { dedupeKey: record.dedupeKey });
+        }
+        if (outcome.relevanceError) {
+          relevanceFailures += 1;
+          logError("relevance score failed", new Error(outcome.relevanceError), { dedupeKey: record.dedupeKey });
+        }
+      }
+      const admission = decideAdmission({
+        publishedAt: record.publishedAt,
+        window,
+        ruleReason,
+        republish,
+        relevanceEnabled: input.settings.relevanceEnabled,
+        relevanceScore,
+        relevanceThreshold: input.settings.relevanceThreshold,
+        relevant,
+      });
+      if (admission.action === "drop") {
+        filtered += 1;
+        continue;
+      }
+      if (admission.timeStatus === "in_window") {
+        accepted.push({ urlKey, titleKey, publishedAt: record.publishedAt });
+      }
+      kept.push({
+        ...record,
+        translation,
+        translationStatus,
+        translationError,
+        detectedLang,
+        relevanceScore,
+        relevanceError,
+        aiSummary,
+        aiReason,
+        aiEventType,
+        aiMentions,
+        aiProvider,
+        timeStatus: admission.timeStatus,
+        excludeReason: admission.excludeReason,
+        titleKey,
+        urlKey,
+      });
+    } catch (error) {
+      filtered += 1;
+      logError("record skipped", error, { runId: input.runId, batchId: input.batchId, url: record.url });
+    }
+  }
+  const statements: D1PreparedStatement[] = kept.map((record) => env.DB.prepare(
+    `INSERT INTO records (
+      id, dedupe_key, source, external_id, url, country_id, country_name,
+      matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
+      original_text, published_at, collected_at, translation_zh, translation_status, translation_error, source_lang, news_edition,
+      ai_summary, ai_reason, ai_event_type, ai_mentions, ai_provider, run_id,
+      title_key, title_prefix, url_key, time_status, relevance_score, relevance_error, exclude_reason, is_spam,
+      author_followers, author_created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    ON CONFLICT(dedupe_key) DO NOTHING`,
+  ).bind(
+    crypto.randomUUID(),
+    record.dedupeKey,
+    record.source,
+    record.externalId,
+    record.url,
+    input.country.id,
+    input.country.name,
+    record.matchedTargetId,
+    record.matchedTarget,
+    record.matchedTerm ?? "",
+    record.authorHandle,
+    record.authorName,
+    record.authorUrl,
+    record.text,
+    record.publishedAt,
+    collectedAt,
+    record.translation,
+    record.translationStatus,
+    record.translationError,
+    record.detectedLang,
+    record.newsEdition ?? null,
+    record.aiSummary || null,
+    record.aiReason || null,
+    record.aiEventType || null,
+    record.aiMentions || null,
+    record.aiProvider || null,
+    input.runId,
+    record.titleKey,
+    titlePrefix(record.titleKey),
+    record.urlKey,
+    record.timeStatus,
+    record.relevanceScore,
+    record.relevanceError,
+    record.excludeReason,
+    record.authorFollowers ?? null,
+    record.authorCreatedAt ?? null,
+  ));
+  if (!(await ownsBatch(env, input.batchId, input.leaseToken))) return null;
+  const inserted = await runChunk(env.DB, statements);
+  const added = inserted.reduce((sum, item, index) => {
+    if (kept[index]?.excludeReason) return sum;
+    return sum + (item.meta.changes ?? 0);
+  }, 0);
+  return { added, filtered, deduped, relevanceFailures };
+}
+
+function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as BatchResume;
+    if (!value || value.source !== source || !Number.isInteger(value.step) || value.step < 0) return null;
+    return {
+      source,
+      step: value.step,
+      page: Number.isInteger(value.page) && value.page > 0 ? value.page : 0,
+      cursor: typeof value.cursor === "string" ? value.cursor : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function paceSource(env: Env, source: SourceId, settings: AppSettings): Promise<void> {
+  if (source === "x") {
+    const slot = await tryReserveXSlot(env.DB, settings.xQps, PACE_INLINE_MS);
+    if (!slot.ok) throw new DeferredBatchError(Math.ceil(slot.waitMs / 1000));
+    if (slot.waitMs > 0) await sleep(slot.waitMs);
+    return;
+  }
+  const intervalSec = source === "gdelt"
+    ? settings.gdeltMinIntervalSec
+    : source === "google_news"
+      ? settings.googleNewsMinIntervalSec
+      : 0;
+  if (intervalSec <= 0) return;
+  const name = source === "gdelt" ? GDELT_RATE_SLOT : GOOGLE_NEWS_RATE_SLOT;
+  const slot = await tryReserveSlot(env.DB, name, intervalSec * 1000, PACE_INLINE_MS);
+  if (!slot.ok) throw new DeferredBatchError(Math.ceil(slot.waitMs / 1000));
+  if (slot.waitMs > 0) await sleep(slot.waitMs);
+}
+
+export async function scheduleDeferredWake(
+  env: Env,
+  runId: string,
+  batchId: string,
+  token: string | null,
+  delaySeconds: number,
+  rate?: RateLimitError,
+): Promise<void> {
+  const delay = Math.max(1, Math.floor(delaySeconds));
+  if (token) {
+    const released = await releaseClaim(env, batchId, token);
+    if (!released) return;
+    await env.DB.prepare(
+      "UPDATE batches SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END WHERE id = ? AND status = 'queued'",
+    ).bind(batchId).run();
+  }
+  const wakeAt = new Date(Date.now() + delay * 1000).toISOString();
+  const updated = await env.DB.prepare(
+    `UPDATE batches
+     SET defer_count = defer_count + 1,
+         defer_wait_sec = defer_wait_sec + ?,
+         next_wake_at = ?,
+         status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
+         lease_token = NULL,
+         lease_expires_at = NULL
+     WHERE id = ? AND run_id = ? AND status IN ('queued', 'running')
+     RETURNING defer_count, defer_wait_sec`,
+  ).bind(delay, wakeAt, batchId, runId).first<{ defer_count: number; defer_wait_sec: number }>();
+  if (!updated) return;
+  if (rate && !rate.recorded) {
+    try {
+      await recordRateEvent(env.DB, {
+        source: rate.message.startsWith("GDELT") ? "gdelt" : rate.message.startsWith("Google") ? "google_news" : "x",
+        status: 429,
+        retryAfterSeconds: rate.retryAfterSeconds,
+        delaySeconds: delay,
+      });
+    } catch (error) {
+      logError("rate event failed", error, { runId, batchId });
+    }
+  }
+  if (updated.defer_count > MAX_DEFER_COUNT || updated.defer_wait_sec > MAX_DEFER_WAIT_SEC) {
+    await markBatchFailed(env, runId, batchId, `等待过久（${updated.defer_count} 次，累计 ${updated.defer_wait_sec} 秒）`);
+    await maybeEnqueueFinalize(env, runId);
+    return;
+  }
+  logWarn("batch deferred", { runId, batchId, delaySeconds: delay, deferCount: updated.defer_count });
+  try {
+    await env.COLLECT_QUEUE.send({ type: "batch", runId, batchId }, { delaySeconds: delay });
+    await env.DB.prepare(
+      "UPDATE batches SET enqueued_at = ? WHERE id = ? AND status = 'queued'",
+    ).bind(new Date().toISOString(), batchId).run();
+  } catch (error) {
+    logError("deferred wake failed", error, { runId, batchId });
+  }
+}
+
 export async function processBatch(env: Env, runId: string, batchId: string): Promise<void> {
   const batch = await env.DB.prepare(
-    "SELECT id, run_id, country_id, source, target_ids, status, attempts FROM batches WHERE id = ?",
+    "SELECT id, run_id, country_id, source, target_ids, status, attempts, resume_json, defer_count FROM batches WHERE id = ?",
   ).bind(batchId).first<BatchRow>();
   if (!batch || batch.run_id !== runId || batch.status === "done" || batch.status === "failed" || batch.status === "cancelled") return;
   const run = await env.DB.prepare(
@@ -589,6 +914,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const ids = JSON.parse(batch.target_ids) as string[];
     const targets = await loadTargets(env.DB, ids);
     const provider = getProvider(batch.source);
+    let checkpointFound = 0;
+    let seenProviderFiltered = 0;
+    let seenCalls = 0;
     const result = await provider.search({
       targets: targets.map(toQueryTarget),
       window: { start: new Date(run.window_start), end: new Date(run.window_end) },
@@ -599,20 +927,62 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       maxPages: settings.xMaxPages,
       excludeRetweets: settings.excludeRetweets,
       googleNewsEditions: settings.googleNewsEditions,
-      queueAttempt: batch.attempts + 1,
-      beforeRequest: batch.source === "x" ? async () => {
-        const slot = await tryReserveXSlot(env.DB, settings.xQps, PACE_INLINE_MS);
-        if (!slot.ok) throw new DeferredBatchError(Math.ceil(slot.waitMs / 1000));
-        if (slot.waitMs > 0) await sleep(slot.waitMs);
-      } : undefined,
-      onRateLimit: batch.source === "x" ? async (info) => {
-        await recordRateEvent(env.DB, { source: "x", ...info });
-      } : undefined,
+      queueAttempt: (batch.defer_count ?? 0) + 1,
+      resume: parseResume(batch.resume_json, batch.source),
+      beforeRequest: async () => {
+        await paceSource(env, batch.source, settings);
+      },
+      onRateLimit: async (info) => {
+        await recordRateEvent(env.DB, { source: batch.source, ...info });
+      },
+      onPage: async (page) => {
+        const stored = await storeCollected(env, {
+          run, runId, batchId, leaseToken, country, targets, settings, records: page.records,
+        });
+        if (!stored) throw new BatchLostError();
+        const providerFiltered = Math.max(0, page.filtered - seenProviderFiltered);
+        seenProviderFiltered = page.filtered;
+        const callDelta = Math.max(0, page.calls - seenCalls);
+        seenCalls = page.calls;
+        const saved = await env.DB.prepare(
+          `UPDATE batches
+           SET resume_json = ?, calls = calls + ?,
+               items_found = items_found + ?,
+               items_fetched = items_fetched + ?,
+               items_deduped = items_deduped + ?,
+               items_filtered = items_filtered + ?,
+               items_added = items_added + ?
+           WHERE id = ? AND lease_token = ? AND status = 'running'`,
+        ).bind(
+          JSON.stringify(page.resume),
+          callDelta,
+          page.records.length,
+          page.records.length,
+          stored.deduped,
+          stored.filtered + providerFiltered,
+          stored.added,
+          batchId,
+          leaseToken,
+        ).run();
+        if ((saved.meta.changes ?? 0) === 0) throw new BatchLostError();
+        if (callDelta > 0) {
+          await env.DB.prepare(
+            "INSERT INTO api_usage (id, run_id, source, calls, items, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+          ).bind(crypto.randomUUID(), runId, batch.source, callDelta, page.records.length, new Date().toISOString()).run();
+        }
+        if (stored.added > 0 || stored.relevanceFailures > 0) {
+          await env.DB.prepare(
+            `UPDATE runs SET records_added = records_added + ?, relevance_failed = relevance_failed + ?
+             WHERE id = ? AND status NOT IN ('cancelled')`,
+          ).bind(stored.added, stored.relevanceFailures, runId).run();
+        }
+        checkpointFound += page.records.length;
+      },
     });
     const unique = dedupeRecords(result.records);
     const fetched = result.records.length;
     let deduped = fetched - unique.length;
-    let filtered = result.filtered ?? 0;
+    let filtered = 0;
     const collectedAt = new Date().toISOString();
     const window = { start: new Date(run.window_start), end: new Date(run.window_end) };
     const rules = rulesFromSettings(settings);
@@ -819,13 +1189,13 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const finishedAt = new Date().toISOString();
     const done = await env.DB.prepare(
       `UPDATE batches
-       SET status = 'done', items_found = ?, calls = ?, finished_at = ?, error = NULL,
-           items_fetched = ?, items_deduped = ?, items_filtered = ?, items_added = ?,
-           lease_token = NULL, lease_expires_at = NULL
+       SET status = 'done', items_found = items_found + ?, finished_at = ?, error = NULL,
+           items_fetched = items_fetched + ?, items_deduped = items_deduped + ?,
+           items_filtered = items_filtered + ?, items_added = items_added + ?,
+           lease_token = NULL, lease_expires_at = NULL, resume_json = NULL, next_wake_at = NULL
        WHERE id = ? AND lease_token = ? AND status = 'running'`,
     ).bind(
       unique.length,
-      result.calls,
       finishedAt,
       fetched,
       deduped,
@@ -842,7 +1212,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       ).bind(added, relevanceFailures, runId),
       env.DB.prepare(
         "INSERT INTO api_usage (id, run_id, source, calls, items, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).bind(crypto.randomUUID(), runId, batch.source, result.calls, unique.length, finishedAt),
+      ).bind(crypto.randomUUID(), runId, batch.source, Math.max(0, result.calls - seenCalls), unique.length, finishedAt),
     ]);
     log("batch done", {
       runId,
@@ -855,27 +1225,22 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     });
     await maybeEnqueueFinalize(env, runId);
   } catch (error) {
+    if (error instanceof BatchLostError) return;
+    if (error instanceof DeferredBatchError || error instanceof RateLimitError) {
+      await scheduleDeferredWake(
+        env,
+        runId,
+        batchId,
+        token,
+        error.delaySeconds,
+        error instanceof RateLimitError ? error : undefined,
+      );
+      return;
+    }
     if (isRetryable(error)) {
       if (token) {
         const released = await releaseClaim(env, batchId, token);
         if (!released) return;
-        if (error instanceof DeferredBatchError) {
-          await env.DB.prepare(
-            "UPDATE batches SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END WHERE id = ? AND status = 'queued'",
-          ).bind(batchId).run();
-        }
-      }
-      if (error instanceof RateLimitError && !error.recorded) {
-        try {
-          await recordRateEvent(env.DB, {
-            source: batch.source,
-            status: 429,
-            retryAfterSeconds: error.retryAfterSeconds,
-            delaySeconds: error.delaySeconds,
-          });
-        } catch (recordError) {
-          logError("rate event failed", recordError, { runId, batchId });
-        }
       }
       logError("batch retry", error, { runId, batchId });
       throw error;
@@ -1112,6 +1477,18 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
 
 export async function handleDeadLetter(env: Env, message: CollectMessage): Promise<void> {
   if (message.type === "batch") {
+    const batch = await env.DB.prepare(
+      "SELECT status, next_wake_at, lease_expires_at FROM batches WHERE id = ?",
+    ).bind(message.batchId).first<{ status: string; next_wake_at: string | null; lease_expires_at: string | null }>();
+    const now = new Date().toISOString();
+    if (batch?.status === "queued" && batch.next_wake_at) {
+      log("dead letter ignored for deferred batch", { runId: message.runId, batchId: message.batchId });
+      return;
+    }
+    if (batch?.status === "running" && batch.lease_expires_at && batch.lease_expires_at > now) {
+      log("dead letter ignored for leased batch", { runId: message.runId, batchId: message.batchId });
+      return;
+    }
     await markBatchFailed(env, message.runId, message.batchId, "超过队列重试次数");
     await maybeEnqueueFinalize(env, message.runId);
     return;

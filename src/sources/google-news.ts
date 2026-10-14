@@ -4,6 +4,7 @@ import { normalizeTitle } from "../domain/gate";
 import { cleanText, verifyHit } from "../domain/terms";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
+import { parseRetryAfter, retryDelaySeconds } from "./x-rate";
 import { parseRssItems, type RssItem } from "./xml";
 
 export const DEFAULT_GOOGLE_NEWS_EDITIONS = "en-US,zh-CN";
@@ -150,24 +151,38 @@ export const googleNewsProvider: SourceProvider = {
     const records: CollectedRecord[] = [];
     let calls = 0;
     let filtered = 0;
-    for (const step of searchPlan(request.targets)) {
+    const plan = searchPlan(request.targets).flatMap((step) => editions.map((edition) => ({ step, edition })));
+    const resume = request.resume?.source === "google_news" ? request.resume : null;
+    let stepIndex = resume?.step ?? 0;
+    for (; stepIndex < plan.length; stepIndex += 1) {
+      const { step, edition } = plan[stepIndex];
       const query = buildNewsTermQuery(step.target, step.term, request.window);
       if (!query) continue;
-      for (const edition of editions) {
+      {
         const url = new URL("https://news.google.com/rss/search");
         url.searchParams.set("q", query);
         url.searchParams.set("hl", edition.hl);
         url.searchParams.set("gl", edition.gl);
         url.searchParams.set("ceid", edition.ceid);
+        if (request.beforeRequest) await request.beforeRequest();
         const response = await request.fetchImpl(url);
         calls += 1;
         if (response.status === 429 || response.status === 503) {
-          throw new RateLimitError(`Google News RSS 限流 ${response.status}`);
+          const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
+          const delaySeconds = retryDelaySeconds({
+            attempt: Math.max(0, (request.queueAttempt ?? 1) - 1),
+            retryAfterSeconds,
+          });
+          throw new RateLimitError(`Google News RSS 限流 ${response.status}`, {
+            delaySeconds,
+            retryAfterSeconds,
+          });
         }
         if (!response.ok) {
           throw new Error(`Google News RSS ${response.status}`);
         }
         const xml = await response.text();
+        const pageRecords: CollectedRecord[] = [];
         for (const item of parseRssItems(xml)) {
           let converted: CollectedRecord[] = [];
           try {
@@ -187,9 +202,12 @@ export const googleNewsProvider: SourceProvider = {
               filtered += 1;
               continue;
             }
-            records.push({ ...record, matchedTerm: verdict.term });
+            pageRecords.push({ ...record, matchedTerm: verdict.term });
           }
         }
+        const nextResume = { source: "google_news" as const, step: stepIndex + 1, page: 0, cursor: "" };
+        if (request.onPage) await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
+        else records.push(...pageRecords);
       }
     }
     return { records: mergeNewsRecords(records), calls, filtered };

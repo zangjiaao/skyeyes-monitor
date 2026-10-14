@@ -130,13 +130,22 @@ export const xProvider: SourceProvider = {
     let filtered = 0;
     let waits = 0;
     const pause = request.sleepImpl ?? sleep;
-    for (const step of searchPlan(request.targets)) {
+    const plan = searchPlan(request.targets);
+    const resume = request.resume?.source === "x" ? request.resume : null;
+    let stepIndex = resume?.step ?? 0;
+    let pageIndex = resume?.page ?? 0;
+    let cursor = resume?.cursor ?? "";
+    for (; stepIndex < plan.length; stepIndex += 1) {
+      const step = plan[stepIndex];
       const query = buildXTermQuery(step.target, step.term, request.window, {
         excludeRetweets: request.excludeRetweets !== false,
       });
-      if (!query) continue;
-      let cursor = "";
-      for (let page = 0; page < maxPages; page += 1) {
+      if (!query) {
+        pageIndex = 0;
+        cursor = "";
+        continue;
+      }
+      for (; pageIndex < maxPages; pageIndex += 1) {
         const url = new URL(ENDPOINT);
         url.searchParams.set("query", query);
         url.searchParams.set("queryType", "Latest");
@@ -172,6 +181,7 @@ export const xProvider: SourceProvider = {
         }
         const payload = asRecord(await response.json());
         const tweets = Array.isArray(payload?.tweets) ? payload.tweets as Tweet[] : [];
+        const pageRecords: CollectedRecord[] = [];
         for (const record of tweetsToRecords(tweets, request, step.target, step.term)) {
           const verdict = verifyHit({
             text: record.text,
@@ -183,13 +193,24 @@ export const xProvider: SourceProvider = {
             filtered += 1;
             continue;
           }
-          records.push({ ...record, matchedTerm: verdict.term });
+          pageRecords.push({ ...record, matchedTerm: verdict.term });
         }
         const hasNext = payload?.has_next_page === true;
         const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
-        if (!hasNext || !next || next === cursor) break;
+        const finishedTerm = !hasNext || !next || next === cursor;
+        const nextResume = finishedTerm
+          ? { source: "x" as const, step: stepIndex + 1, page: 0, cursor: "" }
+          : { source: "x" as const, step: stepIndex, page: pageIndex + 1, cursor: next };
+        if (request.onPage) {
+          await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
+        } else {
+          records.push(...pageRecords);
+        }
+        if (finishedTerm) break;
         cursor = next;
       }
+      pageIndex = 0;
+      cursor = "";
     }
     return { records: dedupeRecords(records), calls, filtered };
   },

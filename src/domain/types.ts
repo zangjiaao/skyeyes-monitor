@@ -51,6 +51,21 @@ export interface RateLimitNotice {
   delaySeconds: number;
 }
 
+/** 下次醒来从哪一条检索、哪一页继续。队列延迟不占用 attempts。 */
+export interface BatchResume {
+  source: SourceId;
+  step: number;
+  page: number;
+  cursor: string;
+}
+
+export interface PageCheckpoint {
+  records: CollectedRecord[];
+  resume: BatchResume;
+  calls: number;
+  filtered: number;
+}
+
 export interface SearchRequest {
   targets: QueryTarget[];
   window: TimeWindow;
@@ -63,6 +78,8 @@ export interface SearchRequest {
   googleNewsEditions?: string;
   beforeRequest?: () => Promise<void>;
   onRateLimit?: (info: RateLimitNotice) => Promise<void>;
+  onPage?: (page: PageCheckpoint) => Promise<void>;
+  resume?: BatchResume | null;
   sleepImpl?: (ms: number) => Promise<void>;
   queueAttempt?: number;
 }

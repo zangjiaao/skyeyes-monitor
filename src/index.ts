@@ -1,8 +1,8 @@
 import { createApp } from "./http/app";
-import { logError } from "./log";
+import { logError, logWarn } from "./log";
 import { isCollectMessage } from "./pipeline/messages";
 import { DeferredBatchError } from "./pipeline/lease";
-import { continueEnqueue, handleDeadLetter, processBatch, finalizeRun } from "./pipeline/run";
+import { continueEnqueue, handleDeadLetter, processBatch, finalizeRun, scheduleDeferredWake } from "./pipeline/run";
 import { handleScheduled } from "./schedule";
 import { RateLimitError } from "./sources/x";
 
@@ -34,13 +34,30 @@ export default {
         }
         message.ack();
       } catch (error) {
+        const paced = error instanceof RateLimitError || error instanceof DeferredBatchError;
+        if (paced) {
+          logWarn("queue message delayed", {
+            queue: batch.queue,
+            delaySeconds: error.delaySeconds,
+            error: error.message,
+          });
+          const body = message.body;
+          if (!deadLetter && isCollectMessage(body) && body.type === "batch") {
+            await scheduleDeferredWake(
+              env,
+              body.runId,
+              body.batchId,
+              null,
+              error.delaySeconds,
+              error instanceof RateLimitError ? error : undefined,
+            );
+          }
+          message.ack();
+          continue;
+        }
         logError("queue message failed", error, { queue: batch.queue });
         if (deadLetter) message.ack();
-        else message.retry({
-          delaySeconds: error instanceof RateLimitError || error instanceof DeferredBatchError
-            ? error.delaySeconds
-            : 45,
-        });
+        else message.retry();
       }
     }
   },

@@ -74,12 +74,52 @@ export function buildNewsTermQuery(target: QueryTarget, term: string, window: Ti
   return [`"${raw}"`, ...excludeClauses(target), `after:${after}`, `before:${before}`].join(" ");
 }
 
-export function buildGdeltTermQuery(target: QueryTarget, term: string): string {
+function gdeltQuote(term: string): string {
   const raw = term.trim().replace(/^@/, "").replace(/"/g, "");
-  if (!raw) return "";
-  const excludes = (target.excludeTerms ?? [])
+  return raw ? `"${raw}"` : "";
+}
+
+function gdeltExcludes(target: QueryTarget): string[] {
+  return (target.excludeTerms ?? [])
     .map((item) => item.trim().replace(/"/g, ""))
     .filter(Boolean)
     .map((item) => `NOT "${item}"`);
-  return [`"${raw}"`, ...excludes].join(" ");
+}
+
+export function buildGdeltTermQuery(target: QueryTarget, term: string): string {
+  const quoted = gdeltQuote(term);
+  if (!quoted) return "";
+  return [quoted, ...gdeltExcludes(target)].join(" ");
+}
+
+export interface GdeltQueryGroup {
+  query: string;
+  terms: string[];
+}
+
+export function buildGdeltOrQuery(target: QueryTarget, terms: string[]): string {
+  const quoted = terms.map(gdeltQuote).filter(Boolean);
+  if (quoted.length === 0) return "";
+  const body = quoted.length === 1 ? quoted[0] : `(${quoted.join(" OR ")})`;
+  return [body, ...gdeltExcludes(target)].join(" ");
+}
+
+export function packGdeltQueries(target: QueryTarget, maxChars = MAX_QUERY_CHARS): GdeltQueryGroup[] {
+  const terms = termsOf(target).map((term) => term.trim()).filter((term) => gdeltQuote(term));
+  const groups: GdeltQueryGroup[] = [];
+  let current: string[] = [];
+  for (const term of terms) {
+    const next = [...current, term];
+    const query = buildGdeltOrQuery(target, next);
+    if (current.length > 0 && query.length > maxChars) {
+      groups.push({ query: buildGdeltOrQuery(target, current), terms: current });
+      current = [term];
+      continue;
+    }
+    current = next;
+  }
+  if (current.length > 0) {
+    groups.push({ query: buildGdeltOrQuery(target, current), terms: current });
+  }
+  return groups.filter((group) => group.query);
 }

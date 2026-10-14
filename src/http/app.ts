@@ -252,11 +252,14 @@ async function applyTargetImport(
   return { created, updated, unchanged };
 }
 
-async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
+async function loadRateLimit(db: D1Database, now: Date, options: { xQps: number; gdeltMinIntervalSec: number }) {
   const empty = {
-    xQps,
+    xQps: options.xQps,
+    gdeltMinIntervalSec: options.gdeltMinIntervalSec,
     hits24h: 0,
     hits7d: 0,
+    gdeltHits24h: 0,
+    gdeltHits7d: 0,
     lastHitAt: null as string | null,
     lastRetryAfterSeconds: null as number | null,
     recent: [] as Array<{
@@ -272,11 +275,15 @@ async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
     const since24 = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
     const since7 = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const [day, week, recent] = await Promise.all([
-      db.prepare("SELECT COUNT(*) AS n FROM rate_events WHERE source = 'x' AND recorded_at >= ?").bind(since24).first<{ n: number }>(),
-      db.prepare("SELECT COUNT(*) AS n FROM rate_events WHERE source = 'x' AND recorded_at >= ?").bind(since7).first<{ n: number }>(),
+      db.prepare(
+        "SELECT source, COUNT(*) AS n FROM rate_events WHERE recorded_at >= ? GROUP BY source",
+      ).bind(since24).all<{ source: string; n: number }>(),
+      db.prepare(
+        "SELECT source, COUNT(*) AS n FROM rate_events WHERE recorded_at >= ? GROUP BY source",
+      ).bind(since7).all<{ source: string; n: number }>(),
       db.prepare(
         `SELECT id, source, status, retry_after_seconds, delay_seconds, recorded_at
-         FROM rate_events WHERE source = 'x' ORDER BY recorded_at DESC LIMIT 8`,
+         FROM rate_events ORDER BY recorded_at DESC LIMIT 8`,
       ).all<{
         id: string;
         source: string;
@@ -286,13 +293,17 @@ async function loadRateLimit(db: D1Database, now: Date, xQps: number) {
         recorded_at: string;
       }>(),
     ]);
-    const last = recent.results[0];
+    const count = (rows: { source: string; n: number }[], source: string) => Number(rows.find((row) => row.source === source)?.n ?? 0);
+    const lastX = recent.results.find((row) => row.source === "x");
     return {
-      xQps,
-      hits24h: Number(day?.n ?? 0),
-      hits7d: Number(week?.n ?? 0),
-      lastHitAt: last?.recorded_at ?? null,
-      lastRetryAfterSeconds: last?.retry_after_seconds ?? null,
+      xQps: options.xQps,
+      gdeltMinIntervalSec: options.gdeltMinIntervalSec,
+      hits24h: count(day.results, "x"),
+      hits7d: count(week.results, "x"),
+      gdeltHits24h: count(day.results, "gdelt"),
+      gdeltHits7d: count(week.results, "gdelt"),
+      lastHitAt: lastX?.recorded_at ?? null,
+      lastRetryAfterSeconds: lastX?.retry_after_seconds ?? null,
       recent: recent.results.map((row) => ({
         id: row.id,
         source: row.source,
@@ -431,7 +442,10 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
          FROM api_usage WHERE recorded_at >= ? GROUP BY source`,
       ).bind(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString()).all(),
     ]);
-    const rateLimit = await loadRateLimit(c.env.DB, now, settings.xQps);
+    const rateLimit = await loadRateLimit(c.env.DB, now, {
+      xQps: settings.xQps,
+      gdeltMinIntervalSec: settings.gdeltMinIntervalSec,
+    });
     const stuck = await c.env.DB.prepare(
       `SELECT COUNT(*) AS n FROM batches b
        JOIN runs r ON r.id = b.run_id
