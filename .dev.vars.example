@@ -1,0 +1,6 @@
+ENVIRONMENT=development
+TWITTERAPI_IO_KEY=
+DEEPSEEK_API_KEY=
+RESEND_API_KEY=
+TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+POLICY_AUD=

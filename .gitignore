@@ -1,0 +1,13 @@
+node_modules/
+admin/dist/
+worker-configuration.d.ts
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+!.dev.vars.example
+*.log
+.DS_Store
+coverage/
+wrangler.local.jsonc

@@ -1,0 +1,4 @@
+ALTER TABLE batches ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE batches ADD COLUMN defer_wait_sec INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE batches ADD COLUMN next_wake_at TEXT;
+ALTER TABLE batches ADD COLUMN resume_json TEXT;

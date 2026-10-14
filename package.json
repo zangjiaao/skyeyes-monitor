@@ -1,0 +1,50 @@
+{
+  "name": "skyeyes-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Daily X and web monitor on Cloudflare Workers",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build && wrangler dev",
+    "dev:admin": "vite --config admin/vite.config.ts",
+    "build": "vite build --config admin/vite.config.ts",
+    "typecheck": "wrangler types && tsc -p tsconfig.json --noEmit && tsc -p admin/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "cf-typegen": "wrangler types",
+    "astryx": "node node_modules/@astryxdesign/cli/clients/cli/bin/astryx.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zangjiaao/skyeyes-monitor.git"
+  },
+  "license": "MIT",
+  "browserslist": [
+    "last 1 Chrome version"
+  ],
+  "dependencies": {
+    "@astryxdesign/core": "0.6.8",
+    "@astryxdesign/theme-neutral": "0.6.8",
+    "@stylexjs/stylex": "0.19.1",
+    "hono": "4.13.13",
+    "jose": "6.2.12",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-router-dom": "7.18.4",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@astryxdesign/build": "0.6.8",
+    "@astryxdesign/cli": "0.6.8",
+    "@stylexjs/babel-plugin": "0.19.1",
+    "@stylexjs/unplugin": "0.19.1",
+    "@types/node": "22.19.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.2.0",
+    "typescript": "5.9.3",
+    "unplugin": "2.3.11",
+    "vite": "8.3.4",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0"
+  }
+}
