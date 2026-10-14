@@ -139,7 +139,7 @@ export function buildRecordListQuery(input: RecordListInput, schedule: ScheduleB
   const countryId = clean(input.countryId);
   if (countryId) {
     clauses.push("country_id = ?");
-    binds.push(requireToken(countryId, "国家"));
+    binds.push(requireToken(countryId, "分组"));
   }
 
   const targetId = clean(input.targetId);

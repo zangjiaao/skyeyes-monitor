@@ -49,7 +49,7 @@ describe("Excel", () => {
     ]);
     expect(Object.keys(sheets)).toEqual(["示例国家甲", "示例国家乙", "今日", "昨日"]);
     expect(sheets["示例国家甲"][0]).toEqual([
-      "原文", "发布时间（Asia/Shanghai, UTC+8）", "作者账号", "作者显示名", "主页", "来源", "链接", "国家", "命中目标", "采集时间（Asia/Shanghai, UTC+8）", "中文译文", "时段", "命中检索词", "相关度", "中文摘要",
+      "原文", "发布时间（Asia/Shanghai, UTC+8）", "作者账号", "作者显示名", "主页", "来源", "链接", "分组", "命中目标", "采集时间（Asia/Shanghai, UTC+8）", "中文译文", "时段", "命中检索词", "相关度", "中文摘要",
     ]);
     expect(sheets["示例国家甲"].map((row) => row[0])).toEqual(["原文", "十天前", "今天"]);
     expect(sheets["示例国家甲"].map((row) => row[1])).toEqual(["发布时间（Asia/Shanghai, UTC+8）", "2026-10-02 10:00", "2026-10-11 14:00"]);

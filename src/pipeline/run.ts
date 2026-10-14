@@ -910,7 +910,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const country = await env.DB.prepare("SELECT id, name, code, enabled FROM countries WHERE id = ?")
       .bind(batch.country_id)
       .first<CountryRow>();
-    if (!country) throw new Error("国家不存在");
+    if (!country) throw new Error("分组不存在");
     const ids = JSON.parse(batch.target_ids) as string[];
     const targets = await loadTargets(env.DB, ids);
     const provider = getProvider(batch.source);

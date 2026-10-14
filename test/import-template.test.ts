@@ -40,11 +40,11 @@ describe("目标导入模板", () => {
   it("CSV 带 BOM 和中文表头，两行示例能再导回来", () => {
     const csv = buildTargetTemplateCsv();
     expect(csv.charCodeAt(0)).toBe(0xfeff);
-    expect(csv).toContain("国家代码,类型,显示名,检索词");
+    expect(csv).toContain("分组代码,类型,显示名,检索词");
     const rows = parseCsv(csv);
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({
-      countryCode: "pk",
+      countryCode: "demo",
       kind: "organization",
       name: "俾路支解放军",
       terms: ["Baloch Liberation Army", "Balochistan Liberation Army", "BLA"],
@@ -72,7 +72,7 @@ describe("目标导入模板", () => {
     expect(xml).toContain('<col min="9" max="9" width="24');
     expect(xml).toContain('state="frozen"');
     expect(help.some((row) => String(row[2] ?? "").includes("person"))).toBe(true);
-    const fromXlsx = previewXlsx(bytes, ["pk"]);
+    const fromXlsx = previewXlsx(bytes, ["demo"]);
     expect(fromXlsx.errorCount).toBe(0);
     expect(fromXlsx.rows.map((row) => row.name)).toEqual(["俾路支解放军", "俾路支观察"]);
 
@@ -90,7 +90,7 @@ PK,机构,俾路支解放军,Baloch Liberation Army|BLA,,说明,是,否
     });
   });
 
-  it("预览标出未知国家、错误类型、空检索词和重复行", () => {
+  it("预览标出未知分组、错误类型、空检索词和重复行", () => {
     const preview = previewCsv(`国家代码,类型,显示名,检索词
 pk,organization,俾路支解放军,BLA
 xx,nope,坏目标,
@@ -98,7 +98,7 @@ pk,organization,俾路支解放军,Balochistan Liberation Army
 `, ["pk"]);
     expect(preview.rows.map((row) => row.errors)).toEqual([
       [],
-      ["类型无效，只能是 person、organization、keyword、handle", "检索词不能为空", "未知国家代码 xx"],
+      ["类型无效，只能是 person、organization、keyword、handle", "检索词不能为空", "未知分组代码 xx"],
       [],
     ]);
     expect(preview.rows[2]?.duplicateOf).toBe(2);
@@ -112,7 +112,7 @@ describe("目标导出后再导入", () => {
   it("CSV 带 BOM，表头与模板一致，原样再导入是无变化", () => {
     const csv = buildTargetExportCsv(STORED);
     expect(csv.charCodeAt(0)).toBe(0xfeff);
-    expect(csv.startsWith("\uFEFF目标ID,国家代码,类型,显示名,检索词")).toBe(true);
+    expect(csv.startsWith("\uFEFF目标ID,分组代码,类型,显示名,检索词")).toBe(true);
     expect(buildTargetTemplateCsv().split("\r\n")[0]).toBe(csv.split("\r\n")[0]);
     const preview = previewCsv(csv, ["pk"], STORED);
     expect(preview.errorCount).toBe(0);
@@ -145,6 +145,13 @@ missing-id,pk,keyword,新目标,hello
     expect(preview.rows).toHaveLength(1);
     expect(preview.rows[0]?.action).toBe("unchanged");
     expect(preview.rows.some((row) => (row.action as string) === "delete")).toBe(false);
+  });
+
+  it("旧表头国家代码、国家、country 和新表头分组代码都能导入", () => {
+    for (const header of ["国家代码", "国家", "country", "country_code", "分组代码", "分组", "group_code", "group"]) {
+      const rows = parseCsv(`${header},类型,显示名,检索词\nDEMO,organization,示例,hello\n`);
+      expect(rows[0]?.countryCode).toBe("demo");
+    }
   });
 
   it("Excel 导出冻结表头并带填写说明，改检索词后是更新", async () => {

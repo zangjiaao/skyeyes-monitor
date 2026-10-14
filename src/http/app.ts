@@ -15,6 +15,7 @@ import {
   type ExistingTarget,
   type ImportPreviewRow,
 } from "../import/table";
+import { sendTestEmail } from "../email/send-test";
 import { storeExcel } from "../pipeline/run";
 import { hideRecords, hideRecordsMatching, parseDeleteIds } from "../records/delete";
 import { RECORD_LIST_SELECT, buildRecordListQuery, recordListInputFromBody } from "../records/list";
@@ -128,7 +129,7 @@ async function applyTargetImport(
   const now = new Date().toISOString();
   for (const row of rows) {
     const countryId = countryIdByCode.get(row.countryCode);
-    if (!countryId) throw new Error(`未知国家代码 ${row.countryCode}，请先创建国家`);
+    if (!countryId) throw new Error(`未知分组代码 ${row.countryCode}，请先创建分组`);
     if (row.id) {
       const current = byId.get(row.id);
       if (!current) throw new Error("未知目标 ID");
@@ -554,7 +555,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     try {
       const body = await readJson(c.req.raw);
       const current = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(c.req.param("id")).first();
-      if (!current) return c.json({ error: "国家不存在" }, 404);
+      if (!current) return c.json({ error: "分组不存在" }, 404);
       if (typeof body.name === "string" && body.name.trim()) {
         await c.env.DB.prepare("UPDATE countries SET name = ? WHERE id = ?").bind(body.name.trim(), c.req.param("id")).run();
       }
@@ -588,7 +589,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.post("/api/targets", async (c) => {
     try {
       const body = await readJson(c.req.raw);
-      const countryId = requireString(body.countryId, "国家");
+      const countryId = requireString(body.countryId, "分组");
       const name = requireString(body.name, "名称");
       const kind = requireString(body.kind, "类型") as TargetKind;
       if (!TARGET_KINDS.includes(kind)) throw new Error("类型无效");
@@ -596,7 +597,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const excludeTerms = assertTermList(termsFromUnknown(body.excludeTerms ?? body.exclude_terms ?? ""), "排除词", true);
       const caseSensitive = flagEnabled(body.caseSensitive ?? body.case_sensitive) ? 1 : 0;
       const country = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(countryId).first();
-      if (!country) throw new Error("国家不存在");
+      if (!country) throw new Error("分组不存在");
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
         `INSERT INTO targets (
@@ -782,6 +783,21 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.delete("/api/recipients/:id", async (c) => {
     await c.env.DB.prepare("DELETE FROM recipients WHERE id = ?").bind(c.req.param("id")).run();
     return c.json({ ok: true });
+  });
+
+  app.post("/api/email/test", async (c) => {
+    try {
+      let to: string | undefined;
+      if ((c.req.header("content-type") ?? "").includes("application/json")) {
+        const body = await readJson(c.req.raw);
+        if (body.to != null && typeof body.to !== "string") throw new Error("收件人必须是邮箱");
+        to = typeof body.to === "string" ? body.to : undefined;
+      }
+      const result = await sendTestEmail(c.env, { to });
+      return c.json({ ok: true, ...result });
+    } catch (error) {
+      return jsonError(error);
+    }
   });
 
   app.get("/api/settings", async (c) => {

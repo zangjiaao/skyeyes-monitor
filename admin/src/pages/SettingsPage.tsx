@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
 import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { Selector } from "@astryxdesign/core/Selector";
@@ -48,6 +49,10 @@ export function SettingsPage() {
   const [email, setEmail] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [testOpen, setTestOpen] = useState(false);
+  const [testTo, setTestTo] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testError, setTestError] = useState("");
 
   function load() {
     return Promise.all([
@@ -76,6 +81,7 @@ export function SettingsPage() {
         </Text>
       </VStack>
       {error ? <Banner status="error" title="保存失败" description={error} /> : null}
+      {testError ? <Banner status="error" title="测试邮件失败" description={testError} isDismissable onDismiss={() => setTestError("")} /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable onDismiss={() => setNotice("")} /> : null}
       <HStack gap={3}>
         <CheckboxInput label="启用 X" value={flag("x_enabled")} onChange={(checked) => setValues({ ...values, x_enabled: checked ? "1" : "0" })} />
@@ -139,7 +145,8 @@ export function SettingsPage() {
         }}
       />
       <Heading level={2}>收件人</Heading>
-      <Text type="supporting" color="secondary">所有国家合成一封邮件，发给下面启用的地址。</Text>
+      <Text type="supporting" color="secondary">所有分组合成一封邮件，发给下面启用的地址。测试邮件使用已保存的发件人和邮件服务，每日邮件可以保持关闭。</Text>
+      <Button label="发送测试邮件" variant="secondary" onClick={() => { setTestError(""); setTestTo(""); setTestOpen(true); }} />
       <HStack gap={2}>
         <TextInput label="邮箱" type="email" value={email} onChange={setEmail} />
         <Button
@@ -193,6 +200,67 @@ export function SettingsPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={testOpen}
+        purpose="form"
+        width={440}
+        onOpenChange={(open) => {
+          if (!open && !testing) setTestOpen(false);
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title="发送测试邮件"
+            onOpenChange={(open) => {
+              if (!open && !testing) setTestOpen(false);
+            }}
+          />
+          <Text type="body">
+            使用已保存的发件人、邮件服务和站点地址。每日邮件开关不影响这封信。收件人留空则发给全部已启用的地址；也可以只填一个地址。
+          </Text>
+          {testError ? <Banner status="error" title="测试邮件失败" description={testError} /> : null}
+          <TextInput
+            label="单个收件人（可选）"
+            type="email"
+            value={testTo}
+            onChange={setTestTo}
+          />
+          <HStack gap={2}>
+            <Button
+              label="发送"
+              variant="primary"
+              isLoading={testing}
+              onClick={() => {
+                setTesting(true);
+                setTestError("");
+                const body = testTo.trim() ? { to: testTo.trim() } : {};
+                api<{ to: string[]; attached: boolean; excelError: string | null }>("/api/email/test", {
+                  method: "POST",
+                  body: JSON.stringify(body),
+                }).then((result) => {
+                  const who = result.to.join("、");
+                  const attachment = result.attached
+                    ? "已附上累计 Excel。"
+                    : result.excelError
+                      ? `没有附上 Excel：${result.excelError}`
+                      : "Excel 超过 4MB 或尚未生成，正文里会说明。";
+                  setNotice(`测试邮件已发给 ${who}。${attachment}`);
+                  setTestOpen(false);
+                  setTestTo("");
+                }).catch((reason: Error) => {
+                  setTestError(reason.message);
+                }).finally(() => setTesting(false));
+              }}
+            />
+            <Button
+              label="取消"
+              variant="secondary"
+              isDisabled={testing}
+              onClick={() => setTestOpen(false)}
+            />
+          </HStack>
+        </VStack>
+      </Dialog>
     </VStack>
   );
 }

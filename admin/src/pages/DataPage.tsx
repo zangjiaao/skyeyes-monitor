@@ -405,14 +405,14 @@ export function DataPage() {
       </HStack>
       <HStack gap={2}>
         <Selector
-          label="国家"
+          label="分组"
           value={countryId}
           onChange={(value) => {
             resetPage();
             setCountryId(value);
             setTargetId("");
           }}
-          options={[{ value: "", label: "全部国家" }, ...countries.map((item) => ({ value: item.id, label: item.name }))]}
+          options={[{ value: "", label: "全部分组" }, ...countries.map((item) => ({ value: item.id, label: item.name }))]}
         />
         <Selector
           label="目标"
@@ -577,7 +577,7 @@ export function DataPage() {
         columns={[
           { key: "published_at", header: timeHeader("发布时间", timeZone, utcOffset), renderCell: (row) => formatTime(row.published_at, timeZone) },
           { key: "collected_at", header: timeHeader("采集时间", timeZone, utcOffset), renderCell: (row) => formatTime(row.collected_at, timeZone) },
-          { key: "country_name", header: "国家" },
+          { key: "country_name", header: "分组" },
           {
             key: "source",
             header: "来源",

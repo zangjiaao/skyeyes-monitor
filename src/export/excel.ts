@@ -40,7 +40,7 @@ function headersFor(timeZone: string, reference: Date): string[] {
     "主页",
     "来源",
     "链接",
-    "国家",
+    "分组",
     "命中目标",
     timeColumnLabel("采集时间", timeZone, reference),
     "中文译文",

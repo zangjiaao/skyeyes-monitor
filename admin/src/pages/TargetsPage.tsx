@@ -40,9 +40,9 @@ const KINDS = [
 
 const IMPORT_HELP = [
   ["目标ID", "留空则新建；填写导出的 ID 则覆盖该目标；删行不会删除数据库里的目标。"],
-  ["国家代码", "必须是这里已经建好的国家代码，例如 pk。"],
+  ["分组代码", "必须是这里已经建好的分组代码。任意短且唯一，不必是 ISO 国家代码，例如 demo。旧表头「国家代码」和 country 仍可导入。"],
   ["类型", "person 人物、organization 机构、keyword 关键词、handle X 账号。也可以写中文。"],
-  ["显示名", "日报里的名称。没有目标 ID 时，同一国家、类型、显示名的多行会合并。"],
+  ["显示名", "日报里的名称。没有目标 ID 时，同一分组、类型、显示名的多行会合并。"],
   ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。带目标 ID 的行会按文件里的检索词整列覆盖。"],
   ["排除词", "可选。规则与检索词相同，命中就丢掉整条。"],
   ["背景说明", "可选。交给 AI 解读，最多 800 字。"],
@@ -207,17 +207,17 @@ export function TargetsPage() {
       <VStack gap={1}>
         <Heading level={1}>监测目标</Heading>
         <Text type="body" color="secondary">
-          国家和目标只存在数据库里。种子数据是占位示例，上线前请删掉并导入真实名单。
+          分组和目标只存在数据库里。种子数据是占位示例，上线前请删掉并导入真实名单。
         </Text>
       </VStack>
       {error ? <Banner status="error" title="操作失败" description={error} /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable onDismiss={() => setNotice("")} /> : null}
-      <Heading level={2}>国家</Heading>
+      <Heading level={2}>分组</Heading>
       <HStack gap={2}>
         <TextInput label="名称" value={name} onChange={setName} />
-        <TextInput label="代码" value={code} onChange={setCode} description="小写字母、数字、连字符" />
+        <TextInput label="分组代码" value={code} onChange={setCode} description="任意短且唯一的代码，不必是 ISO 国家代码。小写字母、数字和连字符。" />
         <Button
-          label="添加国家"
+          label="添加分组"
           variant="primary"
           onClick={() => {
             setError("");
@@ -237,7 +237,7 @@ export function TargetsPage() {
         data={countries as Array<Country & Record<string, unknown>>}
         columns={[
           { key: "name", header: "名称" },
-          { key: "code", header: "代码" },
+          { key: "code", header: "分组代码" },
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
           {
             key: "actions",
@@ -275,11 +275,11 @@ export function TargetsPage() {
         一个目标只有一个显示名，检索词一行一条。同一目标的每条检索词会单独搜索，命中都记在这个显示名上。2 到 5 个字母的缩写始终区分大小写并按整词匹配，请写成希望命中的样子，例如 BLA。
       </Text>
       <Selector
-        label="国家"
+        label="分组"
         value={countryId}
         onChange={setCountryId}
         options={countries.map((country) => ({ value: country.id, label: `${country.name} (${country.code})` }))}
-        placeholder="选择国家"
+        placeholder="选择分组"
       />
       <HStack gap={2}>
         <Selector label="类型" value={kind} onChange={setKind} options={KINDS} />
@@ -345,7 +345,7 @@ export function TargetsPage() {
         <Button label="导出 CSV" variant="secondary" onClick={() => { void downloadExport("csv"); }} />
         <Button label="导出 Excel" variant="secondary" onClick={() => { void downloadExport("xlsx"); }} />
         <CheckboxInput
-          label="只导出当前国家"
+          label="只导出当前分组"
           value={exportCurrentCountry}
           onChange={setExportCurrentCountry}
         />
@@ -482,7 +482,7 @@ export function TargetsPage() {
               data={preview.rows}
               columns={[
                 { key: "line", header: "行" },
-                { key: "countryCode", header: "国家代码" },
+                { key: "countryCode", header: "分组代码" },
                 { key: "kind", header: "类型" },
                 { key: "name", header: "显示名" },
                 { key: "terms", header: "检索词", renderCell: (row) => row.terms.join(" | ") || "—" },

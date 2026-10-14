@@ -176,13 +176,13 @@ export function StatusPage() {
           { key: "lastError", header: "最近错误", renderCell: (row) => row.lastError || "—" },
         ]}
       />
-      <Heading level={2}>国家计数</Heading>
+      <Heading level={2}>分组计数</Heading>
       <Table
         density="compact"
         idKey="id"
         data={data.countries}
         columns={[
-          { key: "name", header: "国家" },
+          { key: "name", header: "分组" },
           { key: "today", header: "今日" },
           { key: "yesterday", header: "昨日" },
           { key: "total", header: "累计" },
@@ -254,7 +254,7 @@ export function StatusPage() {
         idKey="id"
         data={data.failedBatches}
         columns={[
-          { key: "country_name", header: "国家" },
+          { key: "country_name", header: "分组" },
           { key: "source", header: "来源" },
           { key: "error", header: "错误", renderCell: (row) => row.error || "—" },
         ]}

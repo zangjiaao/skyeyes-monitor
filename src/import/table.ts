@@ -54,7 +54,7 @@ export interface ImportPreview {
 
 export const TEMPLATE_HEADERS = [
   "目标ID",
-  "国家代码",
+  "分组代码",
   "类型",
   "显示名",
   "检索词",
@@ -68,7 +68,7 @@ const COLUMN_WIDTHS = [38, 12, 16, 24, 56, 28, 36, 10, 24];
 
 export const TEMPLATE_EXAMPLES: string[][] = [
   [
-    "pk",
+    "demo",
     "organization",
     "俾路支解放军",
     "Baloch Liberation Army|Balochistan Liberation Army|BLA",
@@ -78,7 +78,7 @@ export const TEMPLATE_EXAMPLES: string[][] = [
     "0",
   ],
   [
-    "pk",
+    "demo",
     "handle",
     "俾路支观察",
     "balochwatch",
@@ -92,9 +92,9 @@ export const TEMPLATE_EXAMPLES: string[][] = [
 const TEMPLATE_HELP: string[][] = [
   ["列", "必填", "允许的值", "说明"],
   ["目标ID", "否", "导出的目标 ID，或留空", "留空则新建。填写后按这个 ID 覆盖原目标，不会另建一条。从文件里删掉一行不会删除数据库里的目标。表头也可以写 id。"],
-  ["国家代码", "是", "已存在的国家代码，例如 pk", "必须先在监测目标页建好国家。大小写不限。表头也可以写 country_code。"],
+  ["分组代码", "是", "已存在的分组代码，任意短且唯一，例如 demo", "不必使用 ISO 国家代码。必须先在监测目标页建好分组。大小写不限。旧表头 国家代码、国家、country_code、country 仍可导入。"],
   ["类型", "是", "person、organization、keyword、handle，或 人物、机构、关键词、X 账号", "决定这条目标怎么匹配。表头也可以写 kind。"],
-  ["显示名", "是", "任意文字", "日报里看到的名称。同一国家、类型、显示名的多行会合并成一个目标。表头也可以写 name。"],
+  ["显示名", "是", "任意文字", "日报里看到的名称。同一分组、类型、显示名的多行会合并成一个目标。表头也可以写 name。"],
   ["检索词", "是", "多条用 | 或单元格内换行分开", "不能为空。账号不要带 @。2 到 5 个字母的缩写请写成要匹配的大小写，例如 BLA。表头也可以写 terms 或 query。"],
   ["排除词", "否", "多条用 | 或换行分开，可留空", "命中就丢掉整条。表头也可以写 exclude 或 exclude_terms。"],
   ["背景说明", "否", "最多 800 字，可留空", "会交给 AI 解读。表头也可以写 description。"],
@@ -110,7 +110,13 @@ const HEADER_ALIASES: Record<string, string> = {
   country_code: "country_code",
   countrycode: "country_code",
   country: "country_code",
+  group_code: "country_code",
+  groupcode: "country_code",
+  group: "country_code",
+  分组代码: "country_code",
+  分组: "country_code",
   国家代码: "country_code",
+  国家: "country_code",
   kind: "kind",
   类型: "kind",
   name: "name",
@@ -325,7 +331,7 @@ function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
   const termsRaw = cell(row, "terms");
   const errors: string[] = [];
   if (id && !TARGET_ID_PATTERN.test(id)) errors.push("目标 ID 格式不正确");
-  if (!countryCode) errors.push("缺少国家代码");
+  if (!countryCode) errors.push("缺少分组代码");
   if (!name) errors.push("缺少显示名");
   if (!kindRaw) errors.push("缺少类型");
   else if (!kind) errors.push(`类型无效，只能是 ${TARGET_KINDS.join("、")}`);
@@ -427,7 +433,7 @@ export function previewMatrix(
     });
     const raw = readRaw(record, line);
     if (checkCountries && raw.countryCode && !known.has(raw.countryCode)) {
-      raw.errors.push(`未知国家代码 ${raw.countryCode}`);
+      raw.errors.push(`未知分组代码 ${raw.countryCode}`);
     }
     if (raw.id && !raw.errors.includes("目标 ID 格式不正确")) {
       const previousId = seenIds.get(raw.id);
