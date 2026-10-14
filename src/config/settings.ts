@@ -2,6 +2,11 @@ import type { SourceId } from "../domain/types";
 import { assertTranslationFallbackModel, DEFAULT_TRANSLATION_FALLBACK_MODEL } from "../translate";
 import { canonicalGoogleNewsEditions, GOOGLE_NEWS_EDITION_LIMIT, parseGoogleNewsEditions } from "../sources/google-news";
 import {
+  SUBREQUEST_BUDGET_DEFAULT,
+  SUBREQUEST_BUDGET_MAX,
+  SUBREQUEST_BUDGET_MIN,
+} from "../pipeline/subrequest-budget";
+import {
   GDELT_MIN_INTERVAL_SEC_DEFAULT,
   GOOGLE_NEWS_MIN_INTERVAL_SEC_DEFAULT,
   normalizeMinIntervalSec,
@@ -49,6 +54,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   ai_model: "deepseek-chat",
   ai_enabled: "1",
   queue_concurrency: "4",
+  subrequest_budget: String(SUBREQUEST_BUDGET_DEFAULT),
 };
 
 export const EDITABLE_SETTINGS = Object.keys(SETTING_DEFAULTS);
@@ -89,6 +95,7 @@ export interface AppSettings {
   aiModel: string;
   aiEnabled: boolean;
   queueConcurrency: number;
+  subrequestBudget: number;
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -175,6 +182,12 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     aiModel: merged.ai_model.trim() || "deepseek-chat",
     aiEnabled: flag(merged.ai_enabled, true),
     queueConcurrency: clampInt(merged.queue_concurrency, 4, 1, 8),
+    subrequestBudget: clampInt(
+      merged.subrequest_budget,
+      SUBREQUEST_BUDGET_DEFAULT,
+      SUBREQUEST_BUDGET_MIN,
+      SUBREQUEST_BUDGET_MAX,
+    ),
   };
 }
 
@@ -221,6 +234,15 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
   assertInt(next.min_account_age_days, 0, 3650, "最少账号天数必须是 0 到 3650，0 表示不限制");
   assertInt(next.relevance_threshold, 0, 100, "相关度阈值必须是 0 到 100，0 表示不因分数排除");
   assertInt(next.queue_concurrency, 1, 8, "同时采集批次数必须是 1 到 8");
+  if (next.subrequest_budget !== undefined) {
+    if (next.subrequest_budget === "") next.subrequest_budget = String(SUBREQUEST_BUDGET_DEFAULT);
+    assertInt(
+      next.subrequest_budget,
+      SUBREQUEST_BUDGET_MIN,
+      SUBREQUEST_BUDGET_MAX,
+      `单次子请求预算必须是 ${SUBREQUEST_BUDGET_MIN} 到 ${SUBREQUEST_BUDGET_MAX}。免费版每次调用最多 50 次外部子请求，默认 ${SUBREQUEST_BUDGET_DEFAULT}`,
+    );
+  }
   if (next.ai_provider && next.ai_provider !== "deepseek" && next.ai_provider !== "workers") {
     throw new Error("解读服务只能是 deepseek 或 workers");
   }

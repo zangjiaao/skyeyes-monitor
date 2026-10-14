@@ -40,6 +40,12 @@ import {
   batchWakeup,
 } from "./lease";
 import {
+  beginSourceFetch,
+  interpretReservation,
+  SubrequestBudget,
+  SubrequestBudgetError,
+} from "./subrequest-budget";
+import {
   enqueueInChunks,
   enqueueRunStatus,
   firstQueuePage,
@@ -572,7 +578,9 @@ async function storeCollected(env: Env, input: {
   targets: TargetRow[];
   settings: AppSettings;
   records: CollectedRecord[];
-}): Promise<{ added: number; filtered: number; deduped: number; relevanceFailures: number } | null> {
+  budget: SubrequestBudget;
+  reservation: number;
+}): Promise<{ added: number; filtered: number; deduped: number; relevanceFailures: number; deferred: boolean } | null> {
   const unique = dedupeRecords(input.records);
   const fetched = input.records.length;
   let deduped = fetched - unique.length;
@@ -582,6 +590,8 @@ async function storeCollected(env: Env, input: {
   const rules = rulesFromSettings(input.settings);
   const accepted: ExistingIdentity[] = [];
   let relevanceFailures = 0;
+  let deferred = false;
+  const charge = () => input.budget.charge();
   const kept: Array<CollectedRecord & {
     translation: string | null;
     translationStatus: string | null;
@@ -650,6 +660,10 @@ async function storeCollected(env: Env, input: {
       const shouldInterpret = timeOnly.timeStatus === "in_window"
         && record.text
         && (input.settings.aiEnabled || input.settings.translationEnabled || input.settings.relevanceEnabled);
+      if (shouldInterpret && input.reservation > 0 && input.budget.remaining < input.reservation) {
+        deferred = true;
+        break;
+      }
       if (shouldInterpret) {
         if (!(await renewLease(env, input.batchId, input.leaseToken))) return null;
         const target = input.targets.find((item) => item.id === record.matchedTargetId);
@@ -664,6 +678,7 @@ async function storeCollected(env: Env, input: {
           terms,
           description: target?.description ?? "",
           fetchImpl: globalThis.fetch.bind(globalThis),
+          charge,
         });
         translation = outcome.translation;
         translationStatus = outcome.translationStatus;
@@ -721,6 +736,10 @@ async function storeCollected(env: Env, input: {
         urlKey,
       });
     } catch (error) {
+      if (error instanceof DeferredBatchError) {
+        deferred = true;
+        break;
+      }
       filtered += 1;
       logError("record skipped", error, { runId: input.runId, batchId: input.batchId, url: record.url });
     }
@@ -779,7 +798,7 @@ async function storeCollected(env: Env, input: {
     if (kept[index]?.excludeReason) return sum;
     return sum + (item.meta.changes ?? 0);
   }, 0);
-  return { added, filtered, deduped, relevanceFailures };
+  return { added, filtered, deduped, relevanceFailures, deferred };
 }
 
 function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
@@ -896,6 +915,8 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
   let token: string | null = null;
   try {
     const settings = await loadSettings(env.DB);
+    const budget = new SubrequestBudget(settings.subrequestBudget);
+    const reservation = interpretReservation(settings, Boolean(env.DEEPSEEK_API_KEY?.trim()));
     const running = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM batches WHERE status = 'running'",
     ).first<{ n: number }>();
@@ -930,6 +951,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       queueAttempt: (batch.defer_count ?? 0) + 1,
       resume: parseResume(batch.resume_json, batch.source),
       beforeRequest: async () => {
+        beginSourceFetch(budget, reservation);
         await paceSource(env, batch.source, settings);
       },
       onRateLimit: async (info) => {
@@ -938,6 +960,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       onPage: async (page) => {
         const stored = await storeCollected(env, {
           run, runId, batchId, leaseToken, country, targets, settings, records: page.records,
+          budget, reservation,
         });
         if (!stored) throw new BatchLostError();
         const providerFiltered = Math.max(0, page.filtered - seenProviderFiltered);
@@ -954,7 +977,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
                items_added = items_added + ?
            WHERE id = ? AND lease_token = ? AND status = 'running'`,
         ).bind(
-          JSON.stringify(page.resume),
+          JSON.stringify(stored.deferred ? (page.repeatResume ?? page.resume) : page.resume),
           callDelta,
           page.records.length,
           page.records.length,
@@ -977,6 +1000,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           ).bind(stored.added, stored.relevanceFailures, runId).run();
         }
         checkpointFound += page.records.length;
+        if (stored.deferred) throw new SubrequestBudgetError();
       },
     });
     const unique = dedupeRecords(result.records);
@@ -988,6 +1012,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const rules = rulesFromSettings(settings);
     const accepted: ExistingIdentity[] = [];
     let relevanceFailures = 0;
+    let budgetDeferred = false;
     const kept: Array<CollectedRecord & {
       translation: string | null;
       translationStatus: string | null;
@@ -1057,6 +1082,10 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       const shouldInterpret = timeOnly.timeStatus === "in_window"
         && record.text
         && (settings.aiEnabled || settings.translationEnabled || settings.relevanceEnabled);
+      if (shouldInterpret && reservation > 0 && budget.remaining < reservation) {
+        budgetDeferred = true;
+        break;
+      }
       if (shouldInterpret) {
         if (!(await renewLease(env, batchId, leaseToken))) return;
         const target = targets.find((item) => item.id === record.matchedTargetId);
@@ -1071,6 +1100,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           terms,
           description: target?.description ?? "",
           fetchImpl: globalThis.fetch.bind(globalThis),
+          charge: () => budget.charge(),
         });
         translation = outcome.translation;
         translationStatus = outcome.translationStatus;
@@ -1128,6 +1158,10 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         urlKey,
       });
       } catch (error) {
+        if (error instanceof DeferredBatchError) {
+          budgetDeferred = true;
+          break;
+        }
         filtered += 1;
         logError("record skipped", error, { runId, batchId, url: record.url });
       }
@@ -1186,6 +1220,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       if (kept[index]?.excludeReason) return sum;
       return sum + (item.meta.changes ?? 0);
     }, 0);
+    if (budgetDeferred) throw new SubrequestBudgetError();
     const finishedAt = new Date().toISOString();
     const done = await env.DB.prepare(
       `UPDATE batches

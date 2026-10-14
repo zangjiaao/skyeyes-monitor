@@ -205,9 +205,13 @@ export const googleNewsProvider: SourceProvider = {
             pageRecords.push({ ...record, matchedTerm: verdict.term });
           }
         }
+        const repeatResume = { source: "google_news" as const, step: stepIndex, page: 0, cursor: "" };
         const nextResume = { source: "google_news" as const, step: stepIndex + 1, page: 0, cursor: "" };
-        if (request.onPage) await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
-        else records.push(...pageRecords);
+        if (request.onPage) {
+          await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
+        } else {
+          records.push(...pageRecords);
+        }
       }
     }
     return { records: mergeNewsRecords(records), calls, filtered };

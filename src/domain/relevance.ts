@@ -1,3 +1,5 @@
+import { DeferredBatchError } from "../pipeline/lease";
+
 const MODEL = "@cf/meta/llama-3.2-3b-instruct";
 
 export interface RelevanceOutcome {
@@ -46,7 +48,12 @@ export function parseRelevanceScore(text: string): number | null {
   return numbers[numbers.length - 1];
 }
 
-export async function scoreRelevance(ai: Ai, text: string, target: string): Promise<RelevanceOutcome> {
+export async function scoreRelevance(
+  ai: Ai,
+  text: string,
+  target: string,
+  charge?: () => void,
+): Promise<RelevanceOutcome> {
   const prompt = [
     "给正文和监测对象的相关度打分。",
     "只输出一个 0 到 100 的整数。",
@@ -56,6 +63,7 @@ export async function scoreRelevance(ai: Ai, text: string, target: string): Prom
   ].join("\n");
   let payload: unknown;
   try {
+    charge?.();
     payload = await ai.run(MODEL, {
       messages: [
         { role: "system", content: "只输出一个 0 到 100 的整数。" },
@@ -65,6 +73,7 @@ export async function scoreRelevance(ai: Ai, text: string, target: string): Prom
       temperature: 0,
     });
   } catch (error) {
+    if (error instanceof DeferredBatchError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     return { score: null, error: message.slice(0, 200) || "Workers AI 调用失败" };
   }

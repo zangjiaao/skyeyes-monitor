@@ -1,5 +1,6 @@
 import { detectSourceLang } from "./domain/lang";
 import { modelText } from "./domain/relevance";
+import { DeferredBatchError } from "./pipeline/lease";
 
 const TRANSLATION_MODEL = "@cf/meta/m2m100-1.2b";
 export const DEFAULT_TRANSLATION_FALLBACK_MODEL = "@cf/zai-org/glm-4.7-flash";
@@ -132,6 +133,7 @@ export async function translateToChinese(
   targetLang = "zh",
   configuredLang = "en",
   fallbackModel = DEFAULT_TRANSLATION_FALLBACK_MODEL,
+  charge?: () => void,
 ): Promise<TranslationOutcome> {
   const trimmed = text.trim();
   const sourceLang = detectSourceLang(trimmed, sourceLangOrHint, configuredLang);
@@ -144,6 +146,7 @@ export async function translateToChinese(
   let machine = "";
   let machineError = "";
   try {
+    charge?.();
     const payload = await ai.run(TRANSLATION_MODEL, {
       text: slice,
       source_lang: sourceLang,
@@ -151,6 +154,7 @@ export async function translateToChinese(
     });
     machine = cleanTranslation(m2mText(payload));
   } catch (error) {
+    if (error instanceof DeferredBatchError) throw error;
     machineError = explainWorkersAiError(error, TRANSLATION_MODEL) ?? (error instanceof Error ? error.message : String(error));
   }
   if (machine && acceptableChinese(slice, machine)) {
@@ -160,6 +164,7 @@ export async function translateToChinese(
   let chat = "";
   let chatError = "";
   try {
+    charge?.();
     assertTranslationFallbackModel(chatModel);
     const payload = await ai.run(chatModel, {
       messages: [
@@ -174,6 +179,7 @@ export async function translateToChinese(
     if (embedded) throw new Error(embedded);
     chat = cleanTranslation(modelText(payload));
   } catch (error) {
+    if (error instanceof DeferredBatchError) throw error;
     chatError = explainWorkersAiError(error, chatModel) ?? (error instanceof Error ? error.message : String(error));
   }
   if (chat && acceptableChinese(slice, chat)) {
