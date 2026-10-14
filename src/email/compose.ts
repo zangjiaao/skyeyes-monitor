@@ -16,7 +16,6 @@ export interface DigestInput {
   downloadUrl: string | null;
   attached: boolean;
   notes: string;
-  highlights?: Array<{ target: string; summary: string; translation: string; score: string }>;
 }
 
 function escapeHtml(value: string): string {
@@ -31,6 +30,22 @@ const SOURCE_LABEL: Record<string, string> = {
   google_news: "Google News",
   gdelt: "GDELT",
 };
+
+const SOURCE_SUMMARY_LIMIT = 80;
+
+function sourceSuffix(bySource: Record<string, number>): string {
+  const parts = Object.entries(bySource)
+    .map(([source, count]) => `${SOURCE_LABEL[source] ?? source} ${count}`)
+    .join("，");
+  if (!parts || parts.length > SOURCE_SUMMARY_LIMIT) return "";
+  return `（${parts}）`;
+}
+
+function excelLine(input: DigestInput): string {
+  if (input.attached) return "完整内容在附件 Excel 里。";
+  if (input.downloadUrl) return `完整内容请下载: ${input.downloadUrl}`;
+  return "完整内容未放入附件。未配置站点地址，正文里没有下载链接。文件仍在 R2。";
+}
 
 function formatWindowInstant(iso: string, timeZone: string): string {
   const date = new Date(iso);
@@ -54,28 +69,12 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
     `窗口: ${formatWindowInstant(input.windowStart, input.timeZone)} 至 ${formatWindowInstant(input.windowEnd, input.timeZone)}（${zoneLabel}）`,
     `窗口内实际发布且通过过滤: ${total}`,
     "",
-    ...input.countries.map((country) => {
-      const parts = Object.entries(country.bySource)
-        .map(([source, count]) => `${SOURCE_LABEL[source] ?? source} ${count}`)
-        .join("，");
-      return `- ${country.name}: 新增 ${country.added}${parts ? `（${parts}）` : ""}`;
-    }),
+    ...input.countries.map((country) => `- ${country.name}: 新增 ${country.added}${sourceSuffix(country.bySource)}`),
     "",
     `失败批次: ${input.failedBatches}`,
-    input.incomplete ? "本轮在截止时间前仍有批次未完成，邮件里是目前已经入库的内容。" : "本轮批次已全部结束。",
-    input.attached
-      ? "附件 skyeyes.xlsx 会覆盖更新。分组表是已通过时间校验的历史；「今日」「昨日」只按发布时间落入计划窗口的条目，不含缺时间、窗口外、旧文重发、规则过滤或低相关度的内容。"
-      : "Excel 较大，未放入附件。",
+    input.incomplete ? "本轮在截止时间前仍有批次未完成。" : "本轮批次已全部结束。",
+    excelLine(input),
   ];
-  const highlights = (input.highlights ?? []).slice(0, 12);
-  if (highlights.length > 0) {
-    lines.push("", "本轮条目（摘要 / 译文 / 相关度）:");
-    for (const item of highlights) {
-      const summary = item.summary || item.translation || "无摘要";
-      lines.push(`- ${item.target}: ${summary}（译文：${item.translation || "无"}；相关度 ${item.score || "—"}）`);
-    }
-  }
-  if (input.downloadUrl) lines.push(`下载: ${input.downloadUrl}`);
   if (input.notes) lines.push("", input.notes);
   const text = lines.join("\n");
   const html = `<div style="font-family:sans-serif;line-height:1.5">${lines

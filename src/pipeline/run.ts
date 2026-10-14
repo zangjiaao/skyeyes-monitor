@@ -1409,17 +1409,6 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     }
     const downloadUrl = settings.appBaseUrl ? `${settings.appBaseUrl}/api/export/excel` : null;
     const attached = stored.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES;
-    const highlightRows = await env.DB.prepare(
-      `SELECT matched_target, ai_summary, translation_zh, relevance_score
-       FROM records
-       WHERE run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?
-       ORDER BY published_at DESC LIMIT 12`,
-    ).bind(runId, run.window_start, run.window_end).all<{
-      matched_target: string;
-      ai_summary: string | null;
-      translation_zh: string | null;
-      relevance_score: number | null;
-    }>();
     const digest = buildDigest({
       incomplete,
       windowStart: run.window_start,
@@ -1430,12 +1419,6 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       downloadUrl,
       attached,
       notes,
-      highlights: highlightRows.results.map((row) => ({
-        target: row.matched_target,
-        summary: row.ai_summary ?? "",
-        translation: row.translation_zh ?? "",
-        score: row.relevance_score == null ? "" : String(row.relevance_score),
-      })),
     });
     const sent = await sendDigest(env, settings, {
       from: settings.emailFrom,

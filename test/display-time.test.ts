@@ -135,4 +135,68 @@ describe("按时区显示", () => {
     expect(newYork.text).not.toContain("2026-10-13 10:00");
     expect(newYork.text).not.toContain("2026-10-13T02:00:00.000Z");
   });
+
+  it("日报正文只有窗口、分组计数和附件说明", () => {
+    const digest = buildDigest({
+      incomplete: true,
+      windowStart: "2026-10-12T16:00:00.000Z",
+      windowEnd: "2026-10-13T02:00:00.000Z",
+      timeZone: SHANGHAI,
+      countries: [{ name: "示例分组", added: 3, bySource: { x: 2, google_news: 1 } }],
+      failedBatches: 1,
+      downloadUrl: "https://sky.example.com/api/export/excel",
+      attached: true,
+      notes: "有批次未完成，已发送目前收集到的内容。",
+    });
+    expect(digest.text).toContain("窗口: 2026-10-13 00:00 至 2026-10-13 10:00（Asia/Shanghai, UTC+8）");
+    expect(digest.text).toContain("- 示例分组: 新增 3（X 2，Google News 1）");
+    expect(digest.text).toContain("失败批次: 1");
+    expect(digest.text).toContain("本轮在截止时间前仍有批次未完成。");
+    expect(digest.text).toContain("有批次未完成，已发送目前收集到的内容。");
+    expect(digest.text).toContain("完整内容在附件 Excel 里。");
+    expect(digest.text).not.toContain("本轮条目");
+    expect(digest.text).not.toContain("摘要");
+    expect(digest.text).not.toContain("译文");
+    expect(digest.text).not.toContain("https://sky.example.com");
+    expect(digest.html).not.toContain("本轮条目");
+
+    const linked = buildDigest({
+      incomplete: false,
+      windowStart: "2026-10-12T16:00:00.000Z",
+      windowEnd: "2026-10-13T02:00:00.000Z",
+      timeZone: SHANGHAI,
+      countries: [{ name: "示例分组", added: 1, bySource: { x: 1 } }],
+      failedBatches: 0,
+      downloadUrl: "https://sky.example.com/api/export/excel",
+      attached: false,
+      notes: "",
+    });
+    expect(linked.text).toContain("本轮批次已全部结束。");
+    expect(linked.text).toContain("完整内容请下载: https://sky.example.com/api/export/excel");
+    expect(linked.text).not.toContain("完整内容在附件 Excel 里。");
+
+    const longSources = buildDigest({
+      incomplete: false,
+      windowStart: "2026-10-12T16:00:00.000Z",
+      windowEnd: "2026-10-13T02:00:00.000Z",
+      timeZone: SHANGHAI,
+      countries: [{
+        name: "示例分组",
+        added: 8,
+        bySource: {
+          very_long_source_name_one: 1,
+          very_long_source_name_two: 1,
+          very_long_source_name_three: 1,
+          very_long_source_name_four: 1,
+        },
+      }],
+      failedBatches: 0,
+      downloadUrl: null,
+      attached: false,
+      notes: "",
+    });
+    expect(longSources.text).toContain("- 示例分组: 新增 8");
+    expect(longSources.text).not.toContain("very_long_source_name");
+    expect(longSources.text).toContain("未配置站点地址");
+  });
 });

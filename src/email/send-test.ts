@@ -67,10 +67,11 @@ export async function sendTestEmail(env: Env, input: { to?: string | null } = {}
     "每日邮件可以保持关闭，这封信仍然会发出。",
   ];
   if (attached) {
-    lines.push("附件是当前的累计 Excel。");
+    lines.push("完整内容在附件 Excel 里。");
   } else if (tooLarge) {
-    lines.push("累计 Excel 超过 4MB，未放入附件。");
-    lines.push(downloadUrl ? `下载: ${downloadUrl}` : "未配置站点地址，正文里没有下载链接。文件仍在 R2。");
+    lines.push(downloadUrl
+      ? `完整内容请下载: ${downloadUrl}`
+      : "完整内容未放入附件。未配置站点地址，正文里没有下载链接。文件仍在 R2。");
   } else {
     lines.push(excelError ? `没有附上 Excel：${excelError}` : "还没有可附上的 Excel。");
   }

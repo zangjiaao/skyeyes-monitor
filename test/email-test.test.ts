@@ -183,6 +183,8 @@ describe("测试邮件", () => {
       subject: "SkyEyes 测试邮件",
     });
     expect(harness.sent[0]?.text).toContain("每日邮件可以保持关闭");
+    expect(harness.sent[0]?.text).toContain("完整内容在附件 Excel 里。");
+    expect(harness.sent[0]?.text).not.toContain("本轮条目");
     expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes.xlsx");
     expect(harness.sent[0]?.attachments?.[0]?.content).toBeTruthy();
   });
@@ -202,6 +204,9 @@ describe("测试邮件", () => {
     expect(result.payload).toMatchObject({ ok: true, attached: true, generated: true, excelError: null });
     expect(harness.files.get("skyeyes.xlsx")?.byteLength).toBeGreaterThan(0);
     expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes.xlsx");
+    expect(harness.sent[0]?.text).not.toContain("一条记录");
+    expect(harness.sent[0]?.text).not.toContain("译文");
+    expect(harness.sent[0]?.text).not.toContain("摘要");
   });
 
   it("生成失败时仍发出不带附件的测试信，并带回原因", async () => {
@@ -219,7 +224,8 @@ describe("测试邮件", () => {
     expect(result.status).toBe(200);
     expect(result.payload).toMatchObject({ ok: true, attached: false, generated: false, excelError: null });
     expect(harness.sent[0]?.attachments).toBeUndefined();
-    expect(harness.sent[0]?.text).toContain("https://sky.example.com/api/export/excel");
+    expect(harness.sent[0]?.text).toContain("完整内容请下载: https://sky.example.com/api/export/excel");
+    expect(harness.sent[0]?.text).not.toContain("本轮条目");
   });
 
   it("没有站点地址时说明文件仍在 R2", async () => {
