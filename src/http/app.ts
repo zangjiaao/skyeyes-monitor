@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { assertAllowedEmail, authenticate } from "../auth/access";
 import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
+import { probeTranslationFallbackModel } from "../translate";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule, utcOffsetLabel } from "../domain/time";
 import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
@@ -815,6 +816,12 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const body = await readJson(c.req.raw);
       const patch = validateSettingsPatch(body);
       const previous = await loadSettings(c.env.DB);
+      if (
+        patch.translation_fallback_model
+        && patch.translation_fallback_model !== previous.translationFallbackModel
+      ) {
+        await probeTranslationFallbackModel(c.env.AI, patch.translation_fallback_model);
+      }
       const settings = await saveSettings(c.env.DB, patch);
       const refreshed = settings.timeZone !== previous.timeZone
         ? await refreshWorkbook(c.env)

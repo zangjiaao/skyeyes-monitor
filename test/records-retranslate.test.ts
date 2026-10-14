@@ -29,7 +29,7 @@ function row(id: string, extra: Partial<StoredRecord> = {}): StoredRecord {
   };
 }
 
-function createHarness(initial: StoredRecord[], reply: () => unknown) {
+function createHarness(initial: StoredRecord[], reply: (model: string) => unknown) {
   const rows = initial.map((item) => ({ ...item }));
   const calls: string[] = [];
   const db = {
@@ -92,10 +92,10 @@ function createHarness(initial: StoredRecord[], reply: () => unknown) {
     ENVIRONMENT: "development",
     DB: db,
     AI: {
-      async run(_model: string, input: { text?: string; messages?: Array<{ content?: string }> }) {
+      async run(model: string, input: { text?: string; messages?: Array<{ content?: string }> }) {
         const text = input.text ?? input.messages?.map((message) => message.content ?? "").join("\n") ?? "";
         calls.push(text);
-        const next = reply();
+        const next = reply(model);
         if (next instanceof Error) throw next;
         return next;
       },
@@ -174,6 +174,47 @@ describe("补译已有记录", () => {
     expect(result.payload).toMatchObject({ translated: 1, failed: 0, attempted: 1, remaining: 0 });
     expect(harness.rows.find((item) => item.id === "pick")?.translation_zh).toBe(CHINESE);
     expect(harness.rows.find((item) => item.id === "other")?.translation_zh).toBeNull();
+  });
+
+  it("DeepSeek 译成中文后直接保存，不再调用 Workers AI", async () => {
+    const harness = createHarness([row("arabic")], () => {
+      throw new Error("不应调用 Workers AI");
+    });
+    (harness.env as { DEEPSEEK_API_KEY?: string }).DEEPSEEK_API_KEY = "test-key";
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({
+        relevant: true,
+        score: 80,
+        reason: "讨论袭击",
+        source_lang: "ar",
+        translation_zh: CHINESE,
+        summary_zh: "宣布袭击",
+        event_type: "attack",
+        people: [],
+        places: [],
+      }) } }],
+    }), { status: 200 });
+    try {
+      const result = await post(harness, { mode: "failed" });
+      expect(result.status).toBe(200);
+      expect(result.payload).toMatchObject({ translated: 1, failed: 0 });
+      expect(harness.calls).toHaveLength(0);
+      expect(harness.rows[0]).toMatchObject({ translation_zh: CHINESE, translation_status: "ok", source_lang: "ar" });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("备用模型返回 5018 时把停用原因写入失败记录", async () => {
+    const harness = createHarness([row("arabic")], (model) => {
+      if (model.includes("m2m100")) return { translated_text: "" };
+      throw new Error("5018: model deprecated");
+    });
+    const result = await post(harness, { mode: "failed" });
+    expect(result.payload).toMatchObject({ translated: 0, failed: 1 });
+    expect(harness.rows[0]?.translation_error).toMatch(/模型不可用/);
+    expect(harness.rows[0]?.translation_error).toMatch(/5018/);
   });
 
   it("缺少 mode 时返回 400", async () => {

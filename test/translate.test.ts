@@ -2,7 +2,14 @@ import { describe, expect, it } from "vitest";
 import { detectSourceLang } from "../src/domain/lang";
 import type { QueryTarget, SearchRequest } from "../src/domain/types";
 import { tweetsToRecords } from "../src/sources/x";
-import { acceptableChinese, translateToChinese, translationCell } from "../src/translate";
+import {
+  acceptableChinese,
+  assertTranslationFallbackModel,
+  DEFAULT_TRANSLATION_FALLBACK_MODEL,
+  probeTranslationFallbackModel,
+  translateToChinese,
+  translationCell,
+} from "../src/translate";
 
 const ARABIC = "أعلنت الجماعة عن هجوم جديد في المنطقة الشمالية";
 const URDU = "بلوچستان میں نیا حملہ ہوا ہے";
@@ -59,7 +66,7 @@ describe("翻译到简体中文", () => {
     expect(models).toEqual(["@cf/meta/m2m100-1.2b"]);
   });
 
-  it("m2m 返回空或原文时，用 Gemma 只译成简体中文", async () => {
+  it("m2m 返回空或原文时，用配置的对话模型只译成简体中文", async () => {
     for (const machine of ["", ARABIC]) {
       const models: string[] = [];
       const ai = fakeAi((model) => {
@@ -71,8 +78,35 @@ describe("翻译到简体中文", () => {
       expect(outcome.status).toBe("ok");
       expect(outcome.text).toBe(CHINESE);
       expect(outcome.sourceLang).toBe("ar");
-      expect(models[1]).toBe("@cf/google/gemma-3-12b-it");
+      expect(models[1]).toBe(DEFAULT_TRANSLATION_FALLBACK_MODEL);
+      expect(models[1]).toBe("@cf/zai-org/glm-4.7-flash");
     }
+  });
+
+  it("调用配置里的备用模型，而不是写死的默认值", async () => {
+    const models: string[] = [];
+    const ai = fakeAi((model) => {
+      models.push(model);
+      if (model.includes("m2m100")) return { translated_text: "" };
+      return { response: CHINESE };
+    });
+    const outcome = await translateToChinese(ai, ARABIC, "ar", "zh", "en", "@cf/example/other-chat");
+    expect(outcome.text).toBe(CHINESE);
+    expect(models).toEqual(["@cf/meta/m2m100-1.2b", "@cf/example/other-chat"]);
+  });
+
+  it("备用模型返回 5018 时把停用原因写进翻译失败", async () => {
+    const ai = fakeAi((model) => {
+      if (model.includes("m2m100")) return { translated_text: "" };
+      throw new Error("5018: model deprecated");
+    });
+    const outcome = await translateToChinese(ai, ARABIC, null, "zh", "en");
+    expect(outcome.status).toBe("translation_failed");
+    expect(outcome.error).toMatch(/模型不可用/);
+    expect(outcome.error).toMatch(/5018/);
+    expect(outcome.error).toMatch(/deprecat/i);
+    expect(outcome.error).toContain("@cf/zai-org/glm-4.7-flash");
+    expect(translationCell(outcome.text, outcome.status, outcome.error)).toContain("翻译失败：模型不可用");
   });
 
   it("两步都失败时记下 translation_failed 和原因", async () => {
@@ -99,5 +133,28 @@ describe("翻译到简体中文", () => {
     expect(outcome).toMatchObject({ status: "ok", sourceLang: "zh" });
     expect(acceptableChinese(ARABIC, CHINESE)).toBe(true);
     expect(acceptableChinese(ARABIC, ARABIC)).toBe(false);
+  });
+});
+
+describe("翻译备用模型", () => {
+  it("拒绝已停用的 Gemma 和不合规的模型名", () => {
+    expect(() => assertTranslationFallbackModel("@cf/google/gemma-3-12b-it")).toThrow(/5018/);
+    expect(() => assertTranslationFallbackModel("@cf/google/gemma-3-12b-it")).toThrow(/2026-05-30/);
+    expect(() => assertTranslationFallbackModel("gemma")).toThrow(/Workers AI 模型名/);
+    expect(() => assertTranslationFallbackModel(DEFAULT_TRANSLATION_FALLBACK_MODEL)).not.toThrow();
+  });
+
+  it("试跑成功则通过，5018 则拒绝", async () => {
+    await expect(probeTranslationFallbackModel({
+      async run() {
+        return { response: "你好" };
+      },
+    } as unknown as Ai, "@cf/example/other-chat")).resolves.toBeUndefined();
+
+    await expect(probeTranslationFallbackModel({
+      async run() {
+        throw new Error("5018: model deprecated");
+      },
+    } as unknown as Ai, "@cf/example/other-chat")).rejects.toThrow(/模型不可用：5018/);
   });
 });

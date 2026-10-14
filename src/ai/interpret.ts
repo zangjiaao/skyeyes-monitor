@@ -199,6 +199,7 @@ async function workersTranslation(input: InterpretInput, hinted: string | null):
     hinted,
     input.settings.translationTargetLang,
     input.settings.translationSourceLang,
+    input.settings.translationFallbackModel,
   );
   return {
     translation: outcome.text,

@@ -1,4 +1,5 @@
 import type { SourceId } from "../domain/types";
+import { assertTranslationFallbackModel, DEFAULT_TRANSLATION_FALLBACK_MODEL } from "../translate";
 import { canonicalGoogleNewsEditions, GOOGLE_NEWS_EDITION_LIMIT, parseGoogleNewsEditions } from "../sources/google-news";
 import {
   GDELT_MIN_INTERVAL_SEC_DEFAULT,
@@ -18,6 +19,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   translation_enabled: "1",
   translation_source_lang: "en",
   translation_target_lang: "zh",
+  translation_fallback_model: "@cf/zai-org/glm-4.7-flash",
   email_enabled: "0",
   email_provider: "resend",
   email_from: "",
@@ -59,6 +61,7 @@ export interface AppSettings {
   translationEnabled: boolean;
   translationSourceLang: string;
   translationTargetLang: string;
+  translationFallbackModel: string;
   emailEnabled: boolean;
   emailProvider: "resend" | "cloudflare";
   emailFrom: string;
@@ -140,6 +143,7 @@ export function parseSettings(raw: Record<string, string>): AppSettings {
     translationEnabled: flag(merged.translation_enabled, true),
     translationSourceLang: merged.translation_source_lang || "en",
     translationTargetLang: merged.translation_target_lang || "zh",
+    translationFallbackModel: merged.translation_fallback_model.trim() || DEFAULT_TRANSLATION_FALLBACK_MODEL,
     emailEnabled: flag(merged.email_enabled, false),
     emailProvider: provider,
     emailFrom: merged.email_from.trim(),
@@ -222,6 +226,10 @@ export function validateSettingsPatch(patch: Record<string, unknown>): Record<st
   }
   if (next.ai_model !== undefined && next.ai_model !== "" && !/^[A-Za-z0-9._-]{1,64}$/.test(next.ai_model)) {
     throw new Error("模型名只能包含字母、数字、点、下划线和连字符");
+  }
+  if (next.translation_fallback_model !== undefined) {
+    if (!next.translation_fallback_model) next.translation_fallback_model = DEFAULT_TRANSLATION_FALLBACK_MODEL;
+    assertTranslationFallbackModel(next.translation_fallback_model);
   }
   if (next.x_qps !== undefined) {
     if (next.x_qps === "") {

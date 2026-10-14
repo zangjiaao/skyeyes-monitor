@@ -98,6 +98,89 @@ describe("DeepSeek 解读", () => {
     expect(outcome.provider).toBe("workers");
   });
 
+  it("DeepSeek 译成中文后不再调用 Workers AI", async () => {
+    const settings = parseSettings({ ai_provider: "deepseek", ai_enabled: "1", translation_enabled: "1" });
+    let aiCalls = 0;
+    const outcome = await interpretRecord({
+      ai: {
+        async run() {
+          aiCalls += 1;
+          return { translated_text: "不应使用" };
+        },
+      } as unknown as Ai,
+      apiKey: "test-key",
+      settings,
+      text: ARABIC,
+      targetName: "目标",
+      terms: [],
+      description: "",
+      sleepImpl: async () => {},
+      fetchImpl: async () => jsonResponse(200, { choices: [{ message: { content: JSON.stringify(deepseekBody()) } }] }),
+    });
+    expect(aiCalls).toBe(0);
+    expect(outcome.provider).toBe("deepseek");
+    expect(outcome.translationStatus).toBe("ok");
+    expect(outcome.translation).toBe(CHINESE);
+    expect(outcome.translationError).toBeNull();
+  });
+
+  it("DeepSeek 译文不是中文时改走 m2m100 和备用对话模型", async () => {
+    const settings = parseSettings({
+      ai_provider: "deepseek",
+      ai_enabled: "1",
+      translation_fallback_model: "@cf/example/other-chat",
+    });
+    const models: string[] = [];
+    const outcome = await interpretRecord({
+      ai: {
+        async run(model: string) {
+          models.push(model);
+          if (model.includes("m2m100")) return { translated_text: "" };
+          return { response: CHINESE };
+        },
+      } as unknown as Ai,
+      apiKey: "test-key",
+      settings,
+      text: ARABIC,
+      targetName: "目标",
+      terms: [],
+      description: "",
+      sleepImpl: async () => {},
+      fetchImpl: async () => jsonResponse(200, {
+        choices: [{ message: { content: JSON.stringify(deepseekBody({ translation_zh: "not chinese" })) } }],
+      }),
+    });
+    expect(models).toEqual(["@cf/meta/m2m100-1.2b", "@cf/example/other-chat"]);
+    expect(outcome.translation).toBe(CHINESE);
+    expect(outcome.translationStatus).toBe("ok");
+    expect(outcome.provider).toBe("deepseek");
+  });
+
+  it("DeepSeek 和备用模型都失败时，翻译失败原因包含 5018", async () => {
+    const settings = parseSettings({ ai_provider: "deepseek", ai_enabled: "1" });
+    const outcome = await interpretRecord({
+      ai: {
+        async run(model: string) {
+          if (model.includes("m2m100")) return { translated_text: "" };
+          throw new Error("5018: model deprecated");
+        },
+      } as unknown as Ai,
+      apiKey: "test-key",
+      settings,
+      text: ARABIC,
+      targetName: "目标",
+      terms: [],
+      description: "",
+      sleepImpl: async () => {},
+      fetchImpl: async () => jsonResponse(200, {
+        choices: [{ message: { content: JSON.stringify(deepseekBody({ translation_zh: "" })) } }],
+      }),
+    });
+    expect(outcome.translationStatus).toBe("translation_failed");
+    expect(outcome.translationError).toMatch(/5018/);
+    expect(outcome.translationError).toMatch(/模型不可用/);
+  });
+
   it("DeepSeek 失败时译文回退，评分原因保留", async () => {
     const settings = parseSettings({ ai_provider: "deepseek", ai_enabled: "1" });
     const ai = {

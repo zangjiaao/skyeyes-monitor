@@ -1,6 +1,7 @@
+import { callDeepseek } from "../ai/interpret";
 import { loadSettings } from "../config/settings";
 import { logError } from "../log";
-import { translateToChinese } from "../translate";
+import { acceptableChinese, translateToChinese } from "../translate";
 
 export const RETRANSLATE_LIMIT = 20;
 
@@ -8,6 +9,7 @@ interface TranslateRow {
   id: string;
   original_text: string;
   source_lang: string | null;
+  matched_target?: string | null;
 }
 
 export async function retranslateRecords(env: Env, input: {
@@ -21,12 +23,35 @@ export async function retranslateRecords(env: Env, input: {
   let translated = 0;
   let failed = 0;
   for (const row of rows) {
+    const text = row.original_text ?? "";
+    if (settings.aiEnabled && settings.aiProvider === "deepseek" && env.DEEPSEEK_API_KEY?.trim()) {
+      const deep = await callDeepseek({
+        apiKey: env.DEEPSEEK_API_KEY.trim(),
+        model: settings.aiModel,
+        text,
+        targetName: row.matched_target || "监测对象",
+        terms: [],
+        description: "",
+        fetchImpl: globalThis.fetch.bind(globalThis),
+      });
+      if (deep.ok && deep.parsed.translation && acceptableChinese(text, deep.parsed.translation)) {
+        const sourceLang = (deep.parsed.sourceLang || row.source_lang || "und").slice(0, 12);
+        await env.DB.prepare(
+          `UPDATE records
+           SET translation_zh = ?, translation_status = 'ok', translation_error = NULL, source_lang = ?
+           WHERE id = ?`,
+        ).bind(deep.parsed.translation, sourceLang, row.id).run();
+        translated += 1;
+        continue;
+      }
+    }
     const outcome = await translateToChinese(
       env.AI,
-      row.original_text ?? "",
+      text,
       row.source_lang,
       settings.translationTargetLang,
       settings.translationSourceLang,
+      settings.translationFallbackModel,
     );
     if (outcome.status === "ok" && outcome.text) {
       await env.DB.prepare(
@@ -56,7 +81,7 @@ async function selectedRows(db: D1Database, ids: string[]): Promise<TranslateRow
   if (ids.length === 0) return [];
   const marks = ids.map(() => "?").join(",");
   const result = await db.prepare(
-    `SELECT id, original_text, source_lang FROM records
+    `SELECT id, original_text, source_lang, matched_target FROM records
      WHERE deleted_at IS NULL AND id IN (${marks})`,
   ).bind(...ids).all<TranslateRow>();
   return result.results;
@@ -64,7 +89,7 @@ async function selectedRows(db: D1Database, ids: string[]): Promise<TranslateRow
 
 async function failedRows(db: D1Database): Promise<TranslateRow[]> {
   const result = await db.prepare(
-    `SELECT id, original_text, source_lang FROM records
+    `SELECT id, original_text, source_lang, matched_target FROM records
      WHERE deleted_at IS NULL
        AND (
          translation_status = 'translation_failed'
