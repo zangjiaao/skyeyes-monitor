@@ -2,6 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "skyeyes-monitor",
   "main": "src/index.ts",
+  "preview_urls": false,
   "compatibility_date": "2026-10-12",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {

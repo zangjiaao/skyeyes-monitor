@@ -11,7 +11,7 @@
 - `src/`：Hono API、定时任务、队列消费、数据源、翻译、Excel、邮件
 - `admin/`：React 19 + Vite + Astryx（StyleX）管理后台，构建结果由同一个 Worker 当作静态资源提供
 - `migrations/`：D1 表结构和占位种子
-- `.github/workflows/ci.yml`：PR 上做类型检查、测试和构建；推到 `main` 后应用 D1 迁移并 `wrangler deploy`
+- `.github/workflows/ci.yml`：PR 上做类型检查、测试和构建；推到 `main` 后应用 D1 迁移并 `wrangler deploy`。`wrangler.jsonc` 里 `preview_urls` 为 false，部署不会生成版本预览地址。
 
 数据源实现 `search(targets, window) -> 统一记录`。现在有 X（twitterapi.io）、Google News RSS、GDELT。Reddit / Telegram 以后按同一接口加。
 
