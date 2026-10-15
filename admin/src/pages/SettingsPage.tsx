@@ -242,10 +242,10 @@ export function SettingsPage() {
                 }).then((result) => {
                   const who = result.to.join("、");
                   const attachment = result.attached
-                    ? "已附上累计 Excel。"
+                    ? "已附上最近一次运行的新增 Excel。"
                     : result.excelError
                       ? `没有附上 Excel：${result.excelError}`
-                      : "Excel 超过 4MB 或尚未生成，正文里会说明。";
+                      : "没有附上 Excel，正文里会说明原因。";
                   setNotice(`测试邮件已发给 ${who}。${attachment}`);
                   setTestOpen(false);
                   setTestTo("");

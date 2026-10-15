@@ -19,6 +19,7 @@ import { sendWithCloudflare } from "../email/cloudflare";
 import { sendWithResend } from "../email/resend";
 import { ATTACHMENT_LIMIT_BYTES, type OutboundEmail } from "../email/types";
 import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
+import { runWindowDownloadPath, runWindowFilename, runWindowObjectKey } from "../export/run-file";
 import { errorMessage, log, logError, logWarn } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
@@ -1383,43 +1384,55 @@ async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   }
 }
 
-async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[]; truncated: boolean }> {
+const EXCEL_COLUMNS = `country_name, original_text, published_at, author_handle, author_name, author_url,
+              source, url, matched_target, matched_term, collected_at, translation_zh,
+              translation_status, translation_error, relevance_score, ai_summary`;
+
+function toExcelRecord(row: RecordRow): ExcelRecord {
+  return {
+    countryName: row.country_name,
+    originalText: row.original_text,
+    publishedAt: row.published_at ?? "",
+    authorHandle: row.author_handle,
+    authorName: row.author_name,
+    authorUrl: row.author_url,
+    source: row.source,
+    url: row.url,
+    matchedTarget: row.matched_target,
+    matchedTerm: row.matched_term,
+    collectedAt: row.collected_at,
+    translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
+    relevanceScore: row.relevance_score == null ? "" : String(row.relevance_score),
+    summaryZh: row.ai_summary ?? "",
+  };
+}
+
+async function loadExcelRecords(
+  db: D1Database,
+  whereSql: string,
+  binds: unknown[],
+): Promise<{ records: ExcelRecord[]; truncated: boolean }> {
   const newestFirst: ExcelRecord[] = [];
   let offset = 0;
   const pageSize = 1000;
   let truncated = false;
   while (newestFirst.length < MAX_EXCEL_ROWS) {
     const page = await db.prepare(
-       `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
-              source, url, matched_target, matched_term, collected_at, translation_zh,
-              translation_status, translation_error, relevance_score, ai_summary
-       FROM records WHERE ${DELIVERABLE_SQL}
+      `SELECT ${EXCEL_COLUMNS}
+       FROM records WHERE ${whereSql}
        ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
-    ).bind(pageSize, offset).all<RecordRow>();
+    ).bind(...binds, pageSize, offset).all<RecordRow>();
     if (page.results.length === 0) break;
     for (const row of page.results) {
       if (newestFirst.length >= MAX_EXCEL_ROWS) break;
-      newestFirst.push({
-        countryName: row.country_name,
-        originalText: row.original_text,
-        publishedAt: row.published_at ?? "",
-        authorHandle: row.author_handle,
-        authorName: row.author_name,
-        authorUrl: row.author_url,
-        source: row.source,
-        url: row.url,
-        matchedTarget: row.matched_target,
-        matchedTerm: row.matched_term,
-        collectedAt: row.collected_at,
-        translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
-        relevanceScore: row.relevance_score == null ? "" : String(row.relevance_score),
-        summaryZh: row.ai_summary ?? "",
-      });
+      newestFirst.push(toExcelRecord(row));
     }
     offset += page.results.length;
     if (page.results.length < pageSize) break;
     if (newestFirst.length >= MAX_EXCEL_ROWS) {
-      const extra = await db.prepare(`SELECT id FROM records WHERE ${DELIVERABLE_SQL} LIMIT 1 OFFSET ?`).bind(MAX_EXCEL_ROWS).first();
+      const extra = await db.prepare(
+        `SELECT id FROM records WHERE ${whereSql} LIMIT 1 OFFSET ?`,
+      ).bind(...binds, MAX_EXCEL_ROWS).first();
       truncated = Boolean(extra);
     }
   }
@@ -1428,7 +1441,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
 
 export async function storeExcel(env: Env, settings: AppSettings): Promise<{ bytes: Uint8Array; key: string; truncated: boolean }> {
   const countries = await env.DB.prepare("SELECT name FROM countries ORDER BY name").all<{ name: string }>();
-  const loaded = await loadExcelRecords(env.DB);
+  const loaded = await loadExcelRecords(env.DB, DELIVERABLE_SQL, []);
   const bytes = buildMonitorWorkbook({
     countries: countries.results,
     records: loaded.records,
@@ -1442,6 +1455,38 @@ export async function storeExcel(env: Env, settings: AppSettings): Promise<{ byt
     httpMetadata: { contentType: EXCEL_TYPE },
   });
   return { bytes, key, truncated: loaded.truncated };
+}
+
+export async function storeRunWindowExcel(
+  env: Env,
+  settings: AppSettings,
+  run: { id: string; windowStart: string; windowEnd: string },
+): Promise<{ bytes: Uint8Array | null; key: string; filename: string; truncated: boolean; count: number }> {
+  const excelKey = settings.excelKey || env.EXCEL_FILENAME || "skyeyes.xlsx";
+  const filename = runWindowFilename(excelKey, run.windowEnd, settings.timeZone);
+  const key = runWindowObjectKey(run.id);
+  const loaded = await loadExcelRecords(
+    env.DB,
+    `run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?`,
+    [run.id, run.windowStart, run.windowEnd],
+  );
+  if (loaded.records.length === 0) {
+    return { bytes: null, key, filename, truncated: false, count: 0 };
+  }
+  const countries = await env.DB.prepare("SELECT name FROM countries ORDER BY name").all<{ name: string }>();
+  const windowEnd = new Date(run.windowEnd);
+  const bytes = buildMonitorWorkbook({
+    countries: countries.results,
+    records: loaded.records,
+    reference: Number.isNaN(windowEnd.getTime()) ? new Date() : windowEnd,
+    timeZone: settings.timeZone,
+    scheduleHour: settings.scheduleHour,
+    windowHours: settings.windowHours,
+  });
+  await env.EXPORTS.put(key, bytes, {
+    httpMetadata: { contentType: EXCEL_TYPE },
+  });
+  return { bytes, key, filename, truncated: loaded.truncated, count: loaded.records.length };
 }
 
 async function sendDigest(
@@ -1499,6 +1544,12 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   try {
     const stored = await storeExcel(env, settings);
     if (stored.truncated) notes = [notes, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`].filter(Boolean).join(" ");
+    const windowFile = await storeRunWindowExcel(env, settings, {
+      id: runId,
+      windowStart: run.window_start,
+      windowEnd: run.window_end,
+    });
+    if (windowFile.truncated) notes = [notes, `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。`].filter(Boolean).join(" ");
     const grouped = await env.DB.prepare(
       `SELECT country_name, source, COUNT(*) AS n
        FROM records
@@ -1512,8 +1563,10 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       current.bySource[row.source] = row.n;
       byCountry.set(row.country_name, current);
     }
-    const downloadUrl = settings.appBaseUrl ? `${settings.appBaseUrl}/api/export/excel` : null;
-    const attached = stored.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES;
+    const downloadUrl = windowFile.bytes && settings.appBaseUrl
+      ? `${settings.appBaseUrl}${runWindowDownloadPath(runId)}`
+      : null;
+    const attached = Boolean(windowFile.bytes && windowFile.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
     const digest = buildDigest({
       incomplete,
       windowStart: run.window_start,
@@ -1532,8 +1585,8 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       subject: digest.subject,
       text: digest.text,
       html: digest.html,
-      attachment: attached
-        ? { filename: stored.key.split("/").pop() || "skyeyes.xlsx", content: stored.bytes, contentType: EXCEL_TYPE }
+      attachment: attached && windowFile.bytes
+        ? { filename: windowFile.filename, content: windowFile.bytes, contentType: EXCEL_TYPE }
         : undefined,
     });
     emailStatus = sent.status;

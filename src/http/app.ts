@@ -17,6 +17,7 @@ import {
   type ImportPreviewRow,
 } from "../import/table";
 import { sendTestEmail } from "../email/send-test";
+import { isRunId, runWindowFilename, runWindowObjectKey } from "../export/run-file";
 import { storeExcel } from "../pipeline/run";
 import { hideRecords, hideRecordsMatching, parseDeleteIds } from "../records/delete";
 import { RECORD_LIST_SELECT, buildRecordListQuery, recordListInputFromBody } from "../records/list";
@@ -1004,6 +1005,27 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
 
   app.get("/api/export/excel", async (c) => {
     const settings = await loadSettings(c.env.DB);
+    const runId = c.req.query("run")?.trim() ?? "";
+    if (runId) {
+      if (!isRunId(runId)) return c.json({ error: "运行不存在" }, 404);
+      const run = await c.env.DB.prepare(
+        "SELECT id, window_end FROM runs WHERE id = ?",
+      ).bind(runId).first<{ id: string; window_end: string }>();
+      if (!run) return c.json({ error: "运行不存在" }, 404);
+      const object = await c.env.EXPORTS.get(runWindowObjectKey(runId));
+      if (!object) return c.json({ error: "这次运行没有新增 Excel" }, 404);
+      const filename = runWindowFilename(
+        settings.excelKey || c.env.EXCEL_FILENAME,
+        run.window_end,
+        settings.timeZone,
+      );
+      return new Response(object.body, {
+        headers: {
+          "Content-Type": EXCEL_TYPE,
+          "Content-Disposition": `attachment; filename="${filename}"`,
+        },
+      });
+    }
     const object = await c.env.EXPORTS.get(settings.excelKey || c.env.EXCEL_FILENAME);
     if (!object) return c.json({ error: "还没有生成 Excel，请先运行一次或点击重新生成" }, 404);
     return new Response(object.body, {

@@ -153,7 +153,7 @@ describe("按时区显示", () => {
     expect(digest.text).toContain("失败批次: 1");
     expect(digest.text).toContain("本轮在截止时间前仍有批次未完成。");
     expect(digest.text).toContain("有批次未完成，已发送目前收集到的内容。");
-    expect(digest.text).toContain("完整内容在附件 Excel 里。");
+    expect(digest.text).toContain("本轮新增在附件 Excel 里。");
     expect(digest.text).not.toContain("本轮条目");
     expect(digest.text).not.toContain("摘要");
     expect(digest.text).not.toContain("译文");
@@ -172,8 +172,8 @@ describe("按时区显示", () => {
       notes: "",
     });
     expect(linked.text).toContain("本轮批次已全部结束。");
-    expect(linked.text).toContain("完整内容请下载: https://sky.example.com/api/export/excel");
-    expect(linked.text).not.toContain("完整内容在附件 Excel 里。");
+    expect(linked.text).toContain("本轮新增请下载: https://sky.example.com/api/export/excel");
+    expect(linked.text).not.toContain("本轮新增在附件 Excel 里。");
 
     const longSources = buildDigest({
       incomplete: false,
@@ -197,6 +197,22 @@ describe("按时区显示", () => {
     });
     expect(longSources.text).toContain("- 示例分组: 新增 8");
     expect(longSources.text).not.toContain("very_long_source_name");
-    expect(longSources.text).toContain("未配置站点地址");
+    expect(longSources.text).toContain("请打开配置页，填写「站点地址」并保存");
+    expect(longSources.text).toContain("文件仍在 R2");
+
+    const empty = buildDigest({
+      incomplete: false,
+      windowStart: "2026-10-12T16:00:00.000Z",
+      windowEnd: "2026-10-13T02:00:00.000Z",
+      timeZone: SHANGHAI,
+      countries: [],
+      failedBatches: 0,
+      downloadUrl: "https://sky.example.com/api/export/excel",
+      attached: true,
+      notes: "",
+    });
+    expect(empty.text).toContain("本轮时间窗口内没有新增，因此没有附件。");
+    expect(empty.text).not.toContain("本轮新增在附件 Excel 里。");
+    expect(empty.text).not.toContain("https://sky.example.com");
   });
 });

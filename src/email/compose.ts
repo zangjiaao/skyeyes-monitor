@@ -41,10 +41,15 @@ function sourceSuffix(bySource: Record<string, number>): string {
   return `（${parts}）`;
 }
 
+export const MISSING_SITE_URL_LINE =
+  "本轮新增未放入附件。请打开配置页，填写「站点地址」并保存。文件仍在 R2。";
+
 function excelLine(input: DigestInput): string {
-  if (input.attached) return "完整内容在附件 Excel 里。";
-  if (input.downloadUrl) return `完整内容请下载: ${input.downloadUrl}`;
-  return "完整内容未放入附件。未配置站点地址，正文里没有下载链接。文件仍在 R2。";
+  const total = input.countries.reduce((sum, country) => sum + country.added, 0);
+  if (total === 0) return "本轮时间窗口内没有新增，因此没有附件。";
+  if (input.attached) return "本轮新增在附件 Excel 里。";
+  if (input.downloadUrl) return `本轮新增请下载: ${input.downloadUrl}`;
+  return MISSING_SITE_URL_LINE;
 }
 
 function formatWindowInstant(iso: string, timeZone: string): string {
