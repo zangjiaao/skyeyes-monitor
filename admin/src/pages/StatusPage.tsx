@@ -154,7 +154,7 @@ export function StatusPage() {
       <VStack gap={1}>
         <Heading level={1}>系统状态</Heading>
         <Text type="body" color="secondary">
-          {`每天 ${data.scheduleHour}:00（${data.timezone}, ${data.utcOffset}）采集前 ${data.windowHours} 小时。下次运行 ${formatTime(data.nextRun, data.timezone)}。批次大小 ${data.batchSize}。`}
+          {`每天 ${data.scheduleHour}:00（${data.timezone}, ${data.utcOffset}）采集前 ${data.windowHours} 小时。下次运行 ${formatTime(data.nextRun, data.timezone)}。每个来源一条采集链，按顺序处理全部目标。`}
         </Text>
       </VStack>
       <HStack gap={2}>
@@ -254,7 +254,7 @@ export function StatusPage() {
         idKey="id"
         data={data.failedBatches}
         columns={[
-          { key: "country_name", header: "分组" },
+          { key: "country_name", header: "范围" },
           { key: "source", header: "来源" },
           { key: "error", header: "错误", renderCell: (row) => row.error || "—" },
         ]}

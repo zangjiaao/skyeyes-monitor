@@ -435,8 +435,9 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         .bind(yesterday.start.toISOString(), yesterday.end.toISOString()).all<{ country_id: string; n: number }>(),
       c.env.DB.prepare("SELECT * FROM runs ORDER BY started_at DESC LIMIT 12").all(),
       c.env.DB.prepare(
-        `SELECT b.id, b.run_id, b.source, b.error, b.finished_at, c.name AS country_name
-         FROM batches b JOIN countries c ON c.id = b.country_id
+        `SELECT b.id, b.run_id, b.source, b.error, b.finished_at,
+                COALESCE(NULLIF(c.name, ''), '全部') AS country_name
+         FROM batches b LEFT JOIN countries c ON c.id = b.country_id
          WHERE b.status = 'failed' ORDER BY b.finished_at DESC LIMIT 20`,
       ).all(),
       c.env.DB.prepare(
@@ -1081,8 +1082,8 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const run = await c.env.DB.prepare("SELECT * FROM runs WHERE id = ?").bind(c.req.param("id")).first();
     if (!run) return c.json({ error: "运行不存在" }, 404);
     const batches = await c.env.DB.prepare(
-      `SELECT b.*, c.name AS country_name FROM batches b
-       JOIN countries c ON c.id = b.country_id WHERE b.run_id = ? ORDER BY b.batch_index`,
+      `SELECT b.*, COALESCE(NULLIF(c.name, ''), '全部') AS country_name FROM batches b
+       LEFT JOIN countries c ON c.id = b.country_id WHERE b.run_id = ? ORDER BY b.batch_index`,
     ).bind(c.req.param("id")).all();
     return c.json({ run, batches: batches.results });
   });

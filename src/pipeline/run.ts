@@ -1,5 +1,4 @@
 import { loadSettings, type AppSettings } from "../config/settings";
-import { batchTargetsForQuery } from "../domain/batch";
 import { splitLines } from "../domain/terms";
 import { dedupeRecords } from "../domain/dedupe";
 import {
@@ -23,22 +22,25 @@ import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
 import { errorMessage, log, logError, logWarn } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
-import { GDELT_RATE_SLOT, GOOGLE_NEWS_RATE_SLOT, recordRateEvent, sleep, tryReserveSlot, tryReserveXSlot } from "../sources/x-rate";
+import { GDELT_RATE_SLOT, GOOGLE_NEWS_RATE_SLOT, recordRateEvent, tryReserveSlot, tryReserveXSlot } from "../sources/x-rate";
 import { interpretRecord } from "../ai/interpret";
 import { findSimilarRecords } from "../records/similar";
 import { translationCell } from "../translate";
 import type { CollectMessage } from "./messages";
 import {
+  COORDINATOR_GATE_DELAY_SEC,
+  COORDINATOR_WALL_MS,
+  COORDINATOR_WALL_RESERVE_MS,
   DeferredBatchError,
   LEASE_MS,
   MAX_BATCH_ATTEMPTS,
   MAX_DEFER_COUNT,
   MAX_DEFER_WAIT_SEC,
-  PACE_INLINE_MS,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
   batchWakeup,
 } from "./lease";
+import { pacing } from "./pacing";
 import {
   beginSourceFetch,
   interpretReservation,
@@ -465,35 +467,35 @@ export async function startRun(env: Env, input: {
   const countries = await env.DB.prepare(
     "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
   ).all<CountryRow>();
-  const inserts: D1PreparedStatement[] = [];
-  const messages: MessageSendRequest<CollectMessage>[] = [];
-
+  const targetRows: TargetRow[] = [];
   for (const country of countries.results) {
     const targets = await env.DB.prepare(
       `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
        FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
-    const queryTargets = targets.results.map(toQueryTarget);
+    targetRows.push(...targets.results);
+  }
+  const inserts: D1PreparedStatement[] = [];
+  const messages: MessageSendRequest<CollectMessage>[] = [];
+  if (targetRows.length > 0) {
+    const targetIds = JSON.stringify(targetRows.map((target) => target.id));
     for (const source of SOURCE_IDS) {
-      if (!settings.sources[source] || queryTargets.length === 0) continue;
-      const groups = batchTargetsForQuery(queryTargets);
-      for (const group of groups) {
-        const batchId = crypto.randomUUID();
-        inserts.push(env.DB.prepare(
-          `INSERT INTO batches (
-            id, run_id, country_id, source, batch_index, target_ids, status, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`,
-        ).bind(
-          batchId,
-          runId,
-          country.id,
-          source,
-          messages.length,
-          JSON.stringify(group.map((target) => target.id)),
-          startedAt,
-        ));
-        messages.push(batchQueueMessage(runId, batchId));
-      }
+      if (!settings.sources[source]) continue;
+      const batchId = crypto.randomUUID();
+      inserts.push(env.DB.prepare(
+        `INSERT INTO batches (
+          id, run_id, country_id, source, batch_index, target_ids, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`,
+      ).bind(
+        batchId,
+        runId,
+        "",
+        source,
+        messages.length,
+        targetIds,
+        startedAt,
+      ));
+      messages.push(batchQueueMessage(runId, batchId));
     }
   }
 
@@ -510,12 +512,33 @@ export async function startRun(env: Env, input: {
 
 async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> {
   if (ids.length === 0) return [];
-  const marks = ids.map(() => "?").join(",");
-  const result = await db.prepare(
-    `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
-     FROM targets WHERE id IN (${marks})`,
-  ).bind(...ids).all<TargetRow>();
-  return result.results;
+  const rows: TargetRow[] = [];
+  for (let index = 0; index < ids.length; index += 80) {
+    const slice = ids.slice(index, index + 80);
+    const marks = slice.map(() => "?").join(",");
+    const result = await db.prepare(
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+       FROM targets WHERE id IN (${marks})`,
+    ).bind(...slice).all<TargetRow>();
+    rows.push(...result.results);
+  }
+  const order = new Map(ids.map((id, index) => [id, index]));
+  rows.sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+  return rows;
+}
+
+async function loadCountries(db: D1Database, ids: string[]): Promise<CountryRow[]> {
+  const unique = [...new Set(ids)];
+  const rows: CountryRow[] = [];
+  for (let index = 0; index < unique.length; index += 80) {
+    const slice = unique.slice(index, index + 80);
+    const marks = slice.map(() => "?").join(",");
+    const result = await db.prepare(
+      `SELECT id, name, code, enabled FROM countries WHERE id IN (${marks})`,
+    ).bind(...slice).all<CountryRow>();
+    rows.push(...result.results);
+  }
+  return rows;
 }
 
 export async function claimBatch(
@@ -575,12 +598,21 @@ async function storeCollected(env: Env, input: {
   batchId: string;
   leaseToken: string;
   country: CountryRow;
+  countryFor: (targetId: string | null | undefined) => CountryRow;
   targets: TargetRow[];
   settings: AppSettings;
   records: CollectedRecord[];
   budget: SubrequestBudget;
   reservation: number;
-}): Promise<{ added: number; filtered: number; deduped: number; relevanceFailures: number; deferred: boolean } | null> {
+  yieldNow?: () => boolean;
+}): Promise<{
+  added: number;
+  filtered: number;
+  deduped: number;
+  relevanceFailures: number;
+  deferred: boolean;
+  deferReason: "budget" | "wall" | null;
+} | null> {
   const unique = dedupeRecords(input.records);
   const fetched = input.records.length;
   let deduped = fetched - unique.length;
@@ -591,6 +623,7 @@ async function storeCollected(env: Env, input: {
   const accepted: ExistingIdentity[] = [];
   let relevanceFailures = 0;
   let deferred = false;
+  let deferReason: "budget" | "wall" | null = null;
   const charge = () => input.budget.charge();
   const kept: Array<CollectedRecord & {
     translation: string | null;
@@ -610,6 +643,11 @@ async function storeCollected(env: Env, input: {
     urlKey: string;
   }> = [];
   for (const record of unique) {
+    if (input.yieldNow?.()) {
+      deferred = true;
+      deferReason = "wall";
+      break;
+    }
     if (!record.matchedTargetId || !record.matchedTerm?.trim()) {
       filtered += 1;
       continue;
@@ -662,6 +700,7 @@ async function storeCollected(env: Env, input: {
         && (input.settings.aiEnabled || input.settings.translationEnabled || input.settings.relevanceEnabled);
       if (shouldInterpret && input.reservation > 0 && input.budget.remaining < input.reservation) {
         deferred = true;
+        deferReason = "budget";
         break;
       }
       if (shouldInterpret) {
@@ -738,13 +777,16 @@ async function storeCollected(env: Env, input: {
     } catch (error) {
       if (error instanceof DeferredBatchError) {
         deferred = true;
+        deferReason = "budget";
         break;
       }
       filtered += 1;
       logError("record skipped", error, { runId: input.runId, batchId: input.batchId, url: record.url });
     }
   }
-  const statements: D1PreparedStatement[] = kept.map((record) => env.DB.prepare(
+  const statements: D1PreparedStatement[] = kept.map((record) => {
+    const owner = input.countryFor(record.matchedTargetId);
+    return env.DB.prepare(
     `INSERT INTO records (
       id, dedupe_key, source, external_id, url, country_id, country_name,
       matched_target_id, matched_target, matched_term, author_handle, author_name, author_url,
@@ -760,8 +802,8 @@ async function storeCollected(env: Env, input: {
     record.source,
     record.externalId,
     record.url,
-    input.country.id,
-    input.country.name,
+    owner.id,
+    owner.name,
     record.matchedTargetId,
     record.matchedTarget,
     record.matchedTerm ?? "",
@@ -791,14 +833,15 @@ async function storeCollected(env: Env, input: {
     record.excludeReason,
     record.authorFollowers ?? null,
     record.authorCreatedAt ?? null,
-  ));
+  );
+  });
   if (!(await ownsBatch(env, input.batchId, input.leaseToken))) return null;
   const inserted = await runChunk(env.DB, statements);
   const added = inserted.reduce((sum, item, index) => {
     if (kept[index]?.excludeReason) return sum;
     return sum + (item.meta.changes ?? 0);
   }, 0);
-  return { added, filtered, deduped, relevanceFailures, deferred };
+  return { added, filtered, deduped, relevanceFailures, deferred, deferReason };
 }
 
 function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
@@ -817,11 +860,13 @@ function parseResume(raw: string | null | undefined, source: SourceId): BatchRes
   }
 }
 
-async function paceSource(env: Env, source: SourceId, settings: AppSettings): Promise<void> {
+async function paceSource(env: Env, source: SourceId, settings: AppSettings, inlineLimitMs: number): Promise<void> {
+  const inline = Math.max(0, Math.floor(inlineLimitMs));
+  const now = pacing.now();
   if (source === "x") {
-    const slot = await tryReserveXSlot(env.DB, settings.xQps, PACE_INLINE_MS);
-    if (!slot.ok) throw new DeferredBatchError(Math.ceil(slot.waitMs / 1000));
-    if (slot.waitMs > 0) await sleep(slot.waitMs);
+    const slot = await tryReserveXSlot(env.DB, settings.xQps, inline, now);
+    if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)));
+    if (slot.waitMs > 0) await pacing.sleep(slot.waitMs);
     return;
   }
   const intervalSec = source === "gdelt"
@@ -831,9 +876,9 @@ async function paceSource(env: Env, source: SourceId, settings: AppSettings): Pr
       : 0;
   if (intervalSec <= 0) return;
   const name = source === "gdelt" ? GDELT_RATE_SLOT : GOOGLE_NEWS_RATE_SLOT;
-  const slot = await tryReserveSlot(env.DB, name, intervalSec * 1000, PACE_INLINE_MS);
-  if (!slot.ok) throw new DeferredBatchError(Math.ceil(slot.waitMs / 1000));
-  if (slot.waitMs > 0) await sleep(slot.waitMs);
+  const slot = await tryReserveSlot(env.DB, name, intervalSec * 1000, inline, now);
+  if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)));
+  if (slot.waitMs > 0) await pacing.sleep(slot.waitMs);
 }
 
 export async function scheduleDeferredWake(
@@ -920,21 +965,33 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const running = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM batches WHERE status = 'running'",
     ).first<{ n: number }>();
-    if ((running?.n ?? 0) >= settings.queueConcurrency) throw new DeferredBatchError(5);
+    if ((running?.n ?? 0) >= settings.queueConcurrency) throw new DeferredBatchError(COORDINATOR_GATE_DELAY_SEC);
     const claimed = await claimBatch(env, runId, batchId);
     if (!claimed) return;
     token = claimed.token;
     const leaseToken = claimed.token;
+    const startedMs = pacing.now();
     await env.DB.prepare(
       "UPDATE batches SET attempts = attempts + 1 WHERE id = ? AND lease_token = ? AND status = 'running'",
     ).bind(batchId, leaseToken).run();
-    const country = await env.DB.prepare("SELECT id, name, code, enabled FROM countries WHERE id = ?")
-      .bind(batch.country_id)
-      .first<CountryRow>();
-    if (!country) throw new Error("分组不存在");
     const ids = JSON.parse(batch.target_ids) as string[];
     const targets = await loadTargets(env.DB, ids);
+    if (targets.length === 0) throw new Error("分组不存在");
+    const countries = await loadCountries(env.DB, targets.map((target) => target.country_id));
+    const countryByTarget = new Map<string, CountryRow>();
+    for (const target of targets) {
+      const found = countries.find((item) => item.id === target.country_id);
+      if (!found) throw new Error("分组不存在");
+      countryByTarget.set(target.id, found);
+    }
+    const countryFor = (targetId: string | null | undefined): CountryRow => {
+      const found = targetId ? countryByTarget.get(targetId) : undefined;
+      if (!found) throw new Error("分组不存在");
+      return found;
+    };
+    const country = countryFor(targets[0]?.id);
     const provider = getProvider(batch.source);
+    const yieldNow = () => pacing.now() - startedMs >= COORDINATOR_WALL_MS - COORDINATOR_WALL_RESERVE_MS;
     let checkpointFound = 0;
     let seenProviderFiltered = 0;
     let seenCalls = 0;
@@ -951,16 +1008,19 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       queueAttempt: (batch.defer_count ?? 0) + 1,
       resume: parseResume(batch.resume_json, batch.source),
       beforeRequest: async () => {
+        const remaining = COORDINATOR_WALL_MS - (pacing.now() - startedMs);
+        if (remaining < COORDINATOR_WALL_RESERVE_MS) throw new DeferredBatchError(1);
+        if (!(await renewLease(env, batchId, leaseToken))) throw new BatchLostError();
         beginSourceFetch(budget, reservation);
-        await paceSource(env, batch.source, settings);
+        await paceSource(env, batch.source, settings, remaining - COORDINATOR_WALL_RESERVE_MS);
       },
       onRateLimit: async (info) => {
         await recordRateEvent(env.DB, { source: batch.source, ...info });
       },
       onPage: async (page) => {
         const stored = await storeCollected(env, {
-          run, runId, batchId, leaseToken, country, targets, settings, records: page.records,
-          budget, reservation,
+          run, runId, batchId, leaseToken, country, countryFor, targets, settings, records: page.records,
+          budget, reservation, yieldNow,
         });
         if (!stored) throw new BatchLostError();
         const providerFiltered = Math.max(0, page.filtered - seenProviderFiltered);
@@ -1000,7 +1060,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           ).bind(stored.added, stored.relevanceFailures, runId).run();
         }
         checkpointFound += page.records.length;
-        if (stored.deferred) throw new SubrequestBudgetError();
+        if (stored.deferred) {
+          throw stored.deferReason === "wall" ? new DeferredBatchError(1) : new SubrequestBudgetError();
+        }
       },
     });
     const unique = dedupeRecords(result.records);
@@ -1301,14 +1363,22 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
 }
 
 async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
-  const pending = await env.DB.prepare(
-    `SELECT COUNT(*) AS pending FROM batches WHERE run_id = ? AND status IN ('queued', 'running')`,
-  ).bind(runId).first<{ pending: number }>();
-  const run = await env.DB.prepare("SELECT status FROM runs WHERE id = ?").bind(runId).first<{ status: string }>();
-  if ((pending?.pending ?? 0) === 0 && (run?.status === "running" || run?.status === "partial")) {
-    const follow = await enqueueInChunks(env.COLLECT_QUEUE, [{
-      body: { type: "finalize", runId, reason: "complete" },
-    }]);
+  const now = new Date().toISOString();
+  const claim = await env.DB.prepare(
+    `UPDATE runs SET finalize_enqueued_at = ?
+     WHERE id = ? AND finalize_enqueued_at IS NULL
+       AND status IN ('running', 'partial')
+       AND (SELECT COUNT(*) FROM batches WHERE run_id = ? AND status IN ('queued', 'running')) = 0`,
+  ).bind(now, runId, runId).run();
+  if ((claim.meta.changes ?? 0) !== 1) return;
+  const follow = await enqueueInChunks(env.COLLECT_QUEUE, [{
+    body: { type: "finalize", runId, reason: "complete" },
+  }]);
+  if (follow.error || follow.sent.length === 0) {
+    await env.DB.prepare(
+      `UPDATE runs SET finalize_enqueued_at = NULL
+       WHERE id = ? AND finalize_enqueued_at = ? AND status IN ('running', 'partial')`,
+    ).bind(runId, now).run();
     if (follow.error) logError("finalize enqueue failed", new Error(follow.error), { runId });
   }
 }
