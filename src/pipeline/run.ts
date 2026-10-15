@@ -15,10 +15,12 @@ import {
 import type { BatchResume, CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
+import { attachmentMode, recordEmailLog } from "../email/log";
 import { sendWithCloudflare } from "../email/cloudflare";
 import { sendWithResend } from "../email/resend";
 import { ATTACHMENT_LIMIT_BYTES, type OutboundEmail } from "../email/types";
 import { buildMonitorWorkbook, type ExcelRecord } from "../export/excel";
+import { runWindowDownloadPath, runWindowFilename, runWindowObjectKey } from "../export/run-file";
 import { errorMessage, log, logError, logWarn } from "../log";
 import { getProvider } from "../sources/registry";
 import { RateLimitError } from "../sources/x";
@@ -1362,7 +1364,7 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
   logError("batch failed", new Error(message), { runId, batchId });
 }
 
-async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
+export async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   const now = new Date().toISOString();
   const claim = await env.DB.prepare(
     `UPDATE runs SET finalize_enqueued_at = ?
@@ -1383,43 +1385,55 @@ async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   }
 }
 
-async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[]; truncated: boolean }> {
+const EXCEL_COLUMNS = `country_name, original_text, published_at, author_handle, author_name, author_url,
+              source, url, matched_target, matched_term, collected_at, translation_zh,
+              translation_status, translation_error, relevance_score, ai_summary`;
+
+function toExcelRecord(row: RecordRow): ExcelRecord {
+  return {
+    countryName: row.country_name,
+    originalText: row.original_text,
+    publishedAt: row.published_at ?? "",
+    authorHandle: row.author_handle,
+    authorName: row.author_name,
+    authorUrl: row.author_url,
+    source: row.source,
+    url: row.url,
+    matchedTarget: row.matched_target,
+    matchedTerm: row.matched_term,
+    collectedAt: row.collected_at,
+    translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
+    relevanceScore: row.relevance_score == null ? "" : String(row.relevance_score),
+    summaryZh: row.ai_summary ?? "",
+  };
+}
+
+async function loadExcelRecords(
+  db: D1Database,
+  whereSql: string,
+  binds: unknown[],
+): Promise<{ records: ExcelRecord[]; truncated: boolean }> {
   const newestFirst: ExcelRecord[] = [];
   let offset = 0;
   const pageSize = 1000;
   let truncated = false;
   while (newestFirst.length < MAX_EXCEL_ROWS) {
     const page = await db.prepare(
-       `SELECT country_name, original_text, published_at, author_handle, author_name, author_url,
-              source, url, matched_target, matched_term, collected_at, translation_zh,
-              translation_status, translation_error, relevance_score, ai_summary
-       FROM records WHERE ${DELIVERABLE_SQL}
+      `SELECT ${EXCEL_COLUMNS}
+       FROM records WHERE ${whereSql}
        ORDER BY published_at DESC, id DESC LIMIT ? OFFSET ?`,
-    ).bind(pageSize, offset).all<RecordRow>();
+    ).bind(...binds, pageSize, offset).all<RecordRow>();
     if (page.results.length === 0) break;
     for (const row of page.results) {
       if (newestFirst.length >= MAX_EXCEL_ROWS) break;
-      newestFirst.push({
-        countryName: row.country_name,
-        originalText: row.original_text,
-        publishedAt: row.published_at ?? "",
-        authorHandle: row.author_handle,
-        authorName: row.author_name,
-        authorUrl: row.author_url,
-        source: row.source,
-        url: row.url,
-        matchedTarget: row.matched_target,
-        matchedTerm: row.matched_term,
-        collectedAt: row.collected_at,
-        translationZh: translationCell(row.translation_zh, row.translation_status, row.translation_error),
-        relevanceScore: row.relevance_score == null ? "" : String(row.relevance_score),
-        summaryZh: row.ai_summary ?? "",
-      });
+      newestFirst.push(toExcelRecord(row));
     }
     offset += page.results.length;
     if (page.results.length < pageSize) break;
     if (newestFirst.length >= MAX_EXCEL_ROWS) {
-      const extra = await db.prepare(`SELECT id FROM records WHERE ${DELIVERABLE_SQL} LIMIT 1 OFFSET ?`).bind(MAX_EXCEL_ROWS).first();
+      const extra = await db.prepare(
+        `SELECT id FROM records WHERE ${whereSql} LIMIT 1 OFFSET ?`,
+      ).bind(...binds, MAX_EXCEL_ROWS).first();
       truncated = Boolean(extra);
     }
   }
@@ -1428,7 +1442,7 @@ async function loadExcelRecords(db: D1Database): Promise<{ records: ExcelRecord[
 
 export async function storeExcel(env: Env, settings: AppSettings): Promise<{ bytes: Uint8Array; key: string; truncated: boolean }> {
   const countries = await env.DB.prepare("SELECT name FROM countries ORDER BY name").all<{ name: string }>();
-  const loaded = await loadExcelRecords(env.DB);
+  const loaded = await loadExcelRecords(env.DB, DELIVERABLE_SQL, []);
   const bytes = buildMonitorWorkbook({
     countries: countries.results,
     records: loaded.records,
@@ -1444,38 +1458,92 @@ export async function storeExcel(env: Env, settings: AppSettings): Promise<{ byt
   return { bytes, key, truncated: loaded.truncated };
 }
 
+export async function storeRunWindowExcel(
+  env: Env,
+  settings: AppSettings,
+  run: { id: string; windowStart: string; windowEnd: string },
+): Promise<{ bytes: Uint8Array | null; key: string; filename: string; truncated: boolean; count: number }> {
+  const excelKey = settings.excelKey || env.EXCEL_FILENAME || "skyeyes.xlsx";
+  const filename = runWindowFilename(excelKey, run.windowEnd, settings.timeZone);
+  const key = runWindowObjectKey(run.id);
+  const loaded = await loadExcelRecords(
+    env.DB,
+    `run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?`,
+    [run.id, run.windowStart, run.windowEnd],
+  );
+  if (loaded.records.length === 0) {
+    return { bytes: null, key, filename, truncated: false, count: 0 };
+  }
+  const countries = await env.DB.prepare("SELECT name FROM countries ORDER BY name").all<{ name: string }>();
+  const windowEnd = new Date(run.windowEnd);
+  const bytes = buildMonitorWorkbook({
+    countries: countries.results,
+    records: loaded.records,
+    reference: Number.isNaN(windowEnd.getTime()) ? new Date() : windowEnd,
+    timeZone: settings.timeZone,
+    scheduleHour: settings.scheduleHour,
+    windowHours: settings.windowHours,
+  });
+  await env.EXPORTS.put(key, bytes, {
+    httpMetadata: { contentType: EXCEL_TYPE },
+  });
+  return { bytes, key, filename, truncated: loaded.truncated, count: loaded.records.length };
+}
+
 async function sendDigest(
   env: Env,
   settings: AppSettings,
   message: OutboundEmail,
-): Promise<{ status: string; error: string | null }> {
-  if (!settings.emailEnabled) return { status: "skipped", error: null };
+): Promise<{ status: "sent" | "skipped" | "failed"; error: string | null; messageId: string | null; recipients: string[] }> {
+  if (!settings.emailEnabled) return { status: "skipped", error: null, messageId: null, recipients: [] };
   const recipients = await env.DB.prepare(
     "SELECT email FROM recipients WHERE enabled = 1 ORDER BY email",
   ).all<{ email: string }>();
   const to = recipients.results.map((row) => row.email);
-  if (to.length === 0) return { status: "skipped", error: "没有启用的收件人" };
-  if (!settings.emailFrom) return { status: "failed", error: "未配置发件人" };
+  if (to.length === 0) return { status: "skipped", error: "没有启用的收件人", messageId: null, recipients: [] };
+  if (!settings.emailFrom) return { status: "failed", error: "未配置发件人", messageId: null, recipients: to };
   const outbound = { ...message, from: settings.emailFrom, fromName: settings.emailFromName, to };
   try {
-    if (settings.emailProvider === "cloudflare") {
-      await sendWithCloudflare(env.EMAIL, outbound);
-    } else {
-      if (!env.RESEND_API_KEY) return { status: "failed", error: "未配置 RESEND_API_KEY" };
-      await sendWithResend(env.RESEND_API_KEY, outbound);
-    }
-    return { status: "sent", error: null };
+    const result = settings.emailProvider === "cloudflare"
+      ? await sendWithCloudflare(env.EMAIL, outbound)
+      : env.RESEND_API_KEY
+        ? await sendWithResend(env.RESEND_API_KEY, outbound)
+        : null;
+    if (!result) return { status: "failed", error: "未配置 RESEND_API_KEY", messageId: null, recipients: to };
+    return { status: "sent", error: null, messageId: result.id || null, recipients: to };
   } catch (error) {
     logError("email failed", error);
-    return { status: "failed", error: errorMessage(error).slice(0, 500) };
+    return { status: "failed", error: errorMessage(error).slice(0, 500), messageId: null, recipients: to };
   }
+}
+
+async function claimDailyEmail(env: Env, runId: string, claimedAt: string): Promise<boolean> {
+  const claim = await env.DB.prepare(
+    `UPDATE runs SET email_sent_at = ?
+     WHERE id = ? AND email_sent_at IS NULL AND COALESCE(email_status, '') != 'sent'`,
+  ).bind(claimedAt, runId).run();
+  return (claim.meta.changes ?? 0) === 1;
+}
+
+async function releaseDailyEmailClaim(env: Env, runId: string, claimedAt: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE runs SET email_sent_at = NULL
+     WHERE id = ? AND email_sent_at = ? AND COALESCE(email_status, '') != 'sent'`,
+  ).bind(runId, claimedAt).run();
 }
 
 export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline"): Promise<void> {
   const claim = await env.DB.prepare(
-    "UPDATE runs SET status = 'finalizing' WHERE id = ? AND status IN ('running', 'partial')",
+    `UPDATE runs SET status = 'finalizing'
+     WHERE id = ? AND (
+       status IN ('running', 'partial')
+       OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+     )`,
   ).bind(runId).run();
   if ((claim.meta.changes ?? 0) === 0) return;
+  await env.DB.prepare(
+    "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
+  ).bind(new Date().toISOString(), runId).run();
 
   const settings = await loadSettings(env.DB);
   const run = await env.DB.prepare(
@@ -1492,13 +1560,24 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   const failed = counts?.failed ?? 0;
   const pending = counts?.pending ?? 0;
   const incomplete = reason === "deadline" || failed > 0 || pending > 0;
-  let notes = [run.notes, incomplete ? "有批次未完成，已发送目前收集到的内容。" : ""].filter(Boolean).join(" ");
+  let notes = run.notes ?? "";
+  if (incomplete && !notes.includes("有批次未完成，已发送目前收集到的内容。")) {
+    notes = [notes, "有批次未完成，已发送目前收集到的内容。"].filter(Boolean).join(" ");
+  }
   let emailStatus = "skipped";
   let emailError: string | null = null;
+  let emailTouched = false;
+  let claimedAt: string | null = null;
 
   try {
     const stored = await storeExcel(env, settings);
     if (stored.truncated) notes = [notes, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`].filter(Boolean).join(" ");
+    const windowFile = await storeRunWindowExcel(env, settings, {
+      id: runId,
+      windowStart: run.window_start,
+      windowEnd: run.window_end,
+    });
+    if (windowFile.truncated) notes = [notes, `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。`].filter(Boolean).join(" ");
     const grouped = await env.DB.prepare(
       `SELECT country_name, source, COUNT(*) AS n
        FROM records
@@ -1512,8 +1591,12 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       current.bySource[row.source] = row.n;
       byCountry.set(row.country_name, current);
     }
-    const downloadUrl = settings.appBaseUrl ? `${settings.appBaseUrl}/api/export/excel` : null;
-    const attached = stored.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES;
+    const downloadUrl = windowFile.bytes && settings.appBaseUrl
+      ? `${settings.appBaseUrl}${runWindowDownloadPath(runId)}`
+      : null;
+    const attached = Boolean(windowFile.bytes && windowFile.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
+    const mode = attachmentMode(attached, downloadUrl);
+    const attachmentBytes = windowFile.bytes?.byteLength ?? 0;
     const digest = buildDigest({
       incomplete,
       windowStart: run.window_start,
@@ -1525,39 +1608,106 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       attached,
       notes,
     });
-    const sent = await sendDigest(env, settings, {
-      from: settings.emailFrom,
-      fromName: settings.emailFromName,
-      to: [],
-      subject: digest.subject,
-      text: digest.text,
-      html: digest.html,
-      attachment: attached
-        ? { filename: stored.key.split("/").pop() || "skyeyes.xlsx", content: stored.bytes, contentType: EXCEL_TYPE }
-        : undefined,
-    });
-    emailStatus = sent.status;
-    emailError = sent.error;
+    const alreadySent = await env.DB.prepare(
+      "SELECT email_sent_at, email_status FROM runs WHERE id = ?",
+    ).bind(runId).first<{ email_sent_at: string | null; email_status: string | null }>();
+    const sentAlready = Boolean(alreadySent?.email_sent_at) || alreadySent?.email_status === "sent";
+    if (!sentAlready && settings.emailEnabled) {
+      claimedAt = new Date().toISOString();
+      const claimed = await claimDailyEmail(env, runId, claimedAt);
+      if (!claimed) {
+        claimedAt = null;
+      } else {
+        emailTouched = true;
+        const sent = await sendDigest(env, settings, {
+          from: settings.emailFrom,
+          fromName: settings.emailFromName,
+          to: [],
+          subject: digest.subject,
+          text: digest.text,
+          html: digest.html,
+          attachment: attached && windowFile.bytes
+            ? { filename: windowFile.filename, content: windowFile.bytes, contentType: EXCEL_TYPE }
+            : undefined,
+        });
+        if (sent.status === "sent") {
+          emailStatus = "sent";
+          emailError = null;
+          await recordEmailLog(env.DB, {
+            runId,
+            kind: "daily",
+            recipients: sent.recipients,
+            subject: digest.subject,
+            status: "sent",
+            error: null,
+            messageId: sent.messageId,
+            attachmentMode: mode,
+            attachmentBytes,
+          });
+        } else if (sent.status === "failed") {
+          await releaseDailyEmailClaim(env, runId, claimedAt);
+          claimedAt = null;
+          emailStatus = "failed";
+          emailError = sent.error;
+          await recordEmailLog(env.DB, {
+            runId,
+            kind: "daily",
+            recipients: sent.recipients,
+            subject: digest.subject,
+            status: "failed",
+            error: sent.error,
+            messageId: null,
+            attachmentMode: mode,
+            attachmentBytes,
+          });
+        } else {
+          await releaseDailyEmailClaim(env, runId, claimedAt);
+          claimedAt = null;
+          emailStatus = "skipped";
+          emailError = sent.error;
+        }
+      }
+    } else if (!sentAlready) {
+      emailTouched = true;
+      emailStatus = "skipped";
+    }
   } catch (error) {
     logError("finalize failed", error, { runId });
+    if (claimedAt) await releaseDailyEmailClaim(env, runId, claimedAt);
+    claimedAt = null;
+    emailTouched = true;
     emailStatus = "failed";
     emailError = errorMessage(error).slice(0, 500);
     notes = [notes, "收尾时生成 Excel 或发送邮件失败。"].filter(Boolean).join(" ");
+    await recordEmailLog(env.DB, {
+      runId,
+      kind: "daily",
+      recipients: [],
+      subject: "SkyEyes 每日监测",
+      status: "failed",
+      error: emailError,
+      messageId: null,
+      attachmentMode: "none",
+      attachmentBytes: 0,
+    });
   }
 
   await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?,
-         email_status = ?, email_error = ?, notes = ?
+     SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?,
+         email_status = CASE WHEN ? = 1 THEN ? ELSE email_status END,
+         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END
      WHERE id = ?`,
   ).bind(
     incomplete || emailStatus === "failed" ? "incomplete" : "completed",
     new Date().toISOString(),
     counts?.done ?? 0,
     failed,
-    emailStatus,
-    emailError,
     notes || null,
+    emailTouched ? 1 : 0,
+    emailStatus,
+    emailTouched ? 1 : 0,
+    emailError,
     runId,
   ).run();
   log("run finalized", { runId, reason, incomplete, emailStatus });
@@ -1597,7 +1747,11 @@ export async function handleDeadLetter(env: Env, message: CollectMessage): Promi
 
 export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
   const rows = await env.DB.prepare(
-    "SELECT id FROM runs WHERE status IN ('running', 'partial') AND deadline_at <= ?",
+    `SELECT id FROM runs
+     WHERE deadline_at <= ? AND (
+       status IN ('running', 'partial')
+       OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+     )`,
   ).bind(now.toISOString()).all<{ id: string }>();
   for (const row of rows.results) {
     await finalizeRun(env, row.id, "deadline");

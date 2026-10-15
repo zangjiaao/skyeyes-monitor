@@ -10,10 +10,24 @@ interface SentMail {
   attachments?: Array<{ filename: string; content: string }>;
 }
 
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const WINDOW_END = "2026-10-13T02:00:00.000Z";
+
+interface HarnessRun {
+  id: string;
+  window_start: string;
+  window_end: string;
+  finished_at: string | null;
+  status: string;
+}
+
 function createHarness(options: {
   settings?: Record<string, string>;
   recipients?: string[];
   file?: Uint8Array | null;
+  cumulative?: Uint8Array | null;
+  runs?: HarnessRun[];
+  records?: Array<Record<string, unknown>>;
   putError?: string;
   resendKey?: string | null;
   resendStatus?: number;
@@ -30,14 +44,22 @@ function createHarness(options: {
   ]);
   for (const [key, value] of Object.entries(options.settings ?? {})) settings.set(key, value);
   const recipients = options.recipients ?? ["a@example.com", "b@example.com"];
+  const runs = options.runs ?? [{
+    id: RUN_ID,
+    window_start: "2026-10-12T02:00:00.000Z",
+    window_end: WINDOW_END,
+    finished_at: "2026-10-13T02:05:00.000Z",
+    status: "completed",
+  }];
   const files = new Map<string, Uint8Array>();
-  if (options.file) files.set(settings.get("excel_key") || "skyeyes.xlsx", options.file);
+  if (options.file && runs[0]) files.set(`runs/${runs[0].id}.xlsx`, options.file);
+  if (options.cumulative) files.set(settings.get("excel_key") || "skyeyes.xlsx", options.cumulative);
   const sent: SentMail[] = [];
   const cloudflareSent: Array<{ to: string[]; subject: string; text: string; attachments?: unknown[] }> = [];
   const record = {
     country_name: "示例国家甲",
     original_text: "一条记录",
-    published_at: "2026-10-13T02:00:00.000Z",
+    published_at: "2026-10-13T01:00:00.000Z",
     author_handle: "someone",
     author_name: "某人",
     author_url: "https://x.com/someone",
@@ -52,6 +74,7 @@ function createHarness(options: {
     relevance_score: 80,
     ai_summary: "摘要",
   };
+  const recordRows = options.records ?? [record];
   const execute = (sql: string, binds: unknown[]) => {
     if (sql.includes("FROM settings")) {
       const results = [...settings.entries()].map(([key, value]) => ({ key, value }));
@@ -64,8 +87,15 @@ function createHarness(options: {
     if (sql.includes("FROM countries")) {
       return { results: [{ name: "示例国家甲" }], first: { name: "示例国家甲" } };
     }
+    if (sql.includes("FROM runs")) {
+      const id = binds.find((value) => typeof value === "string" && runs.some((run) => run.id === value));
+      const matched = typeof id === "string"
+        ? runs.filter((run) => run.id === id)
+        : runs.filter((run) => run.finished_at && (run.status === "completed" || run.status === "incomplete"));
+      return { results: matched, first: matched[0] ?? null };
+    }
     if (sql.includes("FROM records")) {
-      let matched = [record];
+      let matched = recordRows;
       if (sql.includes("LIMIT") && binds.length >= 2) {
         const limit = Number(binds[binds.length - 2]);
         const offset = Number(binds[binds.length - 1]);
@@ -97,7 +127,10 @@ function createHarness(options: {
         const bytes = files.get(key);
         if (!bytes) return null;
         const copy = new Uint8Array(bytes);
-        return { arrayBuffer: async () => copy.buffer };
+        return {
+          body: copy,
+          arrayBuffer: async () => copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength),
+        };
       },
       async put(key: string, value: Uint8Array) {
         if (options.putError) throw new Error(options.putError);
@@ -183,10 +216,24 @@ describe("测试邮件", () => {
       subject: "SkyEyes 测试邮件",
     });
     expect(harness.sent[0]?.text).toContain("每日邮件可以保持关闭");
-    expect(harness.sent[0]?.text).toContain("完整内容在附件 Excel 里。");
+    expect(harness.sent[0]?.text).toContain("最近一次运行的新增在附件 Excel 里。");
     expect(harness.sent[0]?.text).not.toContain("本轮条目");
-    expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes.xlsx");
+    expect(harness.sent[0]?.text).not.toContain("一条记录");
+    expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes-2026-10-13.xlsx");
     expect(harness.sent[0]?.attachments?.[0]?.content).toBeTruthy();
+  });
+
+  it("测试信不把累计 Excel 当作附件", async () => {
+    const harness = createHarness({
+      file: new Uint8Array([1, 2, 3, 4]),
+      cumulative: new Uint8Array([9, 9, 9]),
+    });
+    const result = await postTest(harness, {});
+    expect(result.payload.attached).toBe(true);
+    expect(harness.files.get("skyeyes.xlsx")).toEqual(new Uint8Array([9, 9, 9]));
+    expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes-2026-10-13.xlsx");
+    expect(harness.sent[0]?.attachments?.[0]?.content).toBe(Buffer.from([1, 2, 3, 4]).toString("base64"));
+    expect(harness.sent[0]?.attachments?.[0]?.content).not.toBe(Buffer.from([9, 9, 9]).toString("base64"));
   });
 
   it("可以只发给对话框里的一个地址，不必已在收件人列表", async () => {
@@ -197,16 +244,35 @@ describe("测试邮件", () => {
     expect(harness.sent[0]?.to).toEqual(["other@example.com"]);
   });
 
-  it("没有 Excel 时先生成再附上", async () => {
+  it("没有本轮文件时按最近一次运行的窗口生成再附上", async () => {
     const harness = createHarness({ file: null });
     const result = await postTest(harness);
     expect(result.status).toBe(200);
     expect(result.payload).toMatchObject({ ok: true, attached: true, generated: true, excelError: null });
-    expect(harness.files.get("skyeyes.xlsx")?.byteLength).toBeGreaterThan(0);
-    expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes.xlsx");
+    expect(harness.files.has("skyeyes.xlsx")).toBe(false);
+    expect(harness.files.get(`runs/${RUN_ID}.xlsx`)?.byteLength).toBeGreaterThan(0);
+    expect(harness.sent[0]?.attachments?.[0]?.filename).toBe("skyeyes-2026-10-13.xlsx");
+    expect(harness.sent[0]?.text).toContain("最近一次运行的新增在附件 Excel 里。");
     expect(harness.sent[0]?.text).not.toContain("一条记录");
     expect(harness.sent[0]?.text).not.toContain("译文");
     expect(harness.sent[0]?.text).not.toContain("摘要");
+  });
+
+  it("最近一次运行没有新增时只说明，不附空表", async () => {
+    const harness = createHarness({ file: null, records: [] });
+    const result = await postTest(harness, {});
+    expect(result.status).toBe(200);
+    expect(result.payload).toMatchObject({ ok: true, attached: false, generated: false, excelError: null });
+    expect(harness.files.has(`runs/${RUN_ID}.xlsx`)).toBe(false);
+    expect(harness.sent[0]?.attachments).toBeUndefined();
+    expect(harness.sent[0]?.text).toContain("最近一次运行的时间窗口内没有新增，因此没有附件。");
+  });
+
+  it("还没有完成的运行时说明没有新增附件", async () => {
+    const harness = createHarness({ file: null, runs: [] });
+    const result = await postTest(harness, {});
+    expect(result.payload).toMatchObject({ ok: true, attached: false, generated: false, excelError: null });
+    expect(harness.sent[0]?.text).toContain("还没有已完成的运行，因此没有新增附件。");
   });
 
   it("生成失败时仍发出不带附件的测试信，并带回原因", async () => {
@@ -224,19 +290,52 @@ describe("测试邮件", () => {
     expect(result.status).toBe(200);
     expect(result.payload).toMatchObject({ ok: true, attached: false, generated: false, excelError: null });
     expect(harness.sent[0]?.attachments).toBeUndefined();
-    expect(harness.sent[0]?.text).toContain("完整内容请下载: https://sky.example.com/api/export/excel");
+    expect(harness.sent[0]?.text).toContain(
+      `本轮新增请下载: https://sky.example.com/api/export/excel?run=${RUN_ID}`,
+    );
     expect(harness.sent[0]?.text).not.toContain("本轮条目");
+    expect(harness.sent[0]?.text).not.toContain("skyeyes.xlsx");
   });
 
-  it("没有站点地址时说明文件仍在 R2", async () => {
+  it("没有站点地址时请用户到配置页填写站点地址", async () => {
     const harness = createHarness({
       file: new Uint8Array(ATTACHMENT_LIMIT_BYTES + 1),
       settings: { app_base_url: "" },
     });
     const result = await postTest(harness, {});
     expect(result.payload.attached).toBe(false);
-    expect(harness.sent[0]?.text).toContain("未配置站点地址");
+    expect(harness.sent[0]?.text).toContain("请打开配置页，填写「站点地址」并保存");
+    expect(harness.sent[0]?.text).toContain("文件仍在 R2");
     expect(harness.sent[0]?.text).not.toContain("/api/export/excel");
+  });
+
+  it("管理页下载仍是累计文件，邮件链接下载这一轮的新增", async () => {
+    const harness = createHarness({
+      file: new Uint8Array([1, 2, 3, 4]),
+      cumulative: new Uint8Array([9, 9, 9]),
+    });
+    const cumulative = await harness.app.request("/api/export/excel", { method: "GET" }, harness.env, harness.ctx);
+    expect(cumulative.status).toBe(200);
+    expect(cumulative.headers.get("Content-Disposition")).toContain('filename="skyeyes.xlsx"');
+    expect(new Uint8Array(await cumulative.arrayBuffer())).toEqual(new Uint8Array([9, 9, 9]));
+
+    const runFile = await harness.app.request(
+      `/api/export/excel?run=${RUN_ID}`,
+      { method: "GET" },
+      harness.env,
+      harness.ctx,
+    );
+    expect(runFile.status).toBe(200);
+    expect(runFile.headers.get("Content-Disposition")).toContain('filename="skyeyes-2026-10-13.xlsx"');
+    expect(new Uint8Array(await runFile.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3, 4]));
+
+    const missing = await harness.app.request(
+      "/api/export/excel?run=22222222-2222-4222-8222-222222222222",
+      { method: "GET" },
+      harness.env,
+      harness.ctx,
+    );
+    expect(missing.status).toBe(404);
   });
 
   it("邮箱格式不对、没有收件人、发件人为空、缺少密钥都会返回原文", async () => {
