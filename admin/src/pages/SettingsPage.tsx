@@ -35,6 +35,7 @@ const FIELDS = [
   ["queue_concurrency", "同时采集的批次数，1 到 8。X、GDELT、Google News 各有自己的时间槽，可以并行"],
   ["gdelt_min_interval_sec", "GDELT 最小间隔秒数，默认 6。文档接口大约每 5 秒 1 次，多个批次共用这个时间槽"],
   ["google_news_min_interval_sec", "Google News 最小间隔秒数，默认 1。0 表示不额外限速"],
+  ["subrequest_budget", "单次子请求预算，默认 40，范围 6–45。免费版每次调用最多 50 次外部子请求，用尽后本批次会暂停并稍后继续"],
   ["excel_key", "R2 中的 Excel 文件名"],
   ["min_text_length", "最短正文长度，0 表示不限制"],
   ["min_followers", "X 最少粉丝数，0 表示不限制；没有粉丝数时不因此排除"],

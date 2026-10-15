@@ -198,11 +198,12 @@ export const xProvider: SourceProvider = {
         const hasNext = payload?.has_next_page === true;
         const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
         const finishedTerm = !hasNext || !next || next === cursor;
+        const repeatResume = { source: "x" as const, step: stepIndex, page: pageIndex, cursor };
         const nextResume = finishedTerm
           ? { source: "x" as const, step: stepIndex + 1, page: 0, cursor: "" }
           : { source: "x" as const, step: stepIndex, page: pageIndex + 1, cursor: next };
         if (request.onPage) {
-          await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
+          await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
         } else {
           records.push(...pageRecords);
         }

@@ -185,6 +185,9 @@ interface RecordState {
   url: string;
   matched_term: string;
   original_text: string;
+  url_key: string;
+  title_key: string;
+  published_at: string | null;
 }
 
 interface Wake {
@@ -193,10 +196,13 @@ interface Wake {
 }
 
 function createMemory(options: {
-  source: "x" | "gdelt";
+  source: "x" | "gdelt" | "google_news";
   settings?: Record<string, string>;
   batch?: Partial<BatchState>;
+  terms?: string;
+  deepseekKey?: string;
 }) {
+  const terms = options.terms ?? "alpha signal\nbeta signal";
   const settings = new Map(Object.entries({
     ai_enabled: "0",
     translation_enabled: "0",
@@ -291,7 +297,7 @@ function createMemory(options: {
         kind: "keyword",
         name: "信号",
         query: "alpha signal",
-        terms: "alpha signal\nbeta signal",
+        terms,
         exclude_terms: "",
         case_sensitive: 0,
         enabled: 1,
@@ -302,12 +308,22 @@ function createMemory(options: {
         kind: "keyword",
         name: "信号",
         query: "alpha signal",
-        terms: "alpha signal\nbeta signal",
+        terms,
         exclude_terms: "",
         case_sensitive: 0,
         enabled: 1,
         description: "",
       }]);
+    }
+    if (sql.includes("FROM records") && sql.includes("url_key")) {
+      const urlKey = String(binds[0] ?? "");
+      const titleKey = String(binds[1] ?? "");
+      const matched = records.filter((row) => (urlKey && row.url_key === urlKey) || (titleKey && row.title_key === titleKey));
+      return result(matched[0] ?? null, 0, matched.map((row) => ({
+        url_key: row.url_key,
+        title_key: row.title_key,
+        published_at: row.published_at,
+      })));
     }
     if (sql.includes("FROM records")) return result(null, 0, []);
     if (sql.includes("INSERT OR IGNORE INTO rate_slots")) {
@@ -367,6 +383,13 @@ function createMemory(options: {
       }
       return result(null, 0, []);
     }
+    if (sql.includes("SET lease_expires_at = ?") && sql.includes("status = 'running'")) {
+      if (batch.id === binds[1] && batch.lease_token === binds[2] && batch.status === "running") {
+        batch.lease_expires_at = String(binds[0]);
+        return result(null, 1);
+      }
+      return result(null, 0, []);
+    }
     if (sql.includes("SET resume_json")) {
       if (batch.id !== binds[7] || batch.lease_token !== binds[8] || batch.status !== "running") {
         return result(null, 0, []);
@@ -409,6 +432,9 @@ function createMemory(options: {
         url: String(binds[4]),
         matched_term: String(binds[9]),
         original_text: String(binds[13]),
+        title_key: String(binds[27] ?? ""),
+        url_key: String(binds[29] ?? ""),
+        published_at: binds[14] == null ? null : String(binds[14]),
       });
       return result(null, 1);
     }
@@ -485,6 +511,12 @@ function createMemory(options: {
     ENVIRONMENT: "development",
     EXCEL_FILENAME: "skyeyes.xlsx",
     TWITTERAPI_IO_KEY: "test-key",
+    DEEPSEEK_API_KEY: options.deepseekKey ?? "",
+    AI: {
+      async run() {
+        return { translated_text: "中文译文已经足够长。", response: "80" };
+      },
+    },
     DB: db,
     COLLECT_QUEUE: {
       async send(body: Wake["body"], options?: { delaySeconds?: number }) {
@@ -652,5 +684,196 @@ describe("推迟不消耗队列重试", () => {
     await handleDeadLetter(bare.env, { type: "batch", runId: "run-1", batchId: "batch-1" });
     expect(bare.batch.status).toBe("failed");
     expect(bare.batch.error).toBe("超过队列重试次数");
+  });
+});
+
+describe("子请求预算", () => {
+  it("Google News 在预算用尽前写入 resume_json，并用延迟消息继续，不走 retry", async () => {
+    let clock = Date.parse("2026-10-14T03:00:00.000Z");
+    Date.now = () => clock;
+    const fetches: string[] = [];
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      const term = url.searchParams.get("q")?.match(/"([^"]+)"/)?.[1] ?? "term";
+      const edition = url.searchParams.get("hl") ?? "edition";
+      fetches.push(`${edition}|${term}`);
+      const xml = `<?xml version="1.0"?><rss><channel><item>
+        <title>${term} ${edition} bulletin covers a distinct corridor today</title>
+        <link>https://news.example/${edition}/${term}</link>
+        <pubDate>Tue, 13 Oct 2026 12:00:00 GMT</pubDate>
+        <description>${term} ${edition} bulletin covers a distinct corridor today</description>
+      </item></channel></rss>`;
+      return new Response(xml);
+    };
+    const terms = ["signal0", "signal1", "signal2", "signal3", "signal4"].join("\n");
+    const memory = createMemory({
+      source: "google_news",
+      terms,
+      settings: {
+        subrequest_budget: "8",
+        google_news_min_interval_sec: "0",
+        google_news_editions: "en-US,zh-CN",
+      },
+    });
+    const first = await memory.deliver();
+    expect(first).toBe("ack");
+    expect(memory.retries).toHaveLength(0);
+    expect(fetches).toHaveLength(8);
+    expect(memory.batch.attempts).toBe(0);
+    expect(memory.batch.status).toBe("queued");
+    expect(memory.batch.defer_count).toBe(1);
+    expect(JSON.parse(memory.batch.resume_json ?? "{}")).toMatchObject({ source: "google_news", step: 8 });
+    expect(memory.wakes).toHaveLength(1);
+    expect(memory.wakes[0]?.delaySeconds).toBe(1);
+    expect(memory.wakes[0]?.body).toEqual({ type: "batch", runId: "run-1", batchId: "batch-1" });
+
+    let steps = 0;
+    while (memory.batch.status !== "done" && steps < 6) {
+      const wake = memory.wakes.shift();
+      expect(wake?.body.type).toBe("batch");
+      clock += (wake?.delaySeconds ?? 0) * 1000;
+      const outcome = await memory.deliver(wake?.body);
+      expect(outcome).toBe("ack");
+      steps += 1;
+    }
+    expect(memory.batch.status).toBe("done");
+    expect(memory.retries).toHaveLength(0);
+    expect(fetches).toHaveLength(10);
+    expect(memory.batch.attempts).toBe(1);
+    expect(memory.batch.resume_json).toBeNull();
+    expect(memory.records.length).toBeGreaterThan(0);
+  });
+
+  it("同一页的翻译超出预算时先入库已完成的条目，下次重抓这一页并补上剩下的", async () => {
+    let clock = Date.parse("2026-10-14T03:00:00.000Z");
+    Date.now = () => clock;
+    let rss = 0;
+    let deepseek = 0;
+    const titles = [
+      "alpha signal bulletin covers the northern corridor in full today",
+      "alpha signal leaders gathered for a separate southern meeting",
+      "alpha signal statement arrived after the evening briefing ended",
+      "alpha signal attack reported near the mountain checkpoint overnight",
+    ];
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("api.deepseek.com")) {
+        deepseek += 1;
+        return Response.json({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                relevant: true,
+                score: 80,
+                reason: "相关",
+                source_lang: "en",
+                translation_zh: "武装组织宣布在北部地区发动新的袭击。",
+                summary_zh: "宣布袭击",
+                event_type: "attack",
+                people: [],
+                places: [],
+              }),
+            },
+          }],
+        });
+      }
+      rss += 1;
+      const items = titles.map((title, index) => `<item>
+        <title>${title}</title>
+        <link>https://news.example/story-${index}</link>
+        <pubDate>Tue, 13 Oct 2026 12:00:00 GMT</pubDate>
+        <description>${title}</description>
+      </item>`).join("");
+      return new Response(`<?xml version="1.0"?><rss><channel>${items}</channel></rss>`);
+    };
+    const memory = createMemory({
+      source: "google_news",
+      terms: "alpha signal",
+      deepseekKey: "test-key",
+      settings: {
+        subrequest_budget: "8",
+        google_news_min_interval_sec: "0",
+        google_news_editions: "en-US",
+        ai_enabled: "1",
+        ai_provider: "deepseek",
+        translation_enabled: "1",
+        relevance_enabled: "1",
+      },
+    });
+    const first = await memory.deliver();
+    expect(first).toBe("ack");
+    expect(memory.retries).toHaveLength(0);
+    expect(rss).toBe(1);
+    expect(deepseek).toBe(3);
+    expect(memory.records).toHaveLength(3);
+    expect(memory.batch.attempts).toBe(0);
+    expect(JSON.parse(memory.batch.resume_json ?? "{}")).toMatchObject({ source: "google_news", step: 0 });
+    expect(memory.wakes[0]?.delaySeconds).toBe(1);
+
+    const wake = memory.wakes.shift();
+    clock += (wake?.delaySeconds ?? 0) * 1000;
+    const second = await memory.deliver(wake?.body);
+    expect(second).toBe("ack");
+    expect(memory.retries).toHaveLength(0);
+    expect(memory.batch.status).toBe("done");
+    expect(rss).toBe(2);
+    expect(deepseek).toBe(4);
+    expect(memory.records).toHaveLength(4);
+    expect(memory.batch.attempts).toBe(1);
+  });
+
+  it("X 翻页同样受预算限制，并从上次的页码和 cursor 继续", async () => {
+    let clock = Date.parse("2026-10-14T03:00:00.000Z");
+    Date.now = () => clock;
+    const fetches: string[] = [];
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      const query = url.searchParams.get("query") ?? "";
+      const cursor = url.searchParams.get("cursor") ?? "";
+      fetches.push(`${query}|${cursor}`);
+      const term = query.includes("beta signal") ? "beta" : "alpha";
+      const page = cursor ? Number(cursor.slice(1)) : 1;
+      return Response.json({
+        tweets: [{
+          id: `${term}-${page}`,
+          text: `${term} signal coverage continues across the monitored region today ${page}`,
+          url: `https://x.com/a/status/${term}-${page}`,
+          createdAt: "Tue Oct 13 12:00:00 +0000 2026",
+          author: { userName: "reporter", name: "Reporter" },
+        }],
+        has_next_page: page < 5,
+        next_cursor: page < 5 ? `p${page + 1}` : "",
+      });
+    };
+    const memory = createMemory({
+      source: "x",
+      settings: { subrequest_budget: "8", x_qps: "20", x_max_pages: "5" },
+    });
+    const first = await memory.deliver();
+    expect(first).toBe("ack");
+    expect(memory.retries).toHaveLength(0);
+    expect(fetches).toHaveLength(8);
+    expect(memory.batch.attempts).toBe(0);
+    expect(JSON.parse(memory.batch.resume_json ?? "{}")).toMatchObject({
+      source: "x",
+      step: 1,
+      page: 3,
+      cursor: "p4",
+    });
+    expect(memory.wakes[0]?.delaySeconds).toBe(1);
+
+    let steps = 0;
+    while (memory.batch.status !== "done" && steps < 6) {
+      const wake = memory.wakes.shift();
+      clock += (wake?.delaySeconds ?? 0) * 1000;
+      const outcome = await memory.deliver(wake?.body);
+      expect(outcome).toBe("ack");
+      steps += 1;
+    }
+    expect(memory.batch.status).toBe("done");
+    expect(memory.retries).toHaveLength(0);
+    expect(fetches).toHaveLength(10);
+    expect(memory.records).toHaveLength(10);
+    expect(memory.batch.attempts).toBe(1);
   });
 });

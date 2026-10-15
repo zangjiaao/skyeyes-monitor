@@ -73,7 +73,7 @@ npx wrangler queues create skyeyes-collect-dlq
 
 Cloudflare Queues 的 `sendBatch` 一次最多 **100 条**，请求体最多 **256KB**。采集入队会按这个上限拆开，失败的分片会隔 0.2 秒、0.5 秒、1 秒重试。一次运行如果有成百上千个批次，当前请求只发送第一页，再丢一条很小的后续消息去发送下一页，避免单次请求把 Worker 的子请求打满。唤醒消息不再按批次序号各延迟最多 15 分钟。X、GDELT、Google News 各有自己的 D1 时间槽，可以并行，但同一个来源不会挤在一起打。槽位还要等超过 2 秒时，当前消息会被确认，再另发一条带 `delaySeconds` 的新唤醒，不调用 `message.retry()`，因此不占用队列的 5 次重试。`wrangler.jsonc` 里消费者 `max_concurrency` 是 8。如果本地 `wrangler.local.jsonc` 仍把它留在 1，`wrangler dev` 会一次只跑一个批次，改成 8 才和线上一致。配置项 `queue_concurrency` 默认 4，范围 1–8，限制同时处于 `running` 的批次数。
 
-每个批次有 `enqueued_at`：写入队列成功才填上。领取时写入 `lease_token` 和 `lease_expires_at`（10 分钟），并清掉 `next_wake_at`。开始采集时 `attempts` 加一；因为时间槽、并发上限或 429 而推迟时，这次不计入 `attempts`。推迟次数和累计等待记在 `defer_count`、`defer_wait_sec`，上限是 2000 次或 6 小时，超过才标为「等待过久」。缺密钥、解析失败，以及其他 4xx/5xx，才 `message.retry()`，重试耗尽后进死信。已经抓到的页会马上入库，进度（来源、检索词序号、页码、cursor）写在 `resume_json`，下次唤醒从这里继续，不从头再抓。某一页入队失败时，只有这一页标为失败，运行记成「部分失败」或「失败」，说明是「未入队：…」。迁移是 `0011_batch_enqueue.sql`、`0014_batch_lease.sql` 和 `0015_batch_defer.sql`。
+每个批次有 `enqueued_at`：写入队列成功才填上。领取时写入 `lease_token` 和 `lease_expires_at`（10 分钟），并清掉 `next_wake_at`。开始采集时 `attempts` 加一；因为时间槽、并发上限或 429 而推迟时，这次不计入 `attempts`。推迟次数和累计等待记在 `defer_count`、`defer_wait_sec`，上限是 2000 次或 6 小时，超过才标为「等待过久」。缺密钥、解析失败，以及其他 4xx/5xx，才 `message.retry()`，重试耗尽后进死信。已经抓到的页会马上入库，进度（来源、检索词序号、页码、cursor）写在 `resume_json`，下次唤醒从这里继续，不从头再抓。免费版每次调用最多 50 次外部子请求。`subrequest_budget` 默认 40，Google News、GDELT、X 的每次抓取，以及 DeepSeek 和 Workers AI 的翻译、相关度评分都计入。快到预算时进度仍写入 `resume_json`，再用 `delaySeconds` 重新入队，不调用 `message.retry()`。D1、R2、Queue 绑定走另一档 1000 次 Cloudflare 服务子请求，不占这 50 次。某一页入队失败时，只有这一页标为失败，运行记成「部分失败」或「失败」，说明是「未入队：…」。迁移是 `0011_batch_enqueue.sql`、`0014_batch_lease.sql` 和 `0015_batch_defer.sql`。
 
 整点 Cron、手动运行开始前，都会收回租约已过期的 `running` 批次，并重发超过 15 分钟仍没有进展的唤醒。已经排期、`next_wake_at` 还在未来的批次，定时收回不会提前重发。状态页的恢复会立刻重发，包括这些还没到点的唤醒，用来捡回 `wrangler dev` 重启后丢掉的延迟消息。同一运行上的重复唤醒由条件更新吃掉。`attempts` 达到 5 次就标为失败，原因是「超过重试次数」。这 5 次只计真正开始采集后的失败，不计让槽和 429。
 
@@ -246,6 +246,7 @@ PR 上只跑 `npm run typecheck`、`npm test`、`npm run build`，不会部署�
 | `x_qps` | 0.2 | twitterapi.io 每秒请求数。未付费账号保持 0.2；充值后可改为 10，上限 20。改完立即生效。每一次 X 请求（含翻页）都受它限制。 |
 | `gdelt_min_interval_sec` | 6 | GDELT 两次请求之间的最短间隔，1–300 秒。默认大约每 6 秒 1 次。 |
 | `google_news_min_interval_sec` | 1 | Google News 两次请求之间的最短间隔，0–60 秒。0 表示不再额外限速。 |
+| `subrequest_budget` | 40 | 一次队列调用里，来源抓取和翻译/评分一共最多用多少次子请求。范围 6–45。免费版外部 `fetch` 上限是 50，重定向的每一跳也算，所以默认留出余量。到预算就写入进度并用延迟消息继续，不占用队列的 5 次重试。 |
 | `x_max_pages` | 5 | 每条检索词在 X 上最多翻多少页。同一目标的每条词各自拥有这个额度。推迟后续跑时从上次的页码和 cursor 继续。 |
 | `google_news_editions` | en-US,zh-CN | Google News 版本，逗号或换行分隔。每个版本单独查询。`ar` 表示沙特阿拉伯语版。 |
 | `translation_fallback_model` | @cf/zai-org/glm-4.7-flash | Workers AI 对话模型。只有 DeepSeek 和 m2m100 都没有译成中文时才调用。可在配置页修改。`@cf/google/gemma-3-12b-it` 已于 2026-05-30 停用，保存时会拒绝。没有新迁移，没保存过这项的库用这个默认值。 |

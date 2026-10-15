@@ -61,7 +61,10 @@ export interface BatchResume {
 
 export interface PageCheckpoint {
   records: CollectedRecord[];
+  /** 这一页全部入库后，下次从这里继续。 */
   resume: BatchResume;
+  /** 这一页还有没解读完的条目时，下次重抓这一页，而不是跳到 resume。 */
+  repeatResume?: BatchResume;
   calls: number;
   filtered: number;
 }

@@ -129,9 +129,10 @@ export const gdeltProvider: SourceProvider = {
           pageRecords.push({ ...record, matchedTerm: term });
         }
       }
+      const repeatResume = { source: "gdelt" as const, step: stepIndex, page: 0, cursor: "" };
       const nextResume = { source: "gdelt" as const, step: stepIndex + 1, page: 0, cursor: "" };
       if (request.onPage) {
-        await request.onPage({ records: pageRecords, resume: nextResume, calls, filtered });
+        await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
       } else {
         records.push(...pageRecords);
       }

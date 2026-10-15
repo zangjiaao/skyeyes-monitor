@@ -1,6 +1,7 @@
 import type { AppSettings } from "../config/settings";
 import { detectSourceLang } from "../domain/lang";
 import { scoreRelevance } from "../domain/relevance";
+import { DeferredBatchError } from "../pipeline/lease";
 import { acceptableChinese, translateToChinese } from "../translate";
 
 export const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
@@ -33,6 +34,8 @@ export interface InterpretInput {
   description: string;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
+  /** 每次外部请求或模型调用前记账。预算用尽时抛出，调用方要改期而不是把这条写成失败。 */
+  charge?: () => void;
 }
 
 const EVENT_TYPES = new Set(["statement", "attack", "meeting", "other"]);
@@ -120,6 +123,7 @@ export async function callDeepseek(input: {
   description: string;
   fetchImpl: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
+  charge?: () => void;
 }): Promise<{ ok: true; parsed: NonNullable<ReturnType<typeof parseDeepseekContent>> } | { ok: false; error: string }> {
   const model = /^[A-Za-z0-9._-]{1,64}$/.test(input.model) ? input.model : "deepseek-chat";
   const body = {
@@ -147,6 +151,7 @@ export async function callDeepseek(input: {
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
     let response: Response;
     try {
+      input.charge?.();
       response = await input.fetchImpl(DEEPSEEK_URL, {
         method: "POST",
         headers: {
@@ -156,6 +161,7 @@ export async function callDeepseek(input: {
         body: JSON.stringify(body),
       });
     } catch (error) {
+      if (error instanceof DeferredBatchError) throw error;
       lastError = error instanceof Error ? error.message : "DeepSeek 网络失败";
       await pause(400 * (2 ** attempt), input.sleepImpl);
       continue;
@@ -200,6 +206,7 @@ async function workersTranslation(input: InterpretInput, hinted: string | null):
     input.settings.translationTargetLang,
     input.settings.translationSourceLang,
     input.settings.translationFallbackModel,
+    input.charge,
   );
   return {
     translation: outcome.text,
@@ -224,6 +231,7 @@ export async function interpretRecord(input: InterpretInput): Promise<Interpreta
       description: input.description,
       fetchImpl,
       sleepImpl: input.sleepImpl,
+      charge: input.charge,
     });
     if (deep.ok) {
       const sourceLang = detectSourceLang(input.text, deep.parsed.sourceLang || hinted, input.settings.translationSourceLang);
@@ -267,7 +275,7 @@ export async function interpretRecord(input: InterpretInput): Promise<Interpreta
     return result;
   }
   if (input.settings.relevanceEnabled && input.text.trim()) {
-    const scored = await scoreRelevance(input.ai, input.text, input.targetName);
+    const scored = await scoreRelevance(input.ai, input.text, input.targetName, input.charge);
     result.score = scored.score;
     result.relevant = scored.score == null ? null : scored.score >= input.settings.relevanceThreshold;
     result.relevanceError = scored.error;
