@@ -1,5 +1,6 @@
 import { loadSettings, type AppSettings } from "../config/settings";
 import { MISSING_SITE_URL_LINE } from "./compose";
+import { attachmentMode, recordEmailLog } from "./log";
 import { runWindowDownloadPath, runWindowFilename, runWindowObjectKey } from "../export/run-file";
 import { storeRunWindowExcel } from "../pipeline/run";
 import { sendWithCloudflare } from "./cloudflare";
@@ -98,6 +99,8 @@ export async function sendTestEmail(env: Env, input: { to?: string | null } = {}
   const downloadUrl = latest && settings.appBaseUrl
     ? `${settings.appBaseUrl}${runWindowDownloadPath(latest.id)}`
     : null;
+  const mode = attachmentMode(attached, tooLarge ? downloadUrl : null);
+  const attachmentBytes = bytes?.byteLength ?? 0;
   const lines = [
     "这是一封 SkyEyes 测试邮件，用来确认发件人、邮件服务和收件人。",
     "每日邮件可以保持关闭，这封信仍然会发出。",
@@ -134,12 +137,45 @@ export async function sendTestEmail(env: Env, input: { to?: string | null } = {}
       : undefined,
   };
 
-  if (settings.emailProvider === "cloudflare") {
-    await sendWithCloudflare(env.EMAIL, message);
-  } else if (!env.RESEND_API_KEY) {
-    throw new Error("未配置 RESEND_API_KEY");
-  } else {
-    await sendWithResend(env.RESEND_API_KEY, message);
+  const logBase = {
+    runId: latest?.id ?? null,
+    kind: "test" as const,
+    recipients: to,
+    subject: message.subject,
+    attachmentMode: mode,
+    attachmentBytes,
+  };
+  try {
+    let messageId: string | null = null;
+    if (settings.emailProvider === "cloudflare") {
+      messageId = (await sendWithCloudflare(env.EMAIL, message)).id || null;
+    } else if (!env.RESEND_API_KEY) {
+      await recordEmailLog(env.DB, {
+        ...logBase,
+        status: "failed",
+        error: "未配置 RESEND_API_KEY",
+        messageId: null,
+      });
+      throw new Error("未配置 RESEND_API_KEY");
+    } else {
+      messageId = (await sendWithResend(env.RESEND_API_KEY, message)).id || null;
+    }
+    await recordEmailLog(env.DB, {
+      ...logBase,
+      status: "sent",
+      error: null,
+      messageId,
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "未配置 RESEND_API_KEY") {
+      await recordEmailLog(env.DB, {
+        ...logBase,
+        status: "failed",
+        error: error instanceof Error ? error.message : "请求失败",
+        messageId: null,
+      });
+    }
+    throw error;
   }
   return { to, attached, generated, excelError, provider: settings.emailProvider };
 }

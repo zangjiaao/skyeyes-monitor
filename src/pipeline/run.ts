@@ -15,6 +15,7 @@ import {
 import type { BatchResume, CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
+import { attachmentMode, recordEmailLog } from "../email/log";
 import { sendWithCloudflare } from "../email/cloudflare";
 import { sendWithResend } from "../email/resend";
 import { ATTACHMENT_LIMIT_BYTES, type OutboundEmail } from "../email/types";
@@ -1363,7 +1364,7 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
   logError("batch failed", new Error(message), { runId, batchId });
 }
 
-async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
+export async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   const now = new Date().toISOString();
   const claim = await env.DB.prepare(
     `UPDATE runs SET finalize_enqueued_at = ?
@@ -1493,34 +1494,56 @@ async function sendDigest(
   env: Env,
   settings: AppSettings,
   message: OutboundEmail,
-): Promise<{ status: string; error: string | null }> {
-  if (!settings.emailEnabled) return { status: "skipped", error: null };
+): Promise<{ status: "sent" | "skipped" | "failed"; error: string | null; messageId: string | null; recipients: string[] }> {
+  if (!settings.emailEnabled) return { status: "skipped", error: null, messageId: null, recipients: [] };
   const recipients = await env.DB.prepare(
     "SELECT email FROM recipients WHERE enabled = 1 ORDER BY email",
   ).all<{ email: string }>();
   const to = recipients.results.map((row) => row.email);
-  if (to.length === 0) return { status: "skipped", error: "没有启用的收件人" };
-  if (!settings.emailFrom) return { status: "failed", error: "未配置发件人" };
+  if (to.length === 0) return { status: "skipped", error: "没有启用的收件人", messageId: null, recipients: [] };
+  if (!settings.emailFrom) return { status: "failed", error: "未配置发件人", messageId: null, recipients: to };
   const outbound = { ...message, from: settings.emailFrom, fromName: settings.emailFromName, to };
   try {
-    if (settings.emailProvider === "cloudflare") {
-      await sendWithCloudflare(env.EMAIL, outbound);
-    } else {
-      if (!env.RESEND_API_KEY) return { status: "failed", error: "未配置 RESEND_API_KEY" };
-      await sendWithResend(env.RESEND_API_KEY, outbound);
-    }
-    return { status: "sent", error: null };
+    const result = settings.emailProvider === "cloudflare"
+      ? await sendWithCloudflare(env.EMAIL, outbound)
+      : env.RESEND_API_KEY
+        ? await sendWithResend(env.RESEND_API_KEY, outbound)
+        : null;
+    if (!result) return { status: "failed", error: "未配置 RESEND_API_KEY", messageId: null, recipients: to };
+    return { status: "sent", error: null, messageId: result.id || null, recipients: to };
   } catch (error) {
     logError("email failed", error);
-    return { status: "failed", error: errorMessage(error).slice(0, 500) };
+    return { status: "failed", error: errorMessage(error).slice(0, 500), messageId: null, recipients: to };
   }
+}
+
+async function claimDailyEmail(env: Env, runId: string, claimedAt: string): Promise<boolean> {
+  const claim = await env.DB.prepare(
+    `UPDATE runs SET email_sent_at = ?
+     WHERE id = ? AND email_sent_at IS NULL AND COALESCE(email_status, '') != 'sent'`,
+  ).bind(claimedAt, runId).run();
+  return (claim.meta.changes ?? 0) === 1;
+}
+
+async function releaseDailyEmailClaim(env: Env, runId: string, claimedAt: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE runs SET email_sent_at = NULL
+     WHERE id = ? AND email_sent_at = ? AND COALESCE(email_status, '') != 'sent'`,
+  ).bind(runId, claimedAt).run();
 }
 
 export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline"): Promise<void> {
   const claim = await env.DB.prepare(
-    "UPDATE runs SET status = 'finalizing' WHERE id = ? AND status IN ('running', 'partial')",
+    `UPDATE runs SET status = 'finalizing'
+     WHERE id = ? AND (
+       status IN ('running', 'partial')
+       OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+     )`,
   ).bind(runId).run();
   if ((claim.meta.changes ?? 0) === 0) return;
+  await env.DB.prepare(
+    "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
+  ).bind(new Date().toISOString(), runId).run();
 
   const settings = await loadSettings(env.DB);
   const run = await env.DB.prepare(
@@ -1537,9 +1560,14 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   const failed = counts?.failed ?? 0;
   const pending = counts?.pending ?? 0;
   const incomplete = reason === "deadline" || failed > 0 || pending > 0;
-  let notes = [run.notes, incomplete ? "有批次未完成，已发送目前收集到的内容。" : ""].filter(Boolean).join(" ");
+  let notes = run.notes ?? "";
+  if (incomplete && !notes.includes("有批次未完成，已发送目前收集到的内容。")) {
+    notes = [notes, "有批次未完成，已发送目前收集到的内容。"].filter(Boolean).join(" ");
+  }
   let emailStatus = "skipped";
   let emailError: string | null = null;
+  let emailTouched = false;
+  let claimedAt: string | null = null;
 
   try {
     const stored = await storeExcel(env, settings);
@@ -1567,6 +1595,8 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       ? `${settings.appBaseUrl}${runWindowDownloadPath(runId)}`
       : null;
     const attached = Boolean(windowFile.bytes && windowFile.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
+    const mode = attachmentMode(attached, downloadUrl);
+    const attachmentBytes = windowFile.bytes?.byteLength ?? 0;
     const digest = buildDigest({
       incomplete,
       windowStart: run.window_start,
@@ -1578,39 +1608,106 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       attached,
       notes,
     });
-    const sent = await sendDigest(env, settings, {
-      from: settings.emailFrom,
-      fromName: settings.emailFromName,
-      to: [],
-      subject: digest.subject,
-      text: digest.text,
-      html: digest.html,
-      attachment: attached && windowFile.bytes
-        ? { filename: windowFile.filename, content: windowFile.bytes, contentType: EXCEL_TYPE }
-        : undefined,
-    });
-    emailStatus = sent.status;
-    emailError = sent.error;
+    const alreadySent = await env.DB.prepare(
+      "SELECT email_sent_at, email_status FROM runs WHERE id = ?",
+    ).bind(runId).first<{ email_sent_at: string | null; email_status: string | null }>();
+    const sentAlready = Boolean(alreadySent?.email_sent_at) || alreadySent?.email_status === "sent";
+    if (!sentAlready && settings.emailEnabled) {
+      claimedAt = new Date().toISOString();
+      const claimed = await claimDailyEmail(env, runId, claimedAt);
+      if (!claimed) {
+        claimedAt = null;
+      } else {
+        emailTouched = true;
+        const sent = await sendDigest(env, settings, {
+          from: settings.emailFrom,
+          fromName: settings.emailFromName,
+          to: [],
+          subject: digest.subject,
+          text: digest.text,
+          html: digest.html,
+          attachment: attached && windowFile.bytes
+            ? { filename: windowFile.filename, content: windowFile.bytes, contentType: EXCEL_TYPE }
+            : undefined,
+        });
+        if (sent.status === "sent") {
+          emailStatus = "sent";
+          emailError = null;
+          await recordEmailLog(env.DB, {
+            runId,
+            kind: "daily",
+            recipients: sent.recipients,
+            subject: digest.subject,
+            status: "sent",
+            error: null,
+            messageId: sent.messageId,
+            attachmentMode: mode,
+            attachmentBytes,
+          });
+        } else if (sent.status === "failed") {
+          await releaseDailyEmailClaim(env, runId, claimedAt);
+          claimedAt = null;
+          emailStatus = "failed";
+          emailError = sent.error;
+          await recordEmailLog(env.DB, {
+            runId,
+            kind: "daily",
+            recipients: sent.recipients,
+            subject: digest.subject,
+            status: "failed",
+            error: sent.error,
+            messageId: null,
+            attachmentMode: mode,
+            attachmentBytes,
+          });
+        } else {
+          await releaseDailyEmailClaim(env, runId, claimedAt);
+          claimedAt = null;
+          emailStatus = "skipped";
+          emailError = sent.error;
+        }
+      }
+    } else if (!sentAlready) {
+      emailTouched = true;
+      emailStatus = "skipped";
+    }
   } catch (error) {
     logError("finalize failed", error, { runId });
+    if (claimedAt) await releaseDailyEmailClaim(env, runId, claimedAt);
+    claimedAt = null;
+    emailTouched = true;
     emailStatus = "failed";
     emailError = errorMessage(error).slice(0, 500);
     notes = [notes, "收尾时生成 Excel 或发送邮件失败。"].filter(Boolean).join(" ");
+    await recordEmailLog(env.DB, {
+      runId,
+      kind: "daily",
+      recipients: [],
+      subject: "SkyEyes 每日监测",
+      status: "failed",
+      error: emailError,
+      messageId: null,
+      attachmentMode: "none",
+      attachmentBytes: 0,
+    });
   }
 
   await env.DB.prepare(
     `UPDATE runs
-     SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?,
-         email_status = ?, email_error = ?, notes = ?
+     SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?,
+         email_status = CASE WHEN ? = 1 THEN ? ELSE email_status END,
+         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END
      WHERE id = ?`,
   ).bind(
     incomplete || emailStatus === "failed" ? "incomplete" : "completed",
     new Date().toISOString(),
     counts?.done ?? 0,
     failed,
-    emailStatus,
-    emailError,
     notes || null,
+    emailTouched ? 1 : 0,
+    emailStatus,
+    emailTouched ? 1 : 0,
+    emailError,
     runId,
   ).run();
   log("run finalized", { runId, reason, incomplete, emailStatus });
@@ -1650,7 +1747,11 @@ export async function handleDeadLetter(env: Env, message: CollectMessage): Promi
 
 export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
   const rows = await env.DB.prepare(
-    "SELECT id FROM runs WHERE status IN ('running', 'partial') AND deadline_at <= ?",
+    `SELECT id FROM runs
+     WHERE deadline_at <= ? AND (
+       status IN ('running', 'partial')
+       OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+     )`,
   ).bind(now.toISOString()).all<{ id: string }>();
   for (const row of rows.results) {
     await finalizeRun(env, row.id, "deadline");

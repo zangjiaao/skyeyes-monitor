@@ -803,6 +803,34 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     }
   });
 
+  app.get("/api/email-log", async (c) => {
+    const settings = await loadSettings(c.env.DB);
+    const requestedSize = Number(c.req.query("pageSize"));
+    const pageSize = requestedSize === 50 || requestedSize === 100 ? requestedSize : 20;
+    const requestedPage = Number(c.req.query("page"));
+    const page = Number.isFinite(requestedPage) && requestedPage >= 1 ? Math.floor(requestedPage) : 1;
+    const totalRow = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM email_log").first<{ n: number }>();
+    const total = totalRow?.n ?? 0;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.min(page, pageCount);
+    const rows = await c.env.DB.prepare(
+      `SELECT id, run_id, kind, recipients, subject, status, error, message_id,
+              attachment_mode, attachment_bytes, created_at
+       FROM email_log
+       ORDER BY created_at DESC, id DESC
+       LIMIT ? OFFSET ?`,
+    ).bind(pageSize, (safePage - 1) * pageSize).all();
+    const now = new Date();
+    return c.json({
+      entries: rows.results,
+      total,
+      page: safePage,
+      pageSize,
+      timeZone: settings.timeZone,
+      utcOffset: utcOffsetLabel(now, settings.timeZone),
+    });
+  });
+
   app.get("/api/settings", async (c) => {
     const rows = await c.env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
     const values: Record<string, string> = { ...SETTING_DEFAULTS };
