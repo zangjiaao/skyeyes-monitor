@@ -1,18 +1,28 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseSettings, validateSettingsPatch } from "../src/config/settings";
 import { buildGdeltTermQuery, packGdeltQueries } from "../src/domain/batch";
 import type { QueryTarget } from "../src/domain/types";
 import { MAX_DEFER_WAIT_SEC } from "../src/pipeline/lease";
+import { pacing } from "../src/pipeline/pacing";
 import { handleDeadLetter, processBatch, scheduleDeferredWake } from "../src/pipeline/run";
 import { gdeltProvider } from "../src/sources/gdelt";
 import { gdeltRetryDelaySeconds } from "../src/sources/x-rate";
 
 const originalNow = Date.now;
 const originalFetch = globalThis.fetch;
+const originalSleep = pacing.sleep;
+const originalPacingNow = pacing.now;
+
+beforeEach(() => {
+  pacing.sleep = async () => {};
+  pacing.now = () => Date.now();
+});
 
 afterEach(() => {
   Date.now = originalNow;
   globalThis.fetch = originalFetch;
+  pacing.sleep = originalSleep;
+  pacing.now = originalPacingNow;
 });
 
 const phrase: QueryTarget = {
@@ -441,6 +451,12 @@ function createMemory(options: {
     if (sql.includes("INSERT INTO api_usage") || sql.includes("INSERT INTO rate_events")) {
       return result(null, 1);
     }
+    if (sql.includes("finalize_enqueued_at")) {
+      if (sql.includes("SET finalize_enqueued_at = NULL")) return result(null, 1);
+      const pending = batch.status === "queued" || batch.status === "running";
+      if (!pending && (run.status === "running" || run.status === "partial")) return result(null, 1);
+      return result(null, 0);
+    }
     if (sql.includes("SET status = 'done'")) {
       if (batch.id !== binds[6] || batch.lease_token !== binds[7] || batch.status !== "running") {
         return result(null, 0, []);
@@ -548,9 +564,14 @@ function createMemory(options: {
 }
 
 describe("推迟不消耗队列重试", () => {
-  it("X 在 0.2 QPS 下翻完两条词各 5 页，并逐页入库", async () => {
+  it("X 在 0.2 QPS 下在一次调用里按间隔睡完两条词各 5 页", async () => {
     let clock = Date.parse("2026-10-14T03:00:00.000Z");
     Date.now = () => clock;
+    let slept = 0;
+    pacing.sleep = async (ms) => {
+      slept += ms;
+      clock += ms;
+    };
     const fetches: string[] = [];
     globalThis.fetch = async (input) => {
       const url = new URL(String(input));
@@ -576,31 +597,9 @@ describe("推迟不消耗队列重试", () => {
     const first = await memory.deliver();
     expect(first).toBe("ack");
     expect(memory.retries).toHaveLength(0);
-    expect(memory.records).toHaveLength(1);
-    expect(memory.batch.attempts).toBe(0);
-    expect(memory.batch.status).toBe("queued");
-    expect(memory.batch.defer_count).toBe(1);
-    expect(JSON.parse(memory.batch.resume_json ?? "{}")).toMatchObject({ source: "x", step: 0, page: 1, cursor: "p2" });
-    expect(memory.wakes).toHaveLength(1);
-    expect(memory.wakes[0]?.delaySeconds).toBe(5);
-    expect(memory.wakes[0]?.body).toEqual({ type: "batch", runId: "run-1", batchId: "batch-1" });
-
-    await handleDeadLetter(memory.env, { type: "batch", runId: "run-1", batchId: "batch-1" });
-    expect(memory.batch.status).toBe("queued");
-    expect(memory.batch.error).toBeNull();
-
-    let steps = 0;
-    while (memory.batch.status !== "done" && steps < 20) {
-      const wake = memory.wakes.shift();
-      expect(wake?.body.type).toBe("batch");
-      clock += (wake?.delaySeconds ?? 0) * 1000;
-      const outcome = await memory.deliver(wake?.body);
-      expect(outcome).toBe("ack");
-      steps += 1;
-    }
-
     expect(memory.batch.status).toBe("done");
-    expect(memory.retries).toHaveLength(0);
+    expect(memory.batch.defer_count).toBe(0);
+    expect(slept).toBe(9 * 5000);
     expect(fetches).toHaveLength(10);
     expect(new Set(fetches).size).toBe(10);
     expect(fetches.filter((item) => item.startsWith('"alpha signal"'))).toHaveLength(5);
@@ -612,6 +611,7 @@ describe("推迟不消耗队列重试", () => {
     expect(memory.batch.attempts).toBe(1);
     expect(memory.batch.resume_json).toBeNull();
     expect(memory.wakes.filter((wake) => wake.body.type === "batch")).toHaveLength(0);
+    expect(memory.wakes.filter((wake) => wake.body.type === "finalize")).toHaveLength(1);
   });
 
   it("GDELT 连续 429 只增加推迟次数，不把批次打进死信", async () => {
