@@ -78,4 +78,61 @@ describe("Excel", () => {
     expect(second["示例国家甲"].map((row) => row[0])).toEqual(["原文", "历史", "新增"]);
     expect(second["今日"].map((row) => row[0])).toEqual(["原文", "新增"]);
   });
+
+  it("本轮窗口工作簿去掉今日和昨日表，避免昨日在窗口结束时刻恒为空", () => {
+    const windowEnd = new Date("2026-10-13T02:00:00.000Z");
+    const records = [
+      record({
+        countryName: "示例国家甲",
+        publishedAt: "2026-10-12T06:00:00.000Z",
+        collectedAt: "2026-10-13T01:00:00.000Z",
+        originalText: "窗口内",
+      }),
+      record({
+        countryName: "示例国家甲",
+        publishedAt: "2026-10-12T18:00:00.000Z",
+        collectedAt: "2026-10-13T01:00:00.000Z",
+        originalText: "仍在窗口",
+      }),
+      record({
+        countryName: "示例国家甲",
+        publishedAt: "2026-10-11T06:00:00.000Z",
+        collectedAt: "2026-10-11T07:00:00.000Z",
+        originalText: "上一窗口",
+      }),
+    ];
+    const input = {
+      countries: [{ name: "示例国家甲" }, { name: "示例国家乙" }],
+      records,
+      reference: windowEnd,
+      timeZone: "Asia/Shanghai",
+      scheduleHour: 10,
+      windowHours: 24,
+    };
+
+    const cumulative = readWorkbookSheets(buildMonitorWorkbook(input));
+    expect(cumulative["今日"].map((row) => row[0])).toEqual(["原文", "窗口内", "仍在窗口"]);
+    expect(cumulative["昨日"].map((row) => row[0])).toEqual(["原文", "上一窗口"]);
+    expect(cumulative["示例国家甲"].map((row) => row[11])).toEqual(["时段", "今日", "今日", "昨日"]);
+
+    const attachment = readWorkbookSheets(buildMonitorWorkbook({
+      ...input,
+      records: records.filter((item) => item.originalText !== "上一窗口"),
+      periodSheets: false,
+    }));
+    expect(Object.keys(attachment)).toEqual(["示例国家甲", "示例国家乙"]);
+    expect(attachment["示例国家甲"].map((row) => row[0])).toEqual(["原文", "窗口内", "仍在窗口"]);
+    expect(attachment["示例国家甲"].map((row) => row[11])).toEqual(["时段", "今日", "今日"]);
+    expect(JSON.stringify(attachment)).not.toContain("上一窗口");
+
+    const newYork = readWorkbookSheets(buildMonitorWorkbook({
+      ...input,
+      records: records.filter((item) => item.originalText !== "上一窗口"),
+      timeZone: "America/New_York",
+      periodSheets: false,
+    }));
+    expect(Object.keys(newYork)).toEqual(["示例国家甲", "示例国家乙"]);
+    expect(newYork["示例国家甲"][0][1]).toBe("发布时间（America/New_York, UTC-4）");
+    expect(newYork["示例国家甲"].map((row) => row[11])).toEqual(["时段", "今日", "更早"]);
+  });
 });
