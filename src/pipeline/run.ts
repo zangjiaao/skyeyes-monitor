@@ -1483,6 +1483,7 @@ export async function storeRunWindowExcel(
     timeZone: settings.timeZone,
     scheduleHour: settings.scheduleHour,
     windowHours: settings.windowHours,
+    periodSheets: false,
   });
   await env.EXPORTS.put(key, bytes, {
     httpMetadata: { contentType: EXCEL_TYPE },

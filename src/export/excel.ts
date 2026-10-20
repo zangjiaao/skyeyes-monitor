@@ -25,6 +25,11 @@ export interface WorkbookInput {
   timeZone: string;
   scheduleHour: number;
   windowHours: number;
+  /**
+   * 是否追加「今日」「昨日」汇总表。累计文件需要这两张表。
+   * 邮件附件只含本轮窗口，参考时刻又是窗口结束，昨日窗口整段落在附件之外，表会恒为空，所以关掉。
+   */
+  periodSheets?: boolean;
 }
 
 const DATE_FORMAT = "yyyy-mm-dd hh:mm";
@@ -136,20 +141,22 @@ export function buildMonitorWorkbook(input: WorkbookInput): Uint8Array {
     addSheet(workbook, sheetName(name, used), countryRows, input.timeZone, input.reference);
   }
 
-  addSheet(
-    workbook,
-    sheetName("今日", used),
-    annotated.filter(([, period]) => period === "今日"),
-    input.timeZone,
-    input.reference,
-  );
-  addSheet(
-    workbook,
-    sheetName("昨日", used),
-    annotated.filter(([, period]) => period === "昨日"),
-    input.timeZone,
-    input.reference,
-  );
+  if (input.periodSheets !== false) {
+    addSheet(
+      workbook,
+      sheetName("今日", used),
+      annotated.filter(([, period]) => period === "今日"),
+      input.timeZone,
+      input.reference,
+    );
+    addSheet(
+      workbook,
+      sheetName("昨日", used),
+      annotated.filter(([, period]) => period === "昨日"),
+      input.timeZone,
+      input.reference,
+    );
+  }
 
   const bytes = XLSX.write(workbook, { type: "array", bookType: "xlsx" }) as Uint8Array;
   return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
