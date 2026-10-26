@@ -1808,15 +1808,21 @@ function sweptRunStatus(
   return "incomplete";
 }
 
-/** Force a terminal status when finalize claimed the row and then died before the update. */
+/**
+ * Force a terminal status when finalize claimed the row and then died before the update.
+ * Age the attempt from `finalize_enqueued_at`. An old `deadline_at` must not close a
+ * claim that is still inside the grace window (a past-deadline `failed` run can be
+ * reopened and start finalizing long after its deadline). When the claim time was
+ * never written, fall back to `deadline_at`.
+ */
 export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[]> {
   const graceIso = new Date(now.getTime() - FINALIZING_GRACE_MS).toISOString();
   const rows = await env.DB.prepare(
     `SELECT id, notes, email_status FROM runs
      WHERE status = 'finalizing'
        AND (
-         deadline_at <= ?
-         OR (finalize_enqueued_at IS NOT NULL AND finalize_enqueued_at <= ?)
+         (finalize_enqueued_at IS NOT NULL AND finalize_enqueued_at <= ?)
+         OR (finalize_enqueued_at IS NULL AND deadline_at <= ?)
        )`,
   ).bind(graceIso, graceIso).all<{ id: string; notes: string | null; email_status: string | null }>();
   const closed: string[] = [];
