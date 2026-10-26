@@ -316,6 +316,111 @@ describe("收尾死锁", () => {
     });
   });
 
+  it("截止时间已过但认领仍在宽限内时，不打断进行中的收尾", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-26T04:05:00.000Z");
+    const claimedAt = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+    insertRun(sqlite, {
+      id: "run-live",
+      slotKey: "2026-10-22T10",
+      status: "finalizing",
+      startedAt: "2026-10-22T02:00:15.000Z",
+      deadlineAt: "2026-10-22T03:00:15.000Z",
+      finalizeEnqueuedAt: claimedAt,
+      emailStatus: "failed",
+      emailSentAt: null,
+    });
+    insertBatch(sqlite, {
+      id: "batch-live",
+      runId: "run-live",
+      source: "x",
+      status: "running",
+      createdAt: "2026-10-22T02:00:15.000Z",
+      leaseExpiresAt: new Date(now.getTime() + 60_000).toISOString(),
+    });
+    expect(FINALIZING_GRACE_MS).toBeGreaterThan(5 * 60 * 1000);
+    await finalizeOverdue(envFor(sqlite), now);
+    expect(sqlite.prepare(
+      "SELECT status, finished_at, email_status, email_sent_at FROM runs WHERE id = ?",
+    ).get("run-live")).toEqual({
+      status: "finalizing",
+      finished_at: null,
+      email_status: "failed",
+      email_sent_at: null,
+    });
+    expect(sqlite.prepare("SELECT status FROM batches WHERE id = ?").get("batch-live")).toEqual({ status: "running" });
+    const terminal = sqlite.prepare(
+      "UPDATE runs SET status = 'incomplete', finished_at = ? WHERE id = ? AND status = 'finalizing'",
+    ).run(now.toISOString(), "run-live");
+    expect(Number(terminal.changes)).toBe(1);
+
+    const abandonedAt = new Date(Date.parse(claimedAt) + FINALIZING_GRACE_MS + 60_000);
+    sqlite.prepare("UPDATE runs SET status = 'finalizing', finished_at = NULL WHERE id = ?").run("run-live");
+    await finalizeOverdue(envFor(sqlite), abandonedAt);
+    const swept = sqlite.prepare("SELECT status, email_status, email_sent_at FROM runs WHERE id = ?").get("run-live") as {
+      status: string;
+      email_status: string;
+      email_sent_at: string | null;
+    };
+    expect(swept.status).toBe("incomplete");
+    expect(swept.email_status).toBe("failed");
+    expect(swept.email_sent_at).toBeNull();
+    expect(sqlite.prepare("SELECT status FROM batches WHERE id = ?").get("batch-live")).toEqual({ status: "cancelled" });
+  });
+
+  it("没有认领时间且截止时间已过宽限的 finalizing 仍会被清扫", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-26T02:00:00.000Z");
+    insertRun(sqlite, {
+      id: "run-untimed",
+      slotKey: "2026-10-22T14",
+      status: "finalizing",
+      startedAt: "2026-10-22T02:00:15.000Z",
+      deadlineAt: "2026-10-22T03:00:15.000Z",
+    });
+    insertBatch(sqlite, {
+      id: "batch-untimed",
+      runId: "run-untimed",
+      source: "x",
+      status: "running",
+      createdAt: "2026-10-22T02:00:15.000Z",
+      leaseExpiresAt: "2026-10-22T05:45:01.000Z",
+    });
+    await finalizeOverdue(envFor(sqlite), now);
+    expect(sqlite.prepare("SELECT status, finished_at FROM runs WHERE id = ?").get("run-untimed")).toEqual({
+      status: "incomplete",
+      finished_at: now.toISOString(),
+    });
+    expect(sqlite.prepare("SELECT status FROM batches WHERE id = ?").get("batch-untimed")).toEqual({ status: "cancelled" });
+  });
+
+  it("截止时间未到但认领已超过宽限的 finalizing 仍会被清扫", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-22T02:30:00.000Z");
+    insertRun(sqlite, {
+      id: "run-early",
+      slotKey: "2026-10-22T15",
+      status: "finalizing",
+      startedAt: "2026-10-22T01:00:00.000Z",
+      deadlineAt: "2026-10-22T03:00:00.000Z",
+      emailStatus: "sent",
+      emailSentAt: "2026-10-22T01:40:00.000Z",
+      finalizeEnqueuedAt: "2026-10-22T01:40:00.000Z",
+    });
+    insertBatch(sqlite, {
+      id: "batch-early",
+      runId: "run-early",
+      source: "google_news",
+      status: "done",
+      createdAt: "2026-10-22T01:00:00.000Z",
+    });
+    await finalizeOverdue(envFor(sqlite), now);
+    expect(sqlite.prepare("SELECT status, email_status FROM runs WHERE id = ?").get("run-early")).toEqual({
+      status: "completed",
+      email_status: "sent",
+    });
+  });
+
   it("宽限期内的 finalizing 保持原状，并继续挡住新运行", async () => {
     const sqlite = openDatabase();
     const now = new Date("2026-10-22T03:10:00.000Z");
