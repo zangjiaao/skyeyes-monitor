@@ -41,7 +41,7 @@ interface BatchRow {
   target_ids: string;
 }
 
-const RECOVERABLE = new Set(["running", "partial", "failed", "incomplete"]);
+const RECOVERABLE = new Set(["running", "partial", "failed"]);
 
 function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
   const runs = new Map((seed.runs ?? []).map((row) => [row.id, { ...row }]));
@@ -183,7 +183,8 @@ function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
     if (sql.includes("SET status = 'running', finished_at = NULL")) {
       const run = runOf(String(binds[0]));
       let changes = 0;
-      if (run && (run.status === "failed" || run.status === "incomplete")) {
+      const reopenIncomplete = sql.includes("'incomplete'");
+      if (run && (run.status === "failed" || (reopenIncomplete && run.status === "incomplete"))) {
         run.status = "running";
         run.finished_at = null;
         changes = 1;
@@ -212,7 +213,7 @@ function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
     if (sql.includes("UPDATE runs") && sql.includes("status = 'cancelled'")) {
       const run = runOf(String(binds[2]));
       let changes = 0;
-      if (run && run.status !== "completed" && run.status !== "cancelled" && run.status !== "finalizing") {
+      if (run && run.status !== "completed" && run.status !== "cancelled") {
         run.status = "cancelled";
         run.finished_at = String(binds[0]);
         run.notes = "已取消";

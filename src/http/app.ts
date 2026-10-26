@@ -453,7 +453,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     const stuck = await c.env.DB.prepare(
       `SELECT COUNT(*) AS n FROM batches b
        JOIN runs r ON r.id = b.run_id
-       WHERE r.status IN ('running', 'partial', 'failed', 'incomplete')
+       WHERE r.status IN ('running', 'partial', 'failed')
          AND (
            (b.status = 'queued' AND (b.enqueued_at IS NULL OR b.enqueued_at <= ?))
            OR (b.status = 'running' AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= ?))

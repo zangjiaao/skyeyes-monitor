@@ -17,7 +17,17 @@ export const PLATFORM_CONCURRENCY = 8;
 export const QUEUE_CONCURRENCY_DEFAULT = 4;
 
 export const ACTIVE_RUN_STATUSES = ["running", "partial", "finalizing"] as const;
-export const RECOVERABLE_RUN_STATUSES = ["running", "partial", "failed", "incomplete"] as const;
+/**
+ * Hourly requeue may reopen these runs. `incomplete` is terminal: flipping it
+ * back to `running` starts another deadline finalize, which can die in
+ * `finalizing` and block every later run.
+ */
+export const RECOVERABLE_RUN_STATUSES = ["running", "partial", "failed"] as const;
+/**
+ * A row left in `finalizing` longer than this is forced terminal.
+ * One Worker invocation is at most 15 minutes; the cron gap is an hour.
+ */
+export const FINALIZING_GRACE_MS = 20 * 60 * 1000;
 
 export class DeferredBatchError extends Error {
   readonly delaySeconds: number;

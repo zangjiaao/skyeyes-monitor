@@ -236,7 +236,14 @@ export function StatusPage() {
             key: "actions",
             header: "操作",
             renderCell: (row) => {
-              const open = row.status === "running" || row.status === "partial" || row.status === "failed" || row.status === "incomplete";
+              if (row.status === "finalizing" || row.status === "incomplete") {
+                return (
+                  <HStack gap={1}>
+                    <Button label="取消" variant="ghost" size="sm" onClick={() => cancel(row.id)} />
+                  </HStack>
+                );
+              }
+              const open = row.status === "running" || row.status === "partial" || row.status === "failed";
               if (!open) return "—";
               return (
                 <HStack gap={1}>
