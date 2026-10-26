@@ -38,6 +38,7 @@ import {
   MAX_BATCH_ATTEMPTS,
   MAX_DEFER_COUNT,
   MAX_DEFER_WAIT_SEC,
+  FINALIZING_GRACE_MS,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
   batchWakeup,
@@ -369,7 +370,8 @@ export async function requeueStuckBatches(env: Env, options: {
   const runs = await env.DB.prepare(
     `SELECT DISTINCT run_id FROM batches
      WHERE status = 'queued' AND enqueued_at IS NULL AND (? = 1 OR created_at <= ?)
-       AND (? = 1 OR next_wake_at IS NULL OR next_wake_at <= ?) ${scope}`,
+       AND (? = 1 OR next_wake_at IS NULL OR next_wake_at <= ?)
+       AND run_id IN (SELECT id FROM runs WHERE status IN (${RECOVERABLE_SQL})) ${scope}`,
   ).bind(force ? 1 : 0, createdBefore, force ? 1 : 0, nowIso, ...scopeBinds).all<{ run_id: string }>();
   let batches = 0;
   let warning: string | null = null;
@@ -377,12 +379,14 @@ export async function requeueStuckBatches(env: Env, options: {
     const current = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
       .bind(row.run_id)
       .first<{ status: string }>();
-    if (!current || current.status === "cancelled" || current.status === "completed" || current.status === "finalizing") {
+    // `incomplete` already finished (and may already have emailed). Reopening it
+    // makes the next hour deadline-finalize again and can stick on `finalizing`.
+    if (!current || current.status === "cancelled" || current.status === "completed" || current.status === "finalizing" || current.status === "incomplete") {
       continue;
     }
-    if (current.status === "failed" || current.status === "incomplete") {
+    if (current.status === "failed") {
       await env.DB.prepare(
-        "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ? AND status IN ('failed', 'incomplete')",
+        "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ? AND status = 'failed'",
       ).bind(row.run_id).run();
     }
     const page = await continueEnqueue(env, row.run_id, !force && minAgeMs > 0 ? { createdBefore } : {});
@@ -397,7 +401,7 @@ export async function cancelRun(env: Env, runId: string): Promise<{ cancelledBat
     .bind(runId)
     .first<{ id: string; status: string }>();
   if (!current) throw new Error("运行不存在");
-  if (current.status === "completed" || current.status === "finalizing") {
+  if (current.status === "completed") {
     throw new Error("这次运行已经结束");
   }
   const now = new Date().toISOString();
@@ -405,7 +409,7 @@ export async function cancelRun(env: Env, runId: string): Promise<{ cancelledBat
     await env.DB.prepare(
       `UPDATE runs SET status = 'cancelled', finished_at = ?, notes = '已取消', batches_failed = (
          SELECT COUNT(*) FROM batches WHERE run_id = ? AND status = 'failed'
-       ) WHERE id = ? AND status NOT IN ('completed', 'cancelled', 'finalizing')`,
+       ) WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
     ).bind(now, runId, runId).run();
   }
   const cancelled = await env.DB.prepare(
@@ -578,20 +582,52 @@ async function releaseClaim(env: Env, batchId: string, token: string): Promise<b
   return (result.meta.changes ?? 0) > 0;
 }
 
+function runHasStoppedCollecting(status: string): boolean {
+  return status === "cancelled" || status === "completed" || status === "incomplete" || status === "finalizing";
+}
+
 async function ownsBatch(env: Env, batchId: string, token: string): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT b.status AS batch_status, b.lease_token, r.status AS run_status
      FROM batches b JOIN runs r ON r.id = b.run_id WHERE b.id = ?`,
   ).bind(batchId).first<{ batch_status: string; lease_token: string | null; run_status: string }>();
-  return row?.batch_status === "running" && row.lease_token === token && row.run_status !== "cancelled";
+  return row?.batch_status === "running"
+    && row.lease_token === token
+    && !runHasStoppedCollecting(row.run_status);
 }
 
 async function renewLease(env: Env, batchId: string, token: string, now = new Date()): Promise<boolean> {
   const lease = new Date(now.getTime() + LEASE_MS).toISOString();
   const result = await env.DB.prepare(
-    "UPDATE batches SET lease_expires_at = ? WHERE id = ? AND lease_token = ? AND status = 'running'",
+    `UPDATE batches SET lease_expires_at = ?
+     WHERE id = ? AND lease_token = ? AND status = 'running'
+       AND EXISTS (
+         SELECT 1 FROM runs
+         WHERE runs.id = batches.run_id AND runs.status IN ('running', 'partial', 'failed')
+       )`,
   ).bind(lease, batchId, token).run();
   return (result.meta.changes ?? 0) > 0;
+}
+
+async function cancelOpenBatches(
+  env: Env,
+  runId: string,
+  error: string,
+  options: { batchId?: string; now?: Date } = {},
+): Promise<number> {
+  const nowIso = (options.now ?? new Date()).toISOString();
+  const result = options.batchId
+    ? await env.DB.prepare(
+      `UPDATE batches
+       SET status = 'cancelled', error = ?, finished_at = ?, lease_token = NULL, lease_expires_at = NULL
+       WHERE run_id = ? AND id = ? AND status IN ('queued', 'running')`,
+    ).bind(error, nowIso, runId, options.batchId).run()
+    : await env.DB.prepare(
+      `UPDATE batches
+       SET status = 'cancelled', error = ?, finished_at = ?, lease_token = NULL, lease_expires_at = NULL
+       WHERE run_id = ? AND status IN ('queued', 'running')`,
+    ).bind(error, nowIso, runId).run();
+  return result.meta.changes ?? 0;
 }
 
 async function storeCollected(env: Env, input: {
@@ -891,6 +927,15 @@ export async function scheduleDeferredWake(
   delaySeconds: number,
   rate?: RateLimitError,
 ): Promise<void> {
+  const run = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ status: string }>();
+  if (!run || runHasStoppedCollecting(run.status)) {
+    if (run) {
+      await cancelOpenBatches(env, runId, run.status === "cancelled" ? "已取消" : "运行已结束", { batchId });
+    }
+    return;
+  }
   const delay = Math.max(1, Math.floor(delaySeconds));
   if (token) {
     const released = await releaseClaim(env, batchId, token);
@@ -948,13 +993,14 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
   const run = await env.DB.prepare(
     "SELECT id, status, window_start, window_end, batches_failed FROM runs WHERE id = ?",
   ).bind(runId).first<RunRow>();
-  if (!run || run.status === "cancelled" || run.status === "completed") {
-    if (run?.status === "cancelled") {
-      await env.DB.prepare(
-        `UPDATE batches
-         SET status = 'cancelled', error = '已取消', finished_at = ?, lease_token = NULL, lease_expires_at = NULL
-         WHERE id = ? AND run_id = ? AND status IN ('queued', 'running')`,
-      ).bind(new Date().toISOString(), batchId, runId).run();
+  if (!run || runHasStoppedCollecting(run.status)) {
+    if (run) {
+      await cancelOpenBatches(
+        env,
+        runId,
+        run.status === "cancelled" ? "已取消" : "运行已结束",
+        { batchId },
+      );
     }
     return;
   }
@@ -1545,6 +1591,9 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   await env.DB.prepare(
     "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
   ).bind(new Date().toISOString(), runId).run();
+  if (reason === "deadline") {
+    await cancelOpenBatches(env, runId, "已过截止时间");
+  }
 
   const settings = await loadSettings(env.DB);
   const run = await env.DB.prepare(
@@ -1698,7 +1747,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
      SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?,
          email_status = CASE WHEN ? = 1 THEN ? ELSE email_status END,
          email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END
-     WHERE id = ?`,
+     WHERE id = ? AND status = 'finalizing'`,
   ).bind(
     incomplete || emailStatus === "failed" ? "incomplete" : "completed",
     new Date().toISOString(),
@@ -1746,7 +1795,64 @@ export async function handleDeadLetter(env: Env, message: CollectMessage): Promi
   await finalizeRun(env, message.runId, message.reason);
 }
 
+const STUCK_FINALIZE_NOTE = "收尾超时，已按当时的批次结果结束。";
+
+function sweptRunStatus(
+  pending: number,
+  failed: number,
+  cancelled: number,
+  emailStatus: string | null,
+): "completed" | "incomplete" {
+  if (pending > 0 || failed > 0 || cancelled > 0) return "incomplete";
+  if (emailStatus === "sent" || emailStatus === "skipped") return "completed";
+  return "incomplete";
+}
+
+/** Force a terminal status when finalize claimed the row and then died before the update. */
+export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[]> {
+  const graceIso = new Date(now.getTime() - FINALIZING_GRACE_MS).toISOString();
+  const rows = await env.DB.prepare(
+    `SELECT id, notes, email_status FROM runs
+     WHERE status = 'finalizing'
+       AND (
+         deadline_at <= ?
+         OR (finalize_enqueued_at IS NOT NULL AND finalize_enqueued_at <= ?)
+       )`,
+  ).bind(graceIso, graceIso).all<{ id: string; notes: string | null; email_status: string | null }>();
+  const closed: string[] = [];
+  for (const row of rows.results) {
+    const counts = await env.DB.prepare(
+      `SELECT
+         SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+         SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending
+       FROM batches WHERE run_id = ?`,
+    ).bind(row.id).first<{ done: number | null; failed: number | null; cancelled: number | null; pending: number | null }>();
+    const pending = counts?.pending ?? 0;
+    const failed = counts?.failed ?? 0;
+    const cancelled = counts?.cancelled ?? 0;
+    const status = sweptRunStatus(pending, failed, cancelled, row.email_status);
+    await cancelOpenBatches(env, row.id, "已过截止时间", { now });
+    const previousNotes = row.notes ?? "";
+    const notes = previousNotes.includes(STUCK_FINALIZE_NOTE)
+      ? previousNotes
+      : [previousNotes, STUCK_FINALIZE_NOTE].filter((part) => part.length > 0).join(" ");
+    const updated = await env.DB.prepare(
+      `UPDATE runs
+       SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?
+       WHERE id = ? AND status = 'finalizing'`,
+    ).bind(status, now.toISOString(), counts?.done ?? 0, failed, notes || null, row.id).run();
+    if ((updated.meta.changes ?? 0) > 0) {
+      closed.push(row.id);
+      log("stuck finalizing closed", { runId: row.id, status, pending, failed, cancelled });
+    }
+  }
+  return closed;
+}
+
 export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
+  const swept = new Set(await closeStuckFinalizing(env, now));
   const rows = await env.DB.prepare(
     `SELECT id FROM runs
      WHERE deadline_at <= ? AND (
@@ -1755,6 +1861,7 @@ export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
      )`,
   ).bind(now.toISOString()).all<{ id: string }>();
   for (const row of rows.results) {
+    if (swept.has(row.id)) continue;
     await finalizeRun(env, row.id, "deadline");
   }
 }

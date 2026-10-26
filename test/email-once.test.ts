@@ -52,7 +52,7 @@ describe("日报只发一次", () => {
     vi.unstubAllGlobals();
   });
 
-  it("收割重新打开未完成运行后，下一小时不再发第二封", async () => {
+  it("已发信的未完成运行不会被重新打开，也不会再发一封", async () => {
     const sqlite = openDatabase();
     const now = new Date("2026-10-15T03:00:00.000Z");
     const windowStart = "2026-10-14T02:00:00.000Z";
@@ -117,8 +117,22 @@ describe("日报只发一次", () => {
     expect(afterFirst.email_sent_at).toBeTruthy();
     expect(afterFirst.finalize_enqueued_at).toBeTruthy();
 
+    const batchAfterDeadline = sqlite.prepare("SELECT status, error FROM batches WHERE id = ?").get("batch-x") as {
+      status: string;
+      error: string;
+    };
+    expect(batchAfterDeadline).toEqual({ status: "cancelled", error: "已过截止时间" });
+
     await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
-    expect(sqlite.prepare("SELECT status FROM runs WHERE id = ?").get("run-scheduled")).toEqual({ status: "running" });
+    await requeueStuckBatches(env, { now, force: true, runId: "run-scheduled" });
+    const reopened = sqlite.prepare("SELECT status, finished_at, email_status FROM runs WHERE id = ?").get("run-scheduled") as {
+      status: string;
+      finished_at: string | null;
+      email_status: string;
+    };
+    expect(reopened.status).toBe("incomplete");
+    expect(reopened.finished_at).toBeTruthy();
+    expect(reopened.email_status).toBe("sent");
     const finalizeMessages = () => queued.filter((message) => message.type === "finalize");
     expect(finalizeMessages()).toHaveLength(0);
     await maybeEnqueueFinalize(env, "run-scheduled");
@@ -126,6 +140,7 @@ describe("日报只发一次", () => {
 
     await finalizeOverdue(env, new Date(now.getTime() + 60 * 60 * 1000));
     expect(mails).toHaveLength(1);
+    expect(sqlite.prepare("SELECT status FROM runs WHERE id = ?").get("run-scheduled")).toEqual({ status: "incomplete" });
     const logged = sqlite.prepare(
       "SELECT kind, status, message_id, attachment_mode, recipients FROM email_log",
     ).all() as Array<{ kind: string; status: string; message_id: string; attachment_mode: string; recipients: string }>;
