@@ -12,6 +12,7 @@ interface InterpretRow {
   matched_term: string;
   terms: string | null;
   description: string | null;
+  match_mode?: "phrase" | "all_words";
 }
 
 export async function interpretStoredRecords(env: Env, input: {
@@ -35,6 +36,7 @@ export async function interpretStoredRecords(env: Env, input: {
       targetName: row.matched_target || "",
       terms,
       description: row.description ?? "",
+      matchMode: row.match_mode ?? "phrase",
       fetchImpl: globalThis.fetch.bind(globalThis),
     });
     const scoreFailed = outcome.score == null && Boolean(outcome.relevanceError);
@@ -76,7 +78,7 @@ async function selectedRows(db: D1Database, ids: string[]): Promise<InterpretRow
   if (ids.length === 0) return [];
   const marks = ids.map(() => "?").join(",");
   const result = await db.prepare(
-    `SELECT r.id, r.original_text, r.source_lang, r.matched_target, r.matched_term, t.terms, t.description
+    `SELECT r.id, r.original_text, r.source_lang, r.matched_target, r.matched_term, t.terms, t.description, t.match_mode
      FROM records r LEFT JOIN targets t ON t.id = r.matched_target_id
      WHERE r.deleted_at IS NULL AND r.id IN (${marks})`,
   ).bind(...ids).all<InterpretRow>();
@@ -93,7 +95,7 @@ const PENDING_SQL = `
 
 async function pendingRows(db: D1Database): Promise<InterpretRow[]> {
   const result = await db.prepare(
-    `SELECT r.id, r.original_text, r.source_lang, r.matched_target, r.matched_term, t.terms, t.description
+    `SELECT r.id, r.original_text, r.source_lang, r.matched_target, r.matched_term, t.terms, t.description, t.match_mode
      FROM records r LEFT JOIN targets t ON t.id = r.matched_target_id
      WHERE ${PENDING_SQL}
      ORDER BY r.collected_at DESC LIMIT ?`,

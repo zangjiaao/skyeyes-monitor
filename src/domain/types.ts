@@ -4,7 +4,11 @@ export type TargetKind = (typeof TARGET_KINDS)[number];
 export const SOURCE_IDS = ["x", "google_news", "gdelt"] as const;
 export type SourceId = (typeof SOURCE_IDS)[number];
 
+export const MATCH_MODES = ["phrase", "all_words"] as const;
+export type MatchMode = (typeof MATCH_MODES)[number];
+
 export interface QueryTarget {
+  matchMode?: MatchMode;
   id: string;
   kind: TargetKind;
   name: string;
@@ -60,6 +64,7 @@ export interface BatchResume {
 }
 
 export interface PageCheckpoint {
+  diagnostic?: SearchDiagnosticContext;
   records: CollectedRecord[];
   /** 这一页全部入库后，下次从这里继续。 */
   resume: BatchResume;
@@ -69,7 +74,30 @@ export interface PageCheckpoint {
   filtered: number;
 }
 
+export interface SearchDiagnosticContext {
+  matchMode?: MatchMode;
+  targetId: string;
+  terms: string[];
+  query: string;
+  step: number;
+  page: number;
+  edition?: string;
+}
+
+export type SearchDiagnostic = SearchDiagnosticContext & {
+  event: "request" | "response" | "result" | "error" | "wait";
+  delaySeconds?: number;
+  reason?: string;
+  status?: number;
+  elapsedMs?: number;
+  rawItems?: number;
+  matchedItems?: number;
+  rejectedItems?: number;
+  error?: string;
+};
+
 export interface SearchRequest {
+  onDiagnostic?: (diagnostic: SearchDiagnostic) => void | Promise<void>;
   targets: QueryTarget[];
   window: TimeWindow;
   countryName: string;
@@ -79,7 +107,7 @@ export interface SearchRequest {
   excludeRetweets?: boolean;
   /** Google News 版本列表，逗号分隔。空则用 en-US 和 zh-CN。 */
   googleNewsEditions?: string;
-  beforeRequest?: () => Promise<void>;
+  beforeRequest?: (context?: SearchDiagnosticContext) => Promise<void>;
   onRateLimit?: (info: RateLimitNotice) => Promise<void>;
   onPage?: (page: PageCheckpoint) => Promise<void>;
   resume?: BatchResume | null;

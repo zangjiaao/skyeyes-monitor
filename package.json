@@ -5,13 +5,14 @@
   "description": "Daily X and web monitor on Cloudflare Workers",
   "type": "module",
   "scripts": {
-    "dev": "npm run build && wrangler dev",
+    "dev": "npm run build && npm run db:migrate:local && wrangler dev",
     "dev:admin": "vite --config admin/vite.config.ts",
     "build": "vite build --config admin/vite.config.ts",
     "typecheck": "wrangler types && tsc -p tsconfig.json --noEmit && tsc -p admin/tsconfig.json --noEmit",
     "test": "vitest run",
     "cf-typegen": "wrangler types",
-    "astryx": "node node_modules/@astryxdesign/cli/clients/cli/bin/astryx.mjs"
+    "astryx": "node node_modules/@astryxdesign/cli/clients/cli/bin/astryx.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply skyeyes-monitor --local"
   },
   "repository": {
     "type": "git",

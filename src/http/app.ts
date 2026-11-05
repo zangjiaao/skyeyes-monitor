@@ -1,10 +1,11 @@
+import { batchActivity, parseObject, runStallReason } from "../monitoring/run-view";
 import { Hono } from "hono";
 import { assertAllowedEmail, authenticate } from "../auth/access";
 import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, validateSettingsPatch } from "../config/settings";
 import { probeTranslationFallbackModel } from "../translate";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule, utcOffsetLabel } from "../domain/time";
-import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
+import { assertTermList, flagEnabled, joinTerms, parseMatchMode, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 import {
   buildTargetExportCsv,
@@ -25,7 +26,7 @@ import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
 import { enqueueErrorMessage } from "../pipeline/queue-batch";
-import { ActiveRunError, cancelRun, requeueStuckBatches } from "../pipeline/run";
+import { ActiveRunError, RunScopeError, parseRunCountryIds, cancelRun, requeueStuckBatches } from "../pipeline/run";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -69,6 +70,7 @@ interface StoredTargetRow {
   description: string | null;
   enabled: number;
   case_sensitive: number;
+  match_mode?: "phrase" | "all_words";
 }
 
 interface IndexedTarget extends ExistingTarget {
@@ -85,7 +87,7 @@ function targetNameKey(target: { countryCode: string; kind: string; name: string
 
 async function loadExistingTargets(db: D1Database, countryId?: string): Promise<IndexedTarget[]> {
   const sql = `SELECT t.id, t.country_id, c.code AS country_code, t.kind, t.name, t.query, t.terms,
-                      t.exclude_terms, t.description, t.enabled, t.case_sensitive
+                      t.exclude_terms, t.description, t.enabled, t.case_sensitive, t.match_mode
                FROM targets t
                JOIN countries c ON c.id = t.country_id
                ${countryId ? "WHERE t.country_id = ?" : ""}
@@ -105,6 +107,7 @@ async function loadExistingTargets(db: D1Database, countryId?: string): Promise<
       description: row.description ?? "",
       enabled: row.enabled === 1,
       caseSensitive: row.case_sensitive === 1,
+      matchMode: row.match_mode ?? "phrase",
     };
   });
 }
@@ -143,7 +146,8 @@ async function applyTargetImport(
         && sameTerms(current.excludeTerms, row.excludeTerms)
         && current.description === row.description
         && current.enabled === row.enabled
-        && current.caseSensitive === row.caseSensitive;
+        && current.caseSensitive === row.caseSensitive
+        && (current.matchMode ?? "phrase") === (row.matchMode ?? current.matchMode ?? "phrase");
       if (same) {
         unchanged += 1;
         continue;
@@ -151,7 +155,7 @@ async function applyTargetImport(
       await db.prepare(
         `UPDATE targets
          SET country_id = ?, kind = ?, name = ?, query = ?, terms = ?, exclude_terms = ?,
-             case_sensitive = ?, enabled = ?, description = ?
+             case_sensitive = ?, enabled = ?, description = ?, match_mode = ?
          WHERE id = ?`,
       ).bind(
         countryId,
@@ -163,6 +167,7 @@ async function applyTargetImport(
         row.caseSensitive ? 1 : 0,
         row.enabled ? 1 : 0,
         row.description,
+        row.matchMode ?? current.matchMode ?? "phrase",
         row.id,
       ).run();
       const oldKey = targetNameKey(current);
@@ -176,6 +181,7 @@ async function applyTargetImport(
       current.description = row.description;
       current.enabled = row.enabled;
       current.caseSensitive = row.caseSensitive;
+      current.matchMode = row.matchMode ?? current.matchMode ?? "phrase";
       byName.set(targetNameKey(current), current);
       updated += 1;
       continue;
@@ -186,8 +192,8 @@ async function applyTargetImport(
       const id = crypto.randomUUID();
       await db.prepare(
         `INSERT INTO targets (
-          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at, match_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         countryId,
@@ -200,6 +206,7 @@ async function applyTargetImport(
         row.description,
         row.enabled ? 1 : 0,
         now,
+        row.matchMode ?? "phrase",
       ).run();
       const createdTarget: IndexedTarget = {
         id,
@@ -212,6 +219,7 @@ async function applyTargetImport(
         description: row.description,
         enabled: row.enabled,
         caseSensitive: row.caseSensitive,
+        matchMode: row.matchMode ?? "phrase",
       };
       byId.set(id, createdTarget);
       byName.set(key, createdTarget);
@@ -223,18 +231,20 @@ async function applyTargetImport(
     const caseSensitive = current.caseSensitive || row.caseSensitive;
     const description = row.description || current.description;
     const enabled = row.enabled;
+    const matchMode = row.matchMode ?? current.matchMode ?? "phrase";
     const changed = !sameTerms(terms, current.terms)
       || !sameTerms(excludeTerms, current.excludeTerms)
       || caseSensitive !== current.caseSensitive
       || description !== current.description
-      || enabled !== current.enabled;
+      || enabled !== current.enabled
+      || matchMode !== (current.matchMode ?? "phrase");
     if (!changed) {
       unchanged += 1;
       continue;
     }
     await db.prepare(
       `UPDATE targets
-       SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?
+       SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?, match_mode = ?
        WHERE id = ?`,
     ).bind(
       terms[0],
@@ -243,6 +253,7 @@ async function applyTargetImport(
       caseSensitive ? 1 : 0,
       enabled ? 1 : 0,
       description,
+      matchMode,
       current.id,
     ).run();
     current.terms = terms;
@@ -250,6 +261,7 @@ async function applyTargetImport(
     current.caseSensitive = caseSensitive;
     current.description = description;
     current.enabled = enabled;
+    current.matchMode = matchMode;
     updated += 1;
   }
   return { created, updated, unchanged };
@@ -322,6 +334,10 @@ async function loadRateLimit(db: D1Database, now: Date, options: { xQps: number;
 }
 
 interface RunProgress {
+  received: number;
+  calls: number;
+  queriesDone: number;
+  queriesTotal: number;
   pending: number;
   enqueued: number;
   running: number;
@@ -335,6 +351,7 @@ interface RunProgress {
 }
 
 const EMPTY_PROGRESS: RunProgress = {
+  received: 0, calls: 0, queriesDone: 0, queriesTotal: 0,
   pending: 0,
   enqueued: 0,
   running: 0,
@@ -358,19 +375,29 @@ async function attachRunProgress<T extends { id: string }>(db: D1Database, runs:
        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+       SUM(items_received) AS received, SUM(calls) AS calls,
+       SUM(queries_done) AS queriesDone, SUM(queries_total) AS queriesTotal,
        SUM(items_fetched) AS fetched,
        SUM(items_deduped) AS deduped,
        SUM(items_filtered) AS filtered,
        SUM(items_added) AS added
      FROM batches WHERE run_id IN (${marks}) GROUP BY run_id`,
   ).bind(...runs.map((run) => run.id)).all<RunProgress & { run_id: string }>();
+  const issueRows = await db.prepare(
+    `SELECT run_id, COUNT(*) AS n FROM records WHERE run_id IN (${marks}) AND translation_status = 'translation_failed' GROUP BY run_id`,
+  ).bind(...runs.map((run) => run.id)).all<{ run_id: string; n: number }>();
+  const translationFailures = new Map(issueRows.results.map((row) => [row.run_id, row.n]));
   const byRun = new Map(rows.results.map((row) => [row.run_id, row]));
   return runs.map((run) => {
     const row = byRun.get(run.id);
     return {
       ...run,
+      scope: parseObject((run as Record<string, unknown>).scope_json),
+      translation_failed: translationFailures.get(run.id) ?? 0,
       progress: row
         ? {
+          received: row.received ?? 0, calls: row.calls ?? 0,
+          queriesDone: row.queriesDone ?? 0, queriesTotal: row.queriesTotal ?? 0,
           pending: row.pending ?? 0,
           enqueued: row.enqueued ?? 0,
           running: row.running ?? 0,
@@ -434,7 +461,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         .bind(today.start.toISOString(), today.end.toISOString()).all<{ country_id: string; n: number }>(),
       c.env.DB.prepare(`SELECT country_id, COUNT(*) AS n FROM records WHERE ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ? GROUP BY country_id`)
         .bind(yesterday.start.toISOString(), yesterday.end.toISOString()).all<{ country_id: string; n: number }>(),
-      c.env.DB.prepare("SELECT * FROM runs ORDER BY started_at DESC LIMIT 12").all(),
+      c.env.DB.prepare("SELECT * FROM runs ORDER BY CASE WHEN status IN ('running', 'partial', 'finalizing') THEN 0 ELSE 1 END, started_at DESC LIMIT 30").all(),
       c.env.DB.prepare(
         `SELECT b.id, b.run_id, b.source, b.error, b.finished_at,
                 COALESCE(NULLIF(c.name, ''), '全部') AS country_name
@@ -455,7 +482,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
        JOIN runs r ON r.id = b.run_id
        WHERE r.status IN ('running', 'partial', 'failed')
          AND (
-           (b.status = 'queued' AND (b.enqueued_at IS NULL OR b.enqueued_at <= ?))
+           (b.status = 'queued' AND MAX(COALESCE(b.next_wake_at, ''), CASE WHEN b.enqueued_at LIKE 'claim:%' THEN b.created_at ELSE COALESCE(NULLIF(b.enqueued_at, ''), b.created_at) END) <= ?)
            OR (b.status = 'running' AND (b.lease_expires_at IS NULL OR b.lease_expires_at <= ?))
          )`,
     ).bind(new Date(now.getTime() - 15 * 60 * 1000).toISOString(), now.toISOString()).first<{ n: number }>();
@@ -502,6 +529,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
           configured: Boolean(c.env.TWITTERAPI_IO_KEY),
           healthy: health.get("x")?.status !== "failed",
           lastError: health.get("x")?.error ?? null,
+          lastStatus: health.get("x")?.status ?? null,
         },
         google_news: {
           label: "Google News RSS",
@@ -509,6 +537,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
           configured: true,
           healthy: health.get("google_news")?.status !== "failed",
           lastError: health.get("google_news")?.error ?? null,
+          lastStatus: health.get("google_news")?.status ?? null,
         },
         gdelt: {
           label: "GDELT",
@@ -516,6 +545,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
           configured: true,
           healthy: health.get("gdelt")?.status !== "failed",
           lastError: health.get("gdelt")?.error ?? null,
+          lastStatus: health.get("gdelt")?.status ?? null,
         },
       },
       delivery: {
@@ -599,13 +629,14 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const terms = assertTermList(termsFromUnknown(body.terms ?? body.query ?? body.name), "检索词");
       const excludeTerms = assertTermList(termsFromUnknown(body.excludeTerms ?? body.exclude_terms ?? ""), "排除词", true);
       const caseSensitive = flagEnabled(body.caseSensitive ?? body.case_sensitive) ? 1 : 0;
+      const matchMode = parseMatchMode(body.matchMode !== undefined ? body.matchMode : body.match_mode);
       const country = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(countryId).first();
       if (!country) throw new Error("分组不存在");
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
         `INSERT INTO targets (
-          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at, match_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         countryId,
@@ -618,6 +649,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         descriptionText(body.description),
         body.enabled === false ? 0 : 1,
         new Date().toISOString(),
+        matchMode,
       ).run();
       return c.json({ id }, 201);
     } catch (error) {
@@ -629,8 +661,13 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     try {
       const body = await readJson(c.req.raw);
       const id = c.req.param("id");
+      const hasMatchMode = body.matchMode !== undefined || body.match_mode !== undefined;
+      const matchMode = hasMatchMode ? parseMatchMode(body.matchMode !== undefined ? body.matchMode : body.match_mode) : undefined;
       const current = await c.env.DB.prepare("SELECT id FROM targets WHERE id = ?").bind(id).first();
       if (!current) return c.json({ error: "目标不存在" }, 404);
+      if (matchMode !== undefined) {
+        await c.env.DB.prepare("UPDATE targets SET match_mode = ? WHERE id = ?").bind(matchMode, id).run();
+      }
       if (typeof body.name === "string") {
         await c.env.DB.prepare("UPDATE targets SET name = ? WHERE id = ?").bind(body.name.trim(), id).run();
       }
@@ -1077,13 +1114,16 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.post("/api/runs", async (c) => {
     try {
       let confirm = false;
+      let countryIds: string[] | undefined;
       if ((c.req.header("content-type") ?? "").includes("application/json")) {
         const body = await readJson(c.req.raw);
         confirm = body.confirm === true;
+        countryIds = parseRunCountryIds(body.countryIds);
       }
-      const started = await startManualRun(c.env, new Date(), { confirm });
+      const started = await startManualRun(c.env, new Date(), { confirm, countryIds });
       return c.json(started, 202);
     } catch (error) {
+      if (error instanceof RunScopeError) return jsonError(error, 400);
       if (error instanceof ActiveRunError) {
         return c.json({ error: error.message, code: "active_run", activeRunId: error.activeRunId }, 409);
       }
@@ -1124,18 +1164,61 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   });
 
   app.get("/api/runs", async (c) => {
-    const rows = await c.env.DB.prepare("SELECT * FROM runs ORDER BY started_at DESC LIMIT 30").all();
-    return c.json({ runs: rows.results });
+    const page = Number(c.req.query("page") ?? 1);
+    const filter = c.req.query("status") ?? "all";
+    if (!Number.isInteger(page) || page < 1 || page > 100000 || !["all", "active", "attention", "completed", "cancelled"].includes(filter)) {
+      return c.json({ error: "任务筛选或页码无效" }, 400);
+    }
+    const where = filter === "active" ? "WHERE status IN ('running', 'partial', 'finalizing')"
+      : filter === "attention" ? "WHERE status IN ('failed', 'partial', 'incomplete') OR relevance_failed > 0 OR email_status = 'failed' OR EXISTS (SELECT 1 FROM records WHERE records.run_id = runs.id AND translation_status = 'translation_failed')"
+      : filter === "completed" ? "WHERE status = 'completed'"
+      : filter === "cancelled" ? "WHERE status = 'cancelled'" : "";
+    const rows = await c.env.DB.prepare(`SELECT * FROM runs ${where} ORDER BY started_at DESC, id DESC LIMIT 20 OFFSET ?`)
+      .bind((page - 1) * 20).all<Record<string, unknown> & { id: string }>();
+    const count = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM runs ${where}`).first<{ n: number }>();
+    return c.json({ runs: await attachRunProgress(c.env.DB, rows.results), total: count?.n ?? 0, page, pageSize: 20 });
+  });
+
+  app.get("/api/runs/:id/events", async (c) => {
+    const runId = c.req.param("id");
+    if (!await c.env.DB.prepare("SELECT id FROM runs WHERE id = ?").bind(runId).first()) return c.json({ error: "运行不存在" }, 404);
+    const beforeText = c.req.query("before");
+    const before = beforeText ? Number(beforeText) : null;
+    if (before !== null && (!Number.isSafeInteger(before) || before < 1)) return c.json({ error: "记录游标无效" }, 400);
+    const rows = await c.env.DB.prepare(
+      `SELECT * FROM run_events WHERE run_id = ? ${before === null ? "" : "AND id < ?"} ORDER BY id DESC LIMIT 51`,
+    ).bind(...(before === null ? [runId] : [runId, before])).all<{ id: number; details_json: string }>();
+    const events = rows.results.slice(0, 50).map((row) => ({ ...row, details: parseObject(row.details_json) ?? {} }));
+    return c.json({ events, nextBefore: rows.results.length > 50 ? events[events.length - 1].id : null });
   });
 
   app.get("/api/runs/:id", async (c) => {
-    const run = await c.env.DB.prepare("SELECT * FROM runs WHERE id = ?").bind(c.req.param("id")).first();
+    const runId = c.req.param("id");
+    const run = await c.env.DB.prepare("SELECT * FROM runs WHERE id = ?").bind(runId)
+      .first<Record<string, unknown> & { id: string; status: string; started_at: string; deadline_at: string }>();
     if (!run) return c.json({ error: "运行不存在" }, 404);
     const batches = await c.env.DB.prepare(
       `SELECT b.*, COALESCE(NULLIF(c.name, ''), '全部') AS country_name FROM batches b
        LEFT JOIN countries c ON c.id = b.country_id WHERE b.run_id = ? ORDER BY b.batch_index`,
-    ).bind(c.req.param("id")).all();
-    return c.json({ run, batches: batches.results });
+    ).bind(runId).all<Record<string, unknown> & { status: string; created_at: string; current_query_json?: string }>();
+    const stats = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS stored,
+        SUM(CASE WHEN ${DELIVERABLE_SQL} THEN 1 ELSE 0 END) AS deliverable,
+        SUM(CASE WHEN translation_status = 'translation_failed' THEN 1 ELSE 0 END) AS translationFailed,
+        SUM(CASE WHEN relevance_error IS NOT NULL AND relevance_error <> '' THEN 1 ELSE 0 END) AS relevanceFailed
+       FROM records WHERE run_id = ?`,
+    ).bind(runId).first();
+    const issues = await c.env.DB.prepare(
+      `SELECT id, source, matched_target, translation_error, relevance_error FROM records
+       WHERE run_id = ? AND (translation_status = 'translation_failed' OR (relevance_error IS NOT NULL AND relevance_error <> ''))
+       ORDER BY collected_at DESC LIMIT 20`,
+    ).bind(runId).all();
+    return c.json({
+      run: (await attachRunProgress(c.env.DB, [run]))[0],
+      stallReason: runStallReason(run),
+      batches: batches.results.map((batch) => ({ ...batch, activity: batchActivity(batch, run.status), waitReason: batch.wait_reason ?? null, query: parseObject(batch.current_query_json) })),
+      records: stats, issues: issues.results,
+    });
   });
 
   app.all("/api/*", (c) => c.json({ error: "接口不存在" }, 404));

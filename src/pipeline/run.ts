@@ -1,3 +1,5 @@
+import { recordRunEvent } from "./events";
+import { queryCount } from "./query-plan";
 import { loadSettings, type AppSettings } from "../config/settings";
 import { splitLines } from "../domain/terms";
 import { dedupeRecords } from "../domain/dedupe";
@@ -12,7 +14,7 @@ import {
   type ExistingIdentity,
   type FilterRules,
 } from "../domain/gate";
-import type { BatchResume, CollectedRecord, QueryTarget, SourceId, TargetKind } from "../domain/types";
+import type { BatchResume, CollectedRecord, QueryTarget, SearchDiagnostic, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest } from "../email/compose";
 import { attachmentMode, recordEmailLog } from "../email/log";
@@ -79,6 +81,7 @@ interface TargetRow {
   case_sensitive: number;
   enabled: number;
   description?: string;
+  match_mode?: "phrase" | "all_words";
 }
 
 interface RunRow {
@@ -160,6 +163,7 @@ function toQueryTarget(target: TargetRow): QueryTarget {
     excludeTerms: splitLines(target.exclude_terms),
     caseSensitive: target.case_sensitive === 1,
     description: target.description ?? "",
+    matchMode: target.match_mode ?? "phrase",
   };
 }
 
@@ -417,6 +421,7 @@ export async function cancelRun(env: Env, runId: string): Promise<{ cancelledBat
      SET status = 'cancelled', error = '已取消', finished_at = ?, lease_token = NULL, lease_expires_at = NULL
      WHERE run_id = ? AND status IN ('queued', 'running')`,
   ).bind(now, runId).run();
+  await recordRunEvent(env.DB, { runId, type: "run cancelled", details: { cancelledBatches: cancelled.meta.changes ?? 0 } });
   return { cancelledBatches: cancelled.meta.changes ?? 0 };
 }
 
@@ -426,6 +431,17 @@ async function findActiveRun(db: D1Database): Promise<{ id: string; status: stri
   ).first<{ id: string; status: string }>();
 }
 
+export class RunScopeError extends Error {}
+
+export function parseRunCountryIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 1000
+    || value.some((id) => typeof id !== "string" || !id.trim() || id.length > 80)) {
+    throw new RunScopeError("请选择至少一个有效分组；全量运行请省略 countryIds");
+  }
+  return [...new Set(value.map((id: string) => id.trim()))];
+}
+
 export async function startRun(env: Env, input: {
   trigger: "schedule" | "manual";
   now: Date;
@@ -433,7 +449,29 @@ export async function startRun(env: Env, input: {
   windowStart: Date;
   windowEnd: Date;
   confirm?: boolean;
+  countryIds?: string[];
 }): Promise<{ runId: string; created: boolean; batches: number; enqueued: number; warning: string | null }> {
+  const countryIds = parseRunCountryIds(input.countryIds);
+  let scopedCountries: CountryRow[] | undefined;
+  let scopedTargets: TargetRow[] | undefined;
+  if (countryIds) {
+    if (input.trigger !== "manual") throw new RunScopeError("只有手动运行可以指定分组");
+    const enabled = await env.DB.prepare(
+      "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
+    ).all<CountryRow>();
+    scopedCountries = enabled.results.filter((country) => countryIds.includes(country.id));
+    if (scopedCountries.length !== countryIds.length) throw new RunScopeError("所选分组不存在或已停用，请刷新后重新选择");
+    scopedTargets = [];
+    for (const country of scopedCountries) {
+      const targets = await env.DB.prepare(
+        `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
+         FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
+      ).bind(country.id).all<TargetRow>();
+      if (targets.results.length === 0) throw new RunScopeError(`分组「${country.name}」没有启用的目标`);
+      scopedTargets.push(...targets.results);
+    }
+  }
+  // Validate scope before cancelling an active run or creating a new one.
   const active = await findActiveRun(env.DB);
   if (active) {
     if (!input.confirm) throw new ActiveRunError(active.id);
@@ -470,16 +508,22 @@ export async function startRun(env: Env, input: {
     throw error;
   }
 
-  const countries = await env.DB.prepare(
+  const countries = scopedCountries ? { results: scopedCountries } : await env.DB.prepare(
     "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
   ).all<CountryRow>();
   const targetRows: TargetRow[] = [];
   for (const country of countries.results) {
-    const targets = await env.DB.prepare(
-      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+    const targets = scopedTargets ? { results: scopedTargets.filter((target) => target.country_id === country.id) } : await env.DB.prepare(
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
        FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
     targetRows.push(...targets.results);
+    log("run group planned", {
+      runId, countryId: country.id, countryName: country.name,
+      targetCount: targets.results.length,
+      termCount: targets.results.reduce((sum, target) => sum + (toQueryTarget(target).terms?.length ?? 0), 0),
+      sources: SOURCE_IDS.filter((source) => settings.sources[source]),
+    });
   }
   const inserts: D1PreparedStatement[] = [];
   const messages: MessageSendRequest<CollectMessage>[] = [];
@@ -490,8 +534,8 @@ export async function startRun(env: Env, input: {
       const batchId = crypto.randomUUID();
       inserts.push(env.DB.prepare(
         `INSERT INTO batches (
-          id, run_id, country_id, source, batch_index, target_ids, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`,
+          id, run_id, country_id, source, batch_index, target_ids, status, created_at, queries_total
+        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
       ).bind(
         batchId,
         runId,
@@ -500,14 +544,29 @@ export async function startRun(env: Env, input: {
         messages.length,
         targetIds,
         startedAt,
+        queryCount(source, targetRows.map(toQueryTarget), settings.googleNewsEditions),
       ));
       messages.push(batchQueueMessage(runId, batchId));
     }
   }
 
+  await env.DB.prepare("UPDATE runs SET scope_json = ? WHERE id = ?").bind(JSON.stringify({
+    mode: countryIds ? "selected" : "all",
+    countries: countries.results.map((country) => ({ id: country.id, name: country.name })),
+    targetCount: targetRows.length,
+  }), runId).run();
   if (inserts.length > 0) await runChunk(env.DB, inserts);
   await env.DB.prepare("UPDATE runs SET batches_total = ? WHERE id = ?").bind(messages.length, runId).run();
-  log("run started", { runId, trigger: input.trigger, batches: messages.length });
+  log("run started", {
+    runId, trigger: input.trigger, batches: messages.length,
+    groupCount: countries.results.length, targetCount: targetRows.length,
+    countryIds: countryIds ?? null,
+    windowStart: input.windowStart.toISOString(), windowEnd: input.windowEnd.toISOString(), deadlineAt,
+  });
+  await recordRunEvent(env.DB, { runId, type: "run started", details: {
+    trigger: input.trigger, targetCount: targetRows.length, groupCount: countries.results.length,
+    countryIds: countryIds ?? null, windowStart: input.windowStart.toISOString(), windowEnd: input.windowEnd.toISOString(),
+  } });
   if (messages.length === 0) {
     await finalizeRun(env, runId, "complete");
     return { runId, created: true, batches: 0, enqueued: 0, warning: null };
@@ -523,7 +582,7 @@ async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> 
     const slice = ids.slice(index, index + 80);
     const marks = slice.map(() => "?").join(",");
     const result = await db.prepare(
-      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
        FROM targets WHERE id IN (${marks})`,
     ).bind(...slice).all<TargetRow>();
     rows.push(...result.results);
@@ -644,6 +703,10 @@ async function storeCollected(env: Env, input: {
   reservation: number;
   yieldNow?: () => boolean;
 }): Promise<{
+  reasons: Record<string, number>;
+  inserted: number;
+  storeOnly: number;
+  unprocessed: number;
   added: number;
   filtered: number;
   deduped: number;
@@ -655,6 +718,12 @@ async function storeCollected(env: Env, input: {
   const fetched = input.records.length;
   let deduped = fetched - unique.length;
   let filtered = 0;
+  const reasons: Record<string, number> = {};
+  const countReason = (reason: string, count = 1) => {
+    if (count > 0) reasons[reason] = (reasons[reason] ?? 0) + count;
+  };
+  countReason("page_duplicate_or_invalid", deduped);
+  let processed = 0;
   const collectedAt = new Date().toISOString();
   const window = { start: new Date(input.run.window_start), end: new Date(input.run.window_end) };
   const rules = rulesFromSettings(input.settings);
@@ -686,8 +755,10 @@ async function storeCollected(env: Env, input: {
       deferReason = "wall";
       break;
     }
+    processed += 1;
     if (!record.matchedTargetId || !record.matchedTerm?.trim()) {
       filtered += 1;
+      countReason("missing_attribution");
       continue;
     }
     try {
@@ -704,6 +775,7 @@ async function storeCollected(env: Env, input: {
         relevanceThreshold: input.settings.relevanceThreshold,
       });
       if (timeOnly.timeStatus === "out_of_window" || ruleReason) {
+        countReason(timeOnly.timeStatus === "out_of_window" ? "time:out_of_window" : ruleReason!);
         filtered += 1;
         continue;
       }
@@ -718,6 +790,7 @@ async function storeCollected(env: Env, input: {
         republish = isRepublish({ urlKey, titleKey }, [...existing, ...accepted]);
         if (republish) {
           deduped += 1;
+          countReason("global_duplicate");
           continue;
         }
       }
@@ -737,6 +810,7 @@ async function storeCollected(env: Env, input: {
         && record.text
         && (input.settings.aiEnabled || input.settings.translationEnabled || input.settings.relevanceEnabled);
       if (shouldInterpret && input.reservation > 0 && input.budget.remaining < input.reservation) {
+        processed -= 1;
         deferred = true;
         deferReason = "budget";
         break;
@@ -754,6 +828,7 @@ async function storeCollected(env: Env, input: {
           targetName: record.matchedTarget,
           terms,
           description: target?.description ?? "",
+          matchMode: target?.match_mode ?? "phrase",
           fetchImpl: globalThis.fetch.bind(globalThis),
           charge,
         });
@@ -788,6 +863,7 @@ async function storeCollected(env: Env, input: {
         relevant,
       });
       if (admission.action === "drop") {
+        countReason(admission.excludeReason ?? "admission_drop");
         filtered += 1;
         continue;
       }
@@ -814,11 +890,13 @@ async function storeCollected(env: Env, input: {
       });
     } catch (error) {
       if (error instanceof DeferredBatchError) {
+        processed -= 1;
         deferred = true;
         deferReason = "budget";
         break;
       }
       filtered += 1;
+      countReason("record_error");
       logError("record skipped", error, { runId: input.runId, batchId: input.batchId, url: record.url });
     }
   }
@@ -879,7 +957,21 @@ async function storeCollected(env: Env, input: {
     if (kept[index]?.excludeReason) return sum;
     return sum + (item.meta.changes ?? 0);
   }, 0);
-  return { added, filtered, deduped, relevanceFailures, deferred, deferReason };
+  let insertedCount = 0;
+  let storeOnly = 0;
+  inserted.forEach((item, index) => {
+    const changes = item.meta.changes ?? 0;
+    insertedCount += changes;
+    if (changes === 0) countReason("insert_conflict");
+    else if (kept[index]?.excludeReason) {
+      storeOnly += changes;
+      countReason(kept[index].excludeReason!, changes);
+    }
+  });
+  return {
+    added, filtered, deduped, relevanceFailures, deferred, deferReason,
+    reasons, inserted: insertedCount, storeOnly, unprocessed: unique.length - processed,
+  };
 }
 
 function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
@@ -898,13 +990,13 @@ function parseResume(raw: string | null | undefined, source: SourceId): BatchRes
   }
 }
 
-async function paceSource(env: Env, source: SourceId, settings: AppSettings, inlineLimitMs: number): Promise<void> {
+async function paceSource(env: Env, source: SourceId, settings: AppSettings, inlineLimitMs: number, onWait?: (waitMs: number) => Promise<void>): Promise<void> {
   const inline = Math.max(0, Math.floor(inlineLimitMs));
   const now = pacing.now();
   if (source === "x") {
     const slot = await tryReserveXSlot(env.DB, settings.xQps, inline, now);
-    if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)));
-    if (slot.waitMs > 0) await pacing.sleep(slot.waitMs);
+    if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)), "等待 X 请求间隔");
+    if (slot.waitMs > 0) { await onWait?.(slot.waitMs); await pacing.sleep(slot.waitMs); }
     return;
   }
   const intervalSec = source === "gdelt"
@@ -915,8 +1007,8 @@ async function paceSource(env: Env, source: SourceId, settings: AppSettings, inl
   if (intervalSec <= 0) return;
   const name = source === "gdelt" ? GDELT_RATE_SLOT : GOOGLE_NEWS_RATE_SLOT;
   const slot = await tryReserveSlot(env.DB, name, intervalSec * 1000, inline, now);
-  if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)));
-  if (slot.waitMs > 0) await pacing.sleep(slot.waitMs);
+  if (!slot.ok) throw new DeferredBatchError(Math.max(1, Math.ceil(slot.waitMs / 1000)), `等待 ${source} 请求间隔`);
+  if (slot.waitMs > 0) { await onWait?.(slot.waitMs); await pacing.sleep(slot.waitMs); }
 }
 
 export async function scheduleDeferredWake(
@@ -926,6 +1018,7 @@ export async function scheduleDeferredWake(
   token: string | null,
   delaySeconds: number,
   rate?: RateLimitError,
+  deferReason?: string,
 ): Promise<void> {
   const run = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
     .bind(runId)
@@ -975,6 +1068,10 @@ export async function scheduleDeferredWake(
     return;
   }
   logWarn("batch deferred", { runId, batchId, delaySeconds: delay, deferCount: updated.defer_count });
+  await recordRunEvent(env.DB, { runId, batchId, type: "batch deferred", details: {
+    delaySeconds: delay, deferCount: updated.defer_count, wakeAt,
+    reason: rate?.message ?? deferReason ?? "等待续跑",
+  } });
   try {
     await env.COLLECT_QUEUE.send({ type: "batch", runId, batchId }, { delaySeconds: delay });
     await env.DB.prepare(
@@ -1013,7 +1110,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const running = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM batches WHERE status = 'running'",
     ).first<{ n: number }>();
-    if ((running?.n ?? 0) >= settings.queueConcurrency) throw new DeferredBatchError(COORDINATOR_GATE_DELAY_SEC);
+    if ((running?.n ?? 0) >= settings.queueConcurrency) throw new DeferredBatchError(COORDINATOR_GATE_DELAY_SEC, "达到采集并发上限，等待其他来源释放槽位");
     const claimed = await claimBatch(env, runId, batchId);
     if (!claimed) return;
     token = claimed.token;
@@ -1040,10 +1137,36 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const country = countryFor(targets[0]?.id);
     const provider = getProvider(batch.source);
     const yieldNow = () => pacing.now() - startedMs >= COORDINATOR_WALL_MS - COORDINATOR_WALL_RESERVE_MS;
+    const targetById = new Map(targets.map((target) => [target.id, target]));
+    const diagnosticOwner = (targetId: string | undefined) => {
+      const target = targetId ? targetById.get(targetId) : undefined;
+      const owner = targetId ? countryByTarget.get(targetId) : undefined;
+      return { countryId: owner?.id, countryName: owner?.name, targetName: target?.name };
+    };
+    log("batch started", {
+      runId, batchId, source: batch.source, targetCount: targets.length,
+      resumeStep: parseResume(batch.resume_json, batch.source)?.step ?? 0,
+      resumePage: parseResume(batch.resume_json, batch.source)?.page ?? 0,
+      windowStart: run.window_start, windowEnd: run.window_end,
+    });
+    await recordRunEvent(env.DB, { runId, batchId, source: batch.source, type: "batch started", details: {
+      resumeStep: parseResume(batch.resume_json, batch.source)?.step ?? 0,
+      resumePage: parseResume(batch.resume_json, batch.source)?.page ?? 0,
+    } });
     let checkpointFound = 0;
+    let checkpointAdded = 0;
+    let checkpointFiltered = 0;
+    let checkpointDeduped = 0;
     let seenProviderFiltered = 0;
     let seenCalls = 0;
+    const onDiagnostic = async (diagnostic: SearchDiagnostic) => {
+      const details = { ...diagnosticOwner(diagnostic.targetId), ...diagnostic };
+      const type = `source query ${diagnostic.event}`;
+      log(type, { runId, batchId, source: batch.source, ...details });
+      await recordRunEvent(env.DB, { runId, batchId, source: batch.source, type, details });
+    };
     const result = await provider.search({
+      onDiagnostic,
       targets: targets.map(toQueryTarget),
       window: { start: new Date(run.window_start), end: new Date(run.window_end) },
       countryName: country.name,
@@ -1055,12 +1178,14 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       googleNewsEditions: settings.googleNewsEditions,
       queueAttempt: (batch.defer_count ?? 0) + 1,
       resume: parseResume(batch.resume_json, batch.source),
-      beforeRequest: async () => {
+      beforeRequest: async (context) => {
         const remaining = COORDINATOR_WALL_MS - (pacing.now() - startedMs);
-        if (remaining < COORDINATOR_WALL_RESERVE_MS) throw new DeferredBatchError(1);
+        if (remaining < COORDINATOR_WALL_RESERVE_MS) throw new DeferredBatchError(1, "本次执行时间接近上限，保存进度后续跑");
         if (!(await renewLease(env, batchId, leaseToken))) throw new BatchLostError();
         beginSourceFetch(budget, reservation);
-        await paceSource(env, batch.source, settings, remaining - COORDINATOR_WALL_RESERVE_MS);
+        await paceSource(env, batch.source, settings, remaining - COORDINATOR_WALL_RESERVE_MS, async (waitMs) => {
+          if (context) await onDiagnostic({ ...context, event: "wait", delaySeconds: waitMs / 1000, reason: `等待 ${batch.source} 请求间隔` });
+        });
       },
       onRateLimit: async (info) => {
         await recordRateEvent(env.DB, { source: batch.source, ...info });
@@ -1107,9 +1232,23 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
              WHERE id = ? AND status NOT IN ('cancelled')`,
           ).bind(stored.added, stored.relevanceFailures, runId).run();
         }
+        const nextResume = stored.deferred ? (page.repeatResume ?? page.resume) : page.resume;
+        const pageDetails = {
+          ...diagnosticOwner(page.diagnostic?.targetId), ...page.diagnostic,
+          matchedItems: page.records.length, inserted: stored.inserted,
+          added: stored.added, storeOnly: stored.storeOnly, deduped: stored.deduped,
+          filtered: stored.filtered, providerFiltered, reasons: stored.reasons,
+          unprocessed: stored.unprocessed, deferred: stored.deferred, deferReason: stored.deferReason,
+          nextStep: nextResume.step, nextPage: nextResume.page,
+        };
+        log("source page stored", { runId, batchId, source: batch.source, ...pageDetails });
+        await recordRunEvent(env.DB, { runId, batchId, source: batch.source, type: "source page stored", details: pageDetails });
+        checkpointAdded += stored.added;
+        checkpointFiltered += stored.filtered + providerFiltered;
+        checkpointDeduped += stored.deduped;
         checkpointFound += page.records.length;
         if (stored.deferred) {
-          throw stored.deferReason === "wall" ? new DeferredBatchError(1) : new SubrequestBudgetError();
+          throw stored.deferReason === "wall" ? new DeferredBatchError(1, "本次执行时间接近上限，保存进度后续跑") : new SubrequestBudgetError();
         }
       },
     });
@@ -1209,6 +1348,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           targetName: record.matchedTarget,
           terms,
           description: target?.description ?? "",
+          matchMode: target?.match_mode ?? "phrase",
           fetchImpl: globalThis.fetch.bind(globalThis),
           charge: () => budget.charge(),
         });
@@ -1363,11 +1503,14 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       runId,
       batchId,
       source: batch.source,
-      items: unique.length,
-      added,
-      filtered,
+      scope: "invocation",
+      items: checkpointFound + unique.length,
+      added: checkpointAdded + added,
+      filtered: checkpointFiltered + filtered,
+      deduped: checkpointDeduped + deduped,
       relevanceFailed: relevanceFailures,
     });
+    await recordRunEvent(env.DB, { runId, batchId, source: batch.source, type: "batch done" });
     await maybeEnqueueFinalize(env, runId);
   } catch (error) {
     if (error instanceof BatchLostError) return;
@@ -1379,6 +1522,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         token,
         error.delaySeconds,
         error instanceof RateLimitError ? error : undefined,
+        error.message,
       );
       return;
     }
@@ -1388,6 +1532,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
         if (!released) return;
       }
       logError("batch retry", error, { runId, batchId });
+      await recordRunEvent(env.DB, { runId, batchId, source: batch.source, type: "batch retry", details: { error: errorMessage(error) } });
       throw error;
     }
     if (token && !(await ownsBatch(env, batchId, token))) return;
@@ -1408,6 +1553,7 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
     ).bind(runId).run();
   }
   logError("batch failed", new Error(message), { runId, batchId });
+  await recordRunEvent(env.DB, { runId, batchId, type: "batch failed", details: { error: message.slice(0, 500) } });
 }
 
 export async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
@@ -1761,6 +1907,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     runId,
   ).run();
   log("run finalized", { runId, reason, incomplete, emailStatus });
+  await recordRunEvent(env.DB, { runId, type: "run finalized", details: { reason, incomplete, emailStatus } });
 }
 
 export async function handleDeadLetter(env: Env, message: CollectMessage): Promise<void> {

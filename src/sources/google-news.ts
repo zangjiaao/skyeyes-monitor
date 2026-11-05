@@ -1,3 +1,4 @@
+import { fetchSearchPage, reportSearchResult } from "./diagnostics";
 import { buildNewsTermQuery, searchPlan } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { normalizeTitle } from "../domain/gate";
@@ -164,8 +165,8 @@ export const googleNewsProvider: SourceProvider = {
         url.searchParams.set("hl", edition.hl);
         url.searchParams.set("gl", edition.gl);
         url.searchParams.set("ceid", edition.ceid);
-        if (request.beforeRequest) await request.beforeRequest();
-        const response = await request.fetchImpl(url);
+        const diagnostic = { matchMode: step.target.matchMode ?? "phrase", targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: 0, edition: edition.id };
+        const response = await fetchSearchPage(request, diagnostic, url);
         calls += 1;
         if (response.status === 429 || response.status === 503) {
           const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
@@ -183,7 +184,8 @@ export const googleNewsProvider: SourceProvider = {
         }
         const xml = await response.text();
         const pageRecords: CollectedRecord[] = [];
-        for (const item of parseRssItems(xml)) {
+        const items = parseRssItems(xml);
+        for (const item of items) {
           let converted: CollectedRecord[] = [];
           try {
             converted = rssItemsToRecords([item], request, { target: step.target, term: step.term, edition });
@@ -205,10 +207,11 @@ export const googleNewsProvider: SourceProvider = {
             pageRecords.push({ ...record, matchedTerm: verdict.term });
           }
         }
+        await reportSearchResult(request, diagnostic, items.length, pageRecords.length);
         const repeatResume = { source: "google_news" as const, step: stepIndex, page: 0, cursor: "" };
         const nextResume = { source: "google_news" as const, step: stepIndex + 1, page: 0, cursor: "" };
         if (request.onPage) {
-          await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
+          await request.onPage({ diagnostic, records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
         } else {
           records.push(...pageRecords);
         }

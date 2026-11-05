@@ -67,7 +67,7 @@ describe("目标导入模板", () => {
     expect(help[1]?.[0]).toBe("目标ID");
     const sheet = book.Sheets["目标"];
     const xml = new TextDecoder().decode(bytes);
-    expect(sheet["!autofilter"]?.ref).toBe("A1:I3");
+    expect(sheet["!autofilter"]?.ref).toBe("A1:J3");
     expect(xml).toContain('<col min="1" max="1" width="38');
     expect(xml).toContain('<col min="9" max="9" width="24');
     expect(xml).toContain('state="frozen"');
@@ -160,7 +160,7 @@ missing-id,pk,keyword,新目标,hello
     expect(book.SheetNames).toEqual(["目标", "填写说明"]);
     const sheet = book.Sheets["目标"];
     const xml = new TextDecoder().decode(bytes);
-    expect(sheet["!autofilter"]?.ref).toBe("A1:I3");
+    expect(sheet["!autofilter"]?.ref).toBe("A1:J3");
     expect(xml).toContain('<col min="1" max="1" width="38');
     expect(xml).toContain('state="frozen"');
     const preview = previewXlsx(bytes, ["pk"], STORED);

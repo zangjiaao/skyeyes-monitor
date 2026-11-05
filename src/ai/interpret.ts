@@ -1,3 +1,4 @@
+import type { MatchMode } from "../domain/types";
 import type { AppSettings } from "../config/settings";
 import { detectSourceLang } from "../domain/lang";
 import { scoreRelevance } from "../domain/relevance";
@@ -31,6 +32,7 @@ export interface InterpretInput {
   hintedLang?: string | null;
   targetName: string;
   terms: string[];
+  matchMode?: MatchMode;
   description: string;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
@@ -120,6 +122,7 @@ export async function callDeepseek(input: {
   text: string;
   targetName: string;
   terms: string[];
+  matchMode?: MatchMode;
   description: string;
   fetchImpl: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
@@ -141,6 +144,7 @@ export async function callDeepseek(input: {
         content: [
           `监测对象：${input.targetName.slice(0, 80)}`,
           `检索词：${input.terms.slice(0, 12).join("、").slice(0, 300)}`,
+          ...(input.matchMode === "all_words" ? ["检索方式：每行词组中的全部词需同时出现，词序不限、不要求连续；多行条件任一命中即可。"] : []),
           `背景：${input.description.trim().slice(0, 500) || "无"}`,
           `正文：${input.text.trim().slice(0, TEXT_LIMIT)}`,
         ].join("\n"),
@@ -228,6 +232,7 @@ export async function interpretRecord(input: InterpretInput): Promise<Interpreta
       text: input.text,
       targetName: input.targetName,
       terms: input.terms,
+      matchMode: input.matchMode,
       description: input.description,
       fetchImpl,
       sleepImpl: input.sleepImpl,

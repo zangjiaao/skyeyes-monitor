@@ -32,8 +32,8 @@ export const FINALIZING_GRACE_MS = 20 * 60 * 1000;
 export class DeferredBatchError extends Error {
   readonly delaySeconds: number;
 
-  constructor(delaySeconds: number) {
-    super("采集稍后再试");
+  constructor(delaySeconds: number, reason = "采集稍后再试") {
+    super(reason);
     this.name = "DeferredBatchError";
     this.delaySeconds = Math.max(1, Math.floor(delaySeconds));
   }

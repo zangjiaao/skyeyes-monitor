@@ -1,4 +1,4 @@
-import { termsOf } from "./terms";
+import { searchParts, termsOf } from "./terms";
 import type { QueryTarget, TimeWindow } from "./types";
 
 export const MAX_QUERY_CHARS = 450;
@@ -23,7 +23,7 @@ export function clauseForTerm(target: QueryTarget, term: string): string {
     const handle = raw.replace(/[^A-Za-z0-9_]/g, "");
     return handle ? `from:${handle}` : "";
   }
-  return `"${raw}"`;
+  return searchParts(target, raw).map((part) => `"${part}"`).join(" ");
 }
 
 export function clauseForTarget(target: QueryTarget): string {
@@ -71,7 +71,8 @@ export function buildNewsTermQuery(target: QueryTarget, term: string, window: Ti
   const after = window.start.toISOString().slice(0, 10);
   const beforeDate = new Date(window.end.getTime() + 24 * 60 * 60 * 1000);
   const before = beforeDate.toISOString().slice(0, 10);
-  return [`"${raw}"`, ...excludeClauses(target), `after:${after}`, `before:${before}`].join(" ");
+  const clause = searchParts(target, raw).map((part) => `"${part}"`).join(" ");
+  return [clause, ...excludeClauses(target), `after:${after}`, `before:${before}`].join(" ");
 }
 
 function gdeltQuote(term: string): string {
@@ -87,7 +88,7 @@ function gdeltExcludes(target: QueryTarget): string[] {
 }
 
 export function buildGdeltTermQuery(target: QueryTarget, term: string): string {
-  const quoted = gdeltQuote(term);
+  const quoted = searchParts(target, term).map(gdeltQuote).filter(Boolean).join(" ");
   if (!quoted) return "";
   return [quoted, ...gdeltExcludes(target)].join(" ");
 }
@@ -105,6 +106,13 @@ export function buildGdeltOrQuery(target: QueryTarget, terms: string[]): string 
 }
 
 export function packGdeltQueries(target: QueryTarget, maxChars = MAX_QUERY_CHARS): GdeltQueryGroup[] {
+  // Keep AND conditions as separate requests: GDELT OR blocks cannot be nested.
+  if (target.matchMode === "all_words" && target.kind !== "handle") {
+    return termsOf(target).flatMap((term) => {
+      const query = buildGdeltTermQuery(target, term);
+      return query ? [{ query, terms: [term] }] : [];
+    });
+  }
   const terms = termsOf(target).map((term) => term.trim()).filter((term) => gdeltQuote(term));
   const groups: GdeltQueryGroup[] = [];
   let current: string[] = [];

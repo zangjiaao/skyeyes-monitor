@@ -1,6 +1,6 @@
 import * as XLSX from "xlsx";
-import { assertTermList, flagEnabled, splitImportTerms, uniqueTerms } from "../domain/terms";
-import { TARGET_KINDS, type TargetKind } from "../domain/types";
+import { assertTermList, parseMatchMode, flagEnabled, splitImportTerms, uniqueTerms } from "../domain/terms";
+import { TARGET_KINDS, type MatchMode, type TargetKind } from "../domain/types";
 import { freezeFirstSheet } from "./xlsx-zip";
 
 export interface ImportRow {
@@ -12,6 +12,7 @@ export interface ImportRow {
   terms: string[];
   excludeTerms: string[];
   caseSensitive: boolean;
+  matchMode?: MatchMode;
   enabled: boolean;
   description: string;
 }
@@ -28,6 +29,7 @@ export interface ExistingTarget {
   description: string;
   enabled: boolean;
   caseSensitive: boolean;
+  matchMode?: MatchMode;
 }
 
 export interface ImportPreviewRow {
@@ -41,6 +43,7 @@ export interface ImportPreviewRow {
   description: string;
   enabled: boolean;
   caseSensitive: boolean;
+  matchMode?: MatchMode;
   errors: string[];
   duplicateOf: number | null;
   action: ImportAction;
@@ -62,9 +65,10 @@ export const TEMPLATE_HEADERS = [
   "背景说明",
   "启用",
   "英文短语区分大小写",
+  "匹配方式",
 ] as const;
 
-const COLUMN_WIDTHS = [38, 12, 16, 24, 56, 28, 36, 10, 24];
+const COLUMN_WIDTHS = [38, 12, 16, 24, 56, 28, 36, 10, 24, 22];
 
 export const TEMPLATE_EXAMPLES: string[][] = [
   [
@@ -99,6 +103,7 @@ const TEMPLATE_HELP: string[][] = [
   ["排除词", "否", "多条用 | 或换行分开，可留空", "命中就丢掉整条。表头也可以写 exclude 或 exclude_terms。"],
   ["背景说明", "否", "最多 800 字，可留空", "会交给 AI 解读。表头也可以写 description。"],
   ["启用", "否", "1、是、true 为启用；0、否、false 为停用", "留空视为启用。表头也可以写 enabled。"],
+  ["匹配方式", "否", "phrase 连续短语；all_words 全部词同时出现", "每行是一条条件，多行任一命中即可。all_words 模式中用空格分隔词，词序不限。旧文件未填时保留原目标模式，新目标默认 phrase。账号按作者匹配。"],
   ["英文短语区分大小写", "否", "1 或 是 为打开，留空或其他为关闭", "只影响更长的英文短语。2 到 5 个字母的缩写始终区分大小写。表头也可以写 case_sensitive。"],
 ];
 
@@ -132,6 +137,9 @@ const HEADER_ALIASES: Record<string, string> = {
   背景说明: "description",
   enabled: "enabled",
   启用: "enabled",
+  match_mode: "match_mode",
+  matchmode: "match_mode",
+  匹配方式: "match_mode",
   case_sensitive: "case_sensitive",
   casesensitive: "case_sensitive",
   英文短语区分大小写: "case_sensitive",
@@ -172,7 +180,7 @@ function csvCell(value: string): string {
 }
 
 function templateExampleRows(): string[][] {
-  return TEMPLATE_EXAMPLES.map((row) => ["", ...row]);
+  return TEMPLATE_EXAMPLES.map((row) => ["", ...row, "phrase"]);
 }
 
 export function joinExportTerms(terms: string[]): string {
@@ -192,6 +200,7 @@ export function targetCells(target: ExistingTarget): string[] {
     target.description,
     target.enabled ? "1" : "0",
     target.caseSensitive ? "1" : "0",
+    target.matchMode ?? "phrase",
   ];
 }
 
@@ -353,7 +362,17 @@ function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
       errors.push(error instanceof Error ? error.message : "排除词无效");
     }
   }
+  let matchMode: MatchMode | undefined;
+  const mode = cell(row, "match_mode");
+  if (mode) {
+    try {
+      matchMode = parseMatchMode(mode === "连续短语" ? "phrase" : mode === "全部词同时出现" ? "all_words" : mode);
+    } catch {
+      errors.push("匹配方式无效，只能是 phrase 或 all_words");
+    }
+  }
   return {
+    matchMode,
     line,
     id,
     countryCode,
@@ -378,7 +397,8 @@ function sameStoredTarget(found: ExistingTarget, raw: ImportPreviewRow): boolean
     && sameList(found.excludeTerms, raw.excludeTerms)
     && found.description === raw.description
     && found.enabled === raw.enabled
-    && found.caseSensitive === raw.caseSensitive;
+    && found.caseSensitive === raw.caseSensitive
+    && (found.matchMode ?? "phrase") === (raw.matchMode ?? found.matchMode ?? "phrase");
 }
 
 function classifyRow(
@@ -405,7 +425,8 @@ function classifyRow(
     && sameList(excludeTerms, found.excludeTerms)
     && description === found.description
     && raw.enabled === found.enabled
-    && caseSensitive === found.caseSensitive;
+    && caseSensitive === found.caseSensitive
+    && (found.matchMode ?? "phrase") === (raw.matchMode ?? found.matchMode ?? "phrase");
   return same ? "unchanged" : "update";
 }
 
@@ -419,6 +440,7 @@ export function previewMatrix(
   const headers = matrix.headers.map(canonicalHeader);
   const seen = new Map<string, number>();
   const seenIds = new Map<string, number>();
+  const seenModes = new Map<string, MatchMode>();
   const byId = new Map<string, ExistingTarget>();
   const byName = new Map<string, ExistingTarget>();
   for (const target of existing ?? []) {
@@ -445,6 +467,11 @@ export function previewMatrix(
     }
     if (raw.countryCode && raw.kind && raw.name && TARGET_KINDS.includes(raw.kind as TargetKind)) {
       const key = nameKey(raw.countryCode, raw.kind, raw.name);
+      const previousMode = seenModes.get(key);
+      if (raw.matchMode) {
+        if (previousMode && previousMode !== raw.matchMode) raw.errors.push("同一目标的匹配方式不一致");
+        else seenModes.set(key, raw.matchMode);
+      }
       const previous = seen.get(key);
       if (!raw.id && previous !== undefined) raw.duplicateOf = previous;
       if (previous === undefined) seen.set(key, line);
@@ -471,6 +498,7 @@ function rowsFromPreview(preview: ImportPreview): ImportRow[] {
     terms: row.terms,
     excludeTerms: row.excludeTerms,
     caseSensitive: row.caseSensitive,
+    matchMode: row.matchMode,
     enabled: row.enabled,
     description: row.description,
   })));
@@ -508,6 +536,10 @@ export function mergeImportRows(rows: ImportRow[]): ImportRow[] {
       });
       continue;
     }
+    if (existing.matchMode && row.matchMode && existing.matchMode !== row.matchMode) {
+      throw new Error("同一目标的匹配方式不一致");
+    }
+    existing.matchMode = row.matchMode ?? existing.matchMode;
     existing.terms = uniqueTerms([...existing.terms, ...row.terms]);
     existing.excludeTerms = uniqueTerms([...existing.excludeTerms, ...row.excludeTerms]);
     existing.query = existing.terms[0] ?? existing.query;
