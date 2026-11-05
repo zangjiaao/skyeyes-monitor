@@ -44,14 +44,14 @@ export async function handleScheduled(env: Env, scheduledTime: number): Promise<
   }
 }
 
-export async function startManualRun(env: Env, now = new Date(), options: { confirm?: boolean } = {}): Promise<{
+export async function startManualRun(env: Env, now = new Date(), options: { confirm?: boolean; countryIds?: string[] } = {}): Promise<{
   runId: string;
   batches: number;
   enqueued: number;
   warning: string | null;
 }> {
   try {
-    await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
+    if (options.countryIds === undefined) await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
   } catch (error) {
     logError("requeue stuck batches failed", error);
   }
@@ -64,6 +64,7 @@ export async function startManualRun(env: Env, now = new Date(), options: { conf
     windowStart: window.start,
     windowEnd: window.end,
     confirm: options.confirm,
+    countryIds: options.countryIds,
   });
   return {
     runId: started.runId,

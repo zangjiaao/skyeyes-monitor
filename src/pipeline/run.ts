@@ -426,6 +426,17 @@ async function findActiveRun(db: D1Database): Promise<{ id: string; status: stri
   ).first<{ id: string; status: string }>();
 }
 
+export class RunScopeError extends Error {}
+
+export function parseRunCountryIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 1000
+    || value.some((id) => typeof id !== "string" || !id.trim() || id.length > 80)) {
+    throw new RunScopeError("请选择至少一个有效分组；全量运行请省略 countryIds");
+  }
+  return [...new Set(value.map((id: string) => id.trim()))];
+}
+
 export async function startRun(env: Env, input: {
   trigger: "schedule" | "manual";
   now: Date;
@@ -433,7 +444,29 @@ export async function startRun(env: Env, input: {
   windowStart: Date;
   windowEnd: Date;
   confirm?: boolean;
+  countryIds?: string[];
 }): Promise<{ runId: string; created: boolean; batches: number; enqueued: number; warning: string | null }> {
+  const countryIds = parseRunCountryIds(input.countryIds);
+  let scopedCountries: CountryRow[] | undefined;
+  let scopedTargets: TargetRow[] | undefined;
+  if (countryIds) {
+    if (input.trigger !== "manual") throw new RunScopeError("只有手动运行可以指定分组");
+    const enabled = await env.DB.prepare(
+      "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
+    ).all<CountryRow>();
+    scopedCountries = enabled.results.filter((country) => countryIds.includes(country.id));
+    if (scopedCountries.length !== countryIds.length) throw new RunScopeError("所选分组不存在或已停用，请刷新后重新选择");
+    scopedTargets = [];
+    for (const country of scopedCountries) {
+      const targets = await env.DB.prepare(
+        `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+         FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
+      ).bind(country.id).all<TargetRow>();
+      if (targets.results.length === 0) throw new RunScopeError(`分组「${country.name}」没有启用的目标`);
+      scopedTargets.push(...targets.results);
+    }
+  }
+  // Validate scope before cancelling an active run or creating a new one.
   const active = await findActiveRun(env.DB);
   if (active) {
     if (!input.confirm) throw new ActiveRunError(active.id);
@@ -470,16 +503,22 @@ export async function startRun(env: Env, input: {
     throw error;
   }
 
-  const countries = await env.DB.prepare(
+  const countries = scopedCountries ? { results: scopedCountries } : await env.DB.prepare(
     "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
   ).all<CountryRow>();
   const targetRows: TargetRow[] = [];
   for (const country of countries.results) {
-    const targets = await env.DB.prepare(
+    const targets = scopedTargets ? { results: scopedTargets.filter((target) => target.country_id === country.id) } : await env.DB.prepare(
       `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
        FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
     targetRows.push(...targets.results);
+    log("run group planned", {
+      runId, countryId: country.id, countryName: country.name,
+      targetCount: targets.results.length,
+      termCount: targets.results.reduce((sum, target) => sum + (toQueryTarget(target).terms?.length ?? 0), 0),
+      sources: SOURCE_IDS.filter((source) => settings.sources[source]),
+    });
   }
   const inserts: D1PreparedStatement[] = [];
   const messages: MessageSendRequest<CollectMessage>[] = [];
@@ -507,7 +546,12 @@ export async function startRun(env: Env, input: {
 
   if (inserts.length > 0) await runChunk(env.DB, inserts);
   await env.DB.prepare("UPDATE runs SET batches_total = ? WHERE id = ?").bind(messages.length, runId).run();
-  log("run started", { runId, trigger: input.trigger, batches: messages.length });
+  log("run started", {
+    runId, trigger: input.trigger, batches: messages.length,
+    groupCount: countries.results.length, targetCount: targetRows.length,
+    countryIds: countryIds ?? null,
+    windowStart: input.windowStart.toISOString(), windowEnd: input.windowEnd.toISOString(), deadlineAt,
+  });
   if (messages.length === 0) {
     await finalizeRun(env, runId, "complete");
     return { runId, created: true, batches: 0, enqueued: 0, warning: null };
@@ -644,6 +688,10 @@ async function storeCollected(env: Env, input: {
   reservation: number;
   yieldNow?: () => boolean;
 }): Promise<{
+  reasons: Record<string, number>;
+  inserted: number;
+  storeOnly: number;
+  unprocessed: number;
   added: number;
   filtered: number;
   deduped: number;
@@ -655,6 +703,12 @@ async function storeCollected(env: Env, input: {
   const fetched = input.records.length;
   let deduped = fetched - unique.length;
   let filtered = 0;
+  const reasons: Record<string, number> = {};
+  const countReason = (reason: string, count = 1) => {
+    if (count > 0) reasons[reason] = (reasons[reason] ?? 0) + count;
+  };
+  countReason("page_duplicate_or_invalid", deduped);
+  let processed = 0;
   const collectedAt = new Date().toISOString();
   const window = { start: new Date(input.run.window_start), end: new Date(input.run.window_end) };
   const rules = rulesFromSettings(input.settings);
@@ -686,8 +740,10 @@ async function storeCollected(env: Env, input: {
       deferReason = "wall";
       break;
     }
+    processed += 1;
     if (!record.matchedTargetId || !record.matchedTerm?.trim()) {
       filtered += 1;
+      countReason("missing_attribution");
       continue;
     }
     try {
@@ -704,6 +760,7 @@ async function storeCollected(env: Env, input: {
         relevanceThreshold: input.settings.relevanceThreshold,
       });
       if (timeOnly.timeStatus === "out_of_window" || ruleReason) {
+        countReason(timeOnly.timeStatus === "out_of_window" ? "time:out_of_window" : ruleReason!);
         filtered += 1;
         continue;
       }
@@ -718,6 +775,7 @@ async function storeCollected(env: Env, input: {
         republish = isRepublish({ urlKey, titleKey }, [...existing, ...accepted]);
         if (republish) {
           deduped += 1;
+          countReason("global_duplicate");
           continue;
         }
       }
@@ -737,6 +795,7 @@ async function storeCollected(env: Env, input: {
         && record.text
         && (input.settings.aiEnabled || input.settings.translationEnabled || input.settings.relevanceEnabled);
       if (shouldInterpret && input.reservation > 0 && input.budget.remaining < input.reservation) {
+        processed -= 1;
         deferred = true;
         deferReason = "budget";
         break;
@@ -788,6 +847,7 @@ async function storeCollected(env: Env, input: {
         relevant,
       });
       if (admission.action === "drop") {
+        countReason(admission.excludeReason ?? "admission_drop");
         filtered += 1;
         continue;
       }
@@ -814,11 +874,13 @@ async function storeCollected(env: Env, input: {
       });
     } catch (error) {
       if (error instanceof DeferredBatchError) {
+        processed -= 1;
         deferred = true;
         deferReason = "budget";
         break;
       }
       filtered += 1;
+      countReason("record_error");
       logError("record skipped", error, { runId: input.runId, batchId: input.batchId, url: record.url });
     }
   }
@@ -879,7 +941,21 @@ async function storeCollected(env: Env, input: {
     if (kept[index]?.excludeReason) return sum;
     return sum + (item.meta.changes ?? 0);
   }, 0);
-  return { added, filtered, deduped, relevanceFailures, deferred, deferReason };
+  let insertedCount = 0;
+  let storeOnly = 0;
+  inserted.forEach((item, index) => {
+    const changes = item.meta.changes ?? 0;
+    insertedCount += changes;
+    if (changes === 0) countReason("insert_conflict");
+    else if (kept[index]?.excludeReason) {
+      storeOnly += changes;
+      countReason(kept[index].excludeReason!, changes);
+    }
+  });
+  return {
+    added, filtered, deduped, relevanceFailures, deferred, deferReason,
+    reasons, inserted: insertedCount, storeOnly, unprocessed: unique.length - processed,
+  };
 }
 
 function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
@@ -1040,10 +1116,31 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     const country = countryFor(targets[0]?.id);
     const provider = getProvider(batch.source);
     const yieldNow = () => pacing.now() - startedMs >= COORDINATOR_WALL_MS - COORDINATOR_WALL_RESERVE_MS;
+    const targetById = new Map(targets.map((target) => [target.id, target]));
+    const diagnosticOwner = (targetId: string | undefined) => {
+      const target = targetId ? targetById.get(targetId) : undefined;
+      const owner = targetId ? countryByTarget.get(targetId) : undefined;
+      return { countryId: owner?.id, countryName: owner?.name, targetName: target?.name };
+    };
+    log("batch started", {
+      runId, batchId, source: batch.source, targetCount: targets.length,
+      resumeStep: parseResume(batch.resume_json, batch.source)?.step ?? 0,
+      resumePage: parseResume(batch.resume_json, batch.source)?.page ?? 0,
+      windowStart: run.window_start, windowEnd: run.window_end,
+    });
     let checkpointFound = 0;
+    let checkpointAdded = 0;
+    let checkpointFiltered = 0;
+    let checkpointDeduped = 0;
     let seenProviderFiltered = 0;
     let seenCalls = 0;
     const result = await provider.search({
+      onDiagnostic: (diagnostic) => {
+        log(`source query ${diagnostic.event}`, {
+          runId, batchId, source: batch.source,
+          ...diagnosticOwner(diagnostic.targetId), ...diagnostic,
+        });
+      },
       targets: targets.map(toQueryTarget),
       window: { start: new Date(run.window_start), end: new Date(run.window_end) },
       countryName: country.name,
@@ -1107,6 +1204,19 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
              WHERE id = ? AND status NOT IN ('cancelled')`,
           ).bind(stored.added, stored.relevanceFailures, runId).run();
         }
+        const nextResume = stored.deferred ? (page.repeatResume ?? page.resume) : page.resume;
+        log("source page stored", {
+          runId, batchId, source: batch.source,
+          ...diagnosticOwner(page.diagnostic?.targetId), ...page.diagnostic,
+          matchedItems: page.records.length, inserted: stored.inserted,
+          added: stored.added, storeOnly: stored.storeOnly, deduped: stored.deduped,
+          filtered: stored.filtered, providerFiltered, reasons: stored.reasons,
+          unprocessed: stored.unprocessed, deferred: stored.deferred, deferReason: stored.deferReason,
+          nextStep: nextResume.step, nextPage: nextResume.page,
+        });
+        checkpointAdded += stored.added;
+        checkpointFiltered += stored.filtered + providerFiltered;
+        checkpointDeduped += stored.deduped;
         checkpointFound += page.records.length;
         if (stored.deferred) {
           throw stored.deferReason === "wall" ? new DeferredBatchError(1) : new SubrequestBudgetError();
@@ -1363,9 +1473,11 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       runId,
       batchId,
       source: batch.source,
-      items: unique.length,
-      added,
-      filtered,
+      scope: "invocation",
+      items: checkpointFound + unique.length,
+      added: checkpointAdded + added,
+      filtered: checkpointFiltered + filtered,
+      deduped: checkpointDeduped + deduped,
       relevanceFailed: relevanceFailures,
     });
     await maybeEnqueueFinalize(env, runId);

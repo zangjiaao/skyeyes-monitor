@@ -25,7 +25,7 @@ import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
 import { enqueueErrorMessage } from "../pipeline/queue-batch";
-import { ActiveRunError, cancelRun, requeueStuckBatches } from "../pipeline/run";
+import { ActiveRunError, RunScopeError, parseRunCountryIds, cancelRun, requeueStuckBatches } from "../pipeline/run";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -1077,13 +1077,16 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.post("/api/runs", async (c) => {
     try {
       let confirm = false;
+      let countryIds: string[] | undefined;
       if ((c.req.header("content-type") ?? "").includes("application/json")) {
         const body = await readJson(c.req.raw);
         confirm = body.confirm === true;
+        countryIds = parseRunCountryIds(body.countryIds);
       }
-      const started = await startManualRun(c.env, new Date(), { confirm });
+      const started = await startManualRun(c.env, new Date(), { confirm, countryIds });
       return c.json(started, 202);
     } catch (error) {
+      if (error instanceof RunScopeError) return jsonError(error, 400);
       if (error instanceof ActiveRunError) {
         return c.json({ error: error.message, code: "active_run", activeRunId: error.activeRunId }, 409);
       }

@@ -60,6 +60,7 @@ export interface BatchResume {
 }
 
 export interface PageCheckpoint {
+  diagnostic?: SearchDiagnosticContext;
   records: CollectedRecord[];
   /** 这一页全部入库后，下次从这里继续。 */
   resume: BatchResume;
@@ -69,7 +70,27 @@ export interface PageCheckpoint {
   filtered: number;
 }
 
+export interface SearchDiagnosticContext {
+  targetId: string;
+  terms: string[];
+  query: string;
+  step: number;
+  page: number;
+  edition?: string;
+}
+
+export type SearchDiagnostic = SearchDiagnosticContext & {
+  event: "request" | "response" | "result" | "error";
+  status?: number;
+  elapsedMs?: number;
+  rawItems?: number;
+  matchedItems?: number;
+  rejectedItems?: number;
+  error?: string;
+};
+
 export interface SearchRequest {
+  onDiagnostic?: (diagnostic: SearchDiagnostic) => void;
   targets: QueryTarget[];
   window: TimeWindow;
   countryName: string;

@@ -1,3 +1,4 @@
+import { fetchSearchPage, reportSearchResult } from "./diagnostics";
 import { packGdeltQueries } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { cleanText, verifyHit } from "../domain/terms";
@@ -92,8 +93,8 @@ export const gdeltProvider: SourceProvider = {
       url.searchParams.set("maxrecords", "75");
       url.searchParams.set("startdatetime", formatGdelt(request.window.start));
       url.searchParams.set("enddatetime", formatGdelt(request.window.end));
-      if (request.beforeRequest) await request.beforeRequest();
-      const response = await request.fetchImpl(url);
+      const diagnostic = { targetId: target.id, terms: group.terms, query: group.query, step: stepIndex, page: 0 };
+      const response = await fetchSearchPage(request, diagnostic, url);
       calls += 1;
       if (response.status === 429 || response.status === 503) {
         const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
@@ -129,10 +130,11 @@ export const gdeltProvider: SourceProvider = {
           pageRecords.push({ ...record, matchedTerm: term });
         }
       }
+      reportSearchResult(request, diagnostic, articles.length, pageRecords.length);
       const repeatResume = { source: "gdelt" as const, step: stepIndex, page: 0, cursor: "" };
       const nextResume = { source: "gdelt" as const, step: stepIndex + 1, page: 0, cursor: "" };
       if (request.onPage) {
-        await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
+        await request.onPage({ diagnostic, records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
       } else {
         records.push(...pageRecords);
       }

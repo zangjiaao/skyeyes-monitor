@@ -1,10 +1,11 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CollectMessage } from "../src/pipeline/messages";
 import { COORDINATOR_WALL_MS } from "../src/pipeline/lease";
+import { createApp } from "../src/http/app";
 import { pacing } from "../src/pipeline/pacing";
-import { finalizeRun, processBatch, startRun } from "../src/pipeline/run";
+import { ActiveRunError, RunScopeError, finalizeRun, processBatch, startRun } from "../src/pipeline/run";
 
 const originalNow = Date.now;
 const originalFetch = globalThis.fetch;
@@ -12,6 +13,7 @@ const originalSleep = pacing.sleep;
 const originalPacingNow = pacing.now;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   Date.now = originalNow;
   globalThis.fetch = originalFetch;
   pacing.sleep = originalSleep;
@@ -205,5 +207,169 @@ describe("来源协调者的队列操作", () => {
     ).all(started.runId) as Array<{ source: string; status: string; target_ids: string }>;
     expect(chains.map((chain) => chain.source)).toEqual(["x", "google_news", "gdelt"]);
     expect(chains.every((chain) => chain.status === "done" && JSON.parse(chain.target_ids).length === 200)).toBe(true);
+  });
+});
+
+
+describe("按分组诊断采集", () => {
+  it("区分上游命中、规则和时间过滤、跨组去重、仅入库和插入冲突", async () => {
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+    const sqlite = openDatabase();
+    sqlite.exec("DELETE FROM targets; DELETE FROM countries;");
+    for (const [key, value] of Object.entries({
+      x_enabled: "1", google_news_enabled: "0", gdelt_enabled: "0",
+      ai_enabled: "0", translation_enabled: "0", relevance_enabled: "0", x_qps: "2",
+    })) {
+      sqlite.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+    }
+    for (const [id, name] of [["old", "a-old"], ["new", "z-new"]]) {
+      sqlite.prepare("INSERT INTO countries VALUES (?, ?, ?, 1, ?)").run(id, name, id, "2026-10-13T00:00:00Z");
+      sqlite.prepare(`INSERT INTO targets (id, country_id, kind, name, query, enabled, created_at)
+        VALUES (?, ?, 'keyword', ?, 'ProbeKeyword', 1, ?)`)
+        .run(id, id, name, "2026-10-13T00:00:00Z");
+    }
+    const now = new Date("2026-10-14T02:00:00Z");
+    pacing.sleep = async () => {};
+    const tweet = (id: string, text: string, createdAt?: string) => ({ id, text, createdAt });
+    globalThis.fetch = async () => Response.json({ tweets: [
+      tweet("good", "ProbeKeyword announces a significant new development today", "2026-10-14T01:00:00Z"),
+      tweet("short", "ProbeKeyword", "2026-10-14T01:00:00Z"),
+      tweet("outside", "Older announcement regarding ProbeKeyword from last week", "2026-10-01T01:00:00Z"),
+      tweet("unknown", "Unconfirmed date for the report about ProbeKeyword"),
+      tweet("no-hit", "This unrelated article does not contain the search term", "2026-10-14T01:00:00Z"),
+    ], has_next_page: false });
+    const messages: CollectMessage[] = [];
+    const env = {
+      DB: asD1(sqlite), TWITTERAPI_IO_KEY: "secret-key-never-log",
+      COLLECT_QUEUE: {
+        async send(body: CollectMessage) { messages.push(body); },
+        async sendBatch(batch: Iterable<{ body: CollectMessage }>) {
+          for (const item of batch) messages.push(item.body);
+        },
+      },
+    } as unknown as Env;
+    const started = await startRun(env, {
+      trigger: "manual", now, slotKey: "",
+      windowStart: new Date("2026-10-13T02:00:00Z"), windowEnd: now,
+    });
+    const batch = messages.find((message) => message.type === "batch");
+    if (!batch || batch.type !== "batch") throw new Error("missing batch");
+    await processBatch(env, started.runId, batch.batchId);
+    const entries = logs.mock.calls.map(([line]) => JSON.parse(String(line)));
+    expect(entries.filter((entry) => entry.message === "run group planned")).toHaveLength(2);
+    expect(entries.find((entry) => entry.message === "source query request" && entry.countryId === "new"))
+      .toMatchObject({ targetId: "new", targetName: "z-new", step: 1, page: 0 });
+    expect(entries.find((entry) => entry.message === "source query result" && entry.countryId === "new"))
+      .toMatchObject({ rawItems: 5, matchedItems: 4, rejectedItems: 1 });
+    expect(entries.find((entry) => entry.message === "source page stored" && entry.countryId === "old"))
+      .toMatchObject({ inserted: 2, added: 1, storeOnly: 1, reasons: {
+        "rule:short": 1, "time:out_of_window": 1, "time:unknown": 1,
+      } });
+    expect(entries.find((entry) => entry.message === "source page stored" && entry.countryId === "new"))
+      .toMatchObject({ inserted: 0, added: 0, reasons: {
+        global_duplicate: 1, insert_conflict: 1, "rule:short": 1, "time:out_of_window": 1,
+      } });
+    expect(entries.find((entry) => entry.message === "batch done"))
+      .toMatchObject({ items: 8, added: 1, filtered: 6, scope: "invocation" });
+    expect(JSON.stringify(entries)).not.toContain("secret-key-never-log");
+    expect(sqlite.prepare("SELECT COUNT(*) AS n FROM records").get()).toMatchObject({ n: 2 });
+    sqlite.close();
+  });
+});
+
+
+describe("手动指定分组", () => {
+  function harness() {
+    const sqlite = openDatabase();
+    const sent: CollectMessage[] = [];
+    const env = {
+      ENVIRONMENT: "development", DB: asD1(sqlite),
+      COLLECT_QUEUE: {
+        async send(body: CollectMessage) { sent.push(body); },
+        async sendBatch(batch: Iterable<{ body: CollectMessage }>) {
+          for (const item of batch) sent.push(item.body);
+        },
+      },
+    } as unknown as Env;
+    const ctx = {
+      access: { async getIdentity() { return { email: "dev@example.com" }; } },
+      waitUntil() {}, passThroughOnException() {},
+    } as unknown as ExecutionContext;
+    const now = new Date("2026-10-14T02:00:00Z");
+    const input = {
+      trigger: "manual" as const, now, slotKey: "",
+      windowStart: new Date("2026-10-13T02:00:00Z"), windowEnd: now,
+    };
+    const idsFor = (runId: string) => sqlite.prepare("SELECT target_ids FROM batches WHERE run_id = ?")
+      .all(runId).map((row) => JSON.parse(String(row.target_ids)) as string[]);
+    return { sqlite, env, ctx, input, idsFor, sent };
+  }
+
+  it("API 创建的任务只包含指定分组的启用目标", async () => {
+    const h = harness();
+    const response = await createApp().request("/api/runs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ countryIds: ["country_demo_beta"] }),
+    }, h.env, h.ctx);
+    expect(response.status).toBe(202);
+    const result = await response.json() as { runId: string };
+    expect(h.idsFor(result.runId)).toEqual([["target_demo_b1"], ["target_demo_b1"]]);
+    expect(h.sent.filter((message) => message.type === "batch")).toHaveLength(2);
+    h.sqlite.close();
+  });
+
+  it("多选分组去重，不重复创建检索目标", async () => {
+    const h = harness();
+    const result = await startRun(h.env, { ...h.input,
+      countryIds: ["country_demo_alpha", "country_demo_beta", "country_demo_beta"],
+    });
+    for (const ids of h.idsFor(result.runId)) {
+      expect(ids.sort()).toEqual(["target_demo_a1", "target_demo_a2", "target_demo_b1"]);
+    }
+    h.sqlite.close();
+  });
+
+  it.each(["manual", "schedule"] as const)("%s 不指定范围时仍包含全部启用目标", async (trigger) => {
+    const h = harness();
+    const result = await startRun(h.env, { ...h.input, trigger });
+    for (const ids of h.idsFor(result.runId)) {
+      expect(ids.sort()).toEqual(["target_demo_a1", "target_demo_a2", "target_demo_b1"]);
+    }
+    h.sqlite.close();
+  });
+
+  it.each([[], null, "country_demo_alpha", [5], [""], ["missing"]])("API 拒绝无效分组范围 %j", async (countryIds) => {
+    const h = harness();
+    const response = await createApp().request("/api/runs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ countryIds }),
+    }, h.env, h.ctx);
+    expect(response.status).toBe(400);
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM runs").get()).toMatchObject({ n: 0 });
+    expect(h.sent).toHaveLength(0);
+    h.sqlite.close();
+  });
+
+  it.each(["disabled", "empty"])("拒绝 %s 分组且不会取消已有运行", async (mode) => {
+    const h = harness();
+    const first = await startRun(h.env, h.input);
+    if (mode === "disabled") h.sqlite.exec("UPDATE countries SET enabled = 0 WHERE id = 'country_demo_beta'");
+    else h.sqlite.exec("UPDATE targets SET enabled = 0 WHERE country_id = 'country_demo_beta'");
+    await expect(startRun(h.env, { ...h.input, countryIds: ["country_demo_beta"], confirm: true }))
+      .rejects.toBeInstanceOf(RunScopeError);
+    expect(h.sqlite.prepare("SELECT status FROM runs WHERE id = ?").get(first.runId)).toMatchObject({ status: "running" });
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM runs").get()).toMatchObject({ n: 1 });
+    h.sqlite.close();
+  });
+
+  it("已有任务需要确认，确认后仍只采集选中的分组", async () => {
+    const h = harness();
+    const first = await startRun(h.env, h.input);
+    await expect(startRun(h.env, { ...h.input, countryIds: ["country_demo_beta"] }))
+      .rejects.toBeInstanceOf(ActiveRunError);
+    const next = await startRun(h.env, { ...h.input, countryIds: ["country_demo_beta"], confirm: true });
+    expect(h.sqlite.prepare("SELECT status FROM runs WHERE id = ?").get(first.runId)).toMatchObject({ status: "cancelled" });
+    expect(h.idsFor(next.runId)).toEqual([["target_demo_b1"], ["target_demo_b1"]]);
+    h.sqlite.close();
   });
 });

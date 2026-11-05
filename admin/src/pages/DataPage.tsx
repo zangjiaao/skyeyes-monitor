@@ -4,6 +4,8 @@ import { Button } from "@astryxdesign/core/Button";
 import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
+import { MultiSelector } from "@astryxdesign/core/MultiSelector";
+import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table, useTableSelection, useTableSelectionState } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
@@ -36,6 +38,7 @@ interface RecordRow extends Record<string, unknown> {
 }
 
 interface NamedOption {
+  enabled?: number | boolean;
   id: string;
   name: string;
 }
@@ -81,6 +84,12 @@ export function DataPage() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [pendingIds, setPendingIds] = useState<string[]>([]);
   const [matchOpen, setMatchOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualAll, setManualAll] = useState(false);
+  const [manualCountryIds, setManualCountryIds] = useState<string[]>([]);
+  const [pendingRunCountryIds, setPendingRunCountryIds] = useState<string[] | undefined>();
+  const [startingRun, setStartingRun] = useState(false);
+  const [runError, setRunError] = useState("");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [scoreMode, setScoreMode] = useState<"" | "selected" | "unscored">("");
@@ -99,6 +108,40 @@ export function DataPage() {
 
   const selectedTarget = targets.find((item) => item.id === targetId);
   const pageCount = Math.max(1, Math.ceil(total / Number(pageSize)));
+
+  const enabledCountries = countries.filter((item) => item.enabled === 1 || item.enabled === true);
+  const runScopeLabel = (ids: string[] | undefined) => ids
+    ? countries.filter((item) => ids.includes(item.id)).map((item) => item.name).join("、")
+    : "全部启用分组";
+
+  async function runManual(ids: string[] | undefined, confirm = false) {
+    setError("");
+    setRunError("");
+    setStartingRun(true);
+    try {
+      const result = await api<{ runId: string; warning?: string | null }>("/api/runs", {
+        method: "POST", body: JSON.stringify({ confirm, countryIds: ids }),
+      });
+      setManualOpen(false);
+      setActiveRunId(null);
+      if (result.warning) setError(result.warning);
+      setNotice(result.warning
+        ? `运行 ${result.runId} 已建立，部分批次没有入队`
+        : `已开始采集「${runScopeLabel(ids)}」，运行 ${result.runId}`);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.code === "active_run" && reason.activeRunId) {
+        setPendingRunCountryIds(ids ? [...ids] : undefined);
+        setManualOpen(false);
+        setActiveRunId(reason.activeRunId);
+      } else {
+        const message = reason instanceof Error ? reason.message : "启动运行失败";
+        setRunError(message);
+        setError(message);
+      }
+    } finally {
+      setStartingRun(false);
+    }
+  }
 
   function listParams(): URLSearchParams {
     const params = new URLSearchParams();
@@ -332,20 +375,13 @@ export function DataPage() {
         <Button
           label="手动运行"
           variant="primary"
+          isDisabled={startingRun}
           onClick={() => {
             setError("");
-            api<{ runId: string; warning?: string | null }>("/api/runs", { method: "POST" })
-              .then((result) => {
-                if (result.warning) setError(result.warning);
-                setNotice(result.warning ? `运行 ${result.runId} 已建立，部分批次没有入队` : `已开始运行 ${result.runId}`);
-              })
-              .catch((reason: Error) => {
-                if (reason instanceof ApiError && reason.code === "active_run" && reason.activeRunId) {
-                  setActiveRunId(reason.activeRunId);
-                  return;
-                }
-                setError(reason.message);
-              });
+            setRunError("");
+            setManualAll(false);
+            setManualCountryIds(enabledCountries.some((item) => item.id === countryId) ? [countryId] : []);
+            setManualOpen(true);
           }}
         />
         <Button
@@ -820,40 +856,75 @@ export function DataPage() {
         </VStack>
       </Dialog>
       <Dialog
+        isOpen={manualOpen}
+        purpose="form"
+        onOpenChange={(open) => { if (!startingRun) setManualOpen(open); }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title="手动运行"
+            onOpenChange={(open) => { if (!startingRun) setManualOpen(open); }}
+          />
+          <Text type="body" color="secondary">选择本次要采集的分组，可多选。只采集所选分组中已启用的目标。</Text>
+          {runError ? <Banner status="error" title="无法启动" description={runError} /> : null}
+          <CheckboxInput
+            label="采集全部启用分组"
+            value={manualAll}
+            onChange={setManualAll}
+            isDisabled={startingRun}
+          />
+          {!manualAll ? (
+            <MultiSelector
+              label="采集分组"
+              placeholder="请选择一个或多个分组"
+              value={manualCountryIds}
+              onChange={setManualCountryIds}
+              options={enabledCountries.map((item) => ({ value: item.id, label: item.name }))}
+              hasSearch
+              hasClear
+              triggerDisplay="labels"
+              emptyText="没有已启用的分组"
+              isDisabled={startingRun}
+            />
+          ) : null}
+          <HStack gap={2}>
+            <Button
+              label={startingRun ? "正在启动…" : manualAll ? "开始全量采集" : `开始采集所选 ${manualCountryIds.length} 个分组`}
+              variant="primary"
+              isDisabled={startingRun || enabledCountries.length === 0 || (!manualAll && manualCountryIds.length === 0)}
+              onClick={() => { void runManual(manualAll ? undefined : [...manualCountryIds]); }}
+            />
+            <Button label="取消" variant="secondary" isDisabled={startingRun} onClick={() => setManualOpen(false)} />
+          </HStack>
+        </VStack>
+      </Dialog>
+      <Dialog
         isOpen={activeRunId !== null}
         purpose="form"
         width={440}
         onOpenChange={(open) => {
-          if (!open) setActiveRunId(null);
+          if (!open && !startingRun) setActiveRunId(null);
         }}
       >
         <VStack gap={3}>
           <DialogHeader
             title="已有运行进行中"
             onOpenChange={(open) => {
-              if (!open) setActiveRunId(null);
+              if (!open && !startingRun) setActiveRunId(null);
             }}
           />
+          {runError ? <Banner status="error" title="无法启动" description={runError} /> : null}
           <Text type="body">
-            另一次采集还没结束。先取消它的全部未完成批次，再开始这次手动运行。已经完成的批次会保留。
+            {`另一次采集还没结束。取消它的未完成批次后，将开始采集「${runScopeLabel(pendingRunCountryIds)}」。已经完成的批次会保留。`}
           </Text>
           <HStack gap={2}>
             <Button
-              label="取消进行中的运行并开始"
+              label={startingRun ? "正在启动…" : "取消进行中的运行并开始"}
               variant="primary"
-              onClick={() => {
-                setError("");
-                api<{ runId: string; warning?: string | null }>("/api/runs", {
-                  method: "POST",
-                  body: JSON.stringify({ confirm: true }),
-                }).then((result) => {
-                  setActiveRunId(null);
-                  if (result.warning) setError(result.warning);
-                  setNotice(result.warning ? `运行 ${result.runId} 已建立，部分批次没有入队` : `已开始运行 ${result.runId}`);
-                }).catch((reason: Error) => setError(reason.message));
-              }}
+              isDisabled={startingRun}
+              onClick={() => { void runManual(pendingRunCountryIds, true); }}
             />
-            <Button label="留下当前运行" variant="secondary" onClick={() => setActiveRunId(null)} />
+            <Button label="留下当前运行" isDisabled={startingRun} variant="secondary" onClick={() => setActiveRunId(null)} />
           </HStack>
         </VStack>
       </Dialog>

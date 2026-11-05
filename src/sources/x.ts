@@ -1,3 +1,4 @@
+import { fetchSearchPage, reportSearchResult } from "./diagnostics";
 import { buildXTermQuery, searchPlan } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { cleanText, verifyHit } from "../domain/terms";
@@ -150,10 +151,10 @@ export const xProvider: SourceProvider = {
         url.searchParams.set("query", query);
         url.searchParams.set("queryType", "Latest");
         if (cursor) url.searchParams.set("cursor", cursor);
+        const diagnostic = { targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: pageIndex };
         let response: Response;
         for (;;) {
-          if (request.beforeRequest) await request.beforeRequest();
-          response = await request.fetchImpl(url, {
+          response = await fetchSearchPage(request, diagnostic, url, {
             headers: { "X-API-Key": request.apiKey },
           });
           calls += 1;
@@ -195,6 +196,7 @@ export const xProvider: SourceProvider = {
           }
           pageRecords.push({ ...record, matchedTerm: verdict.term });
         }
+        reportSearchResult(request, diagnostic, tweets.length, pageRecords.length);
         const hasNext = payload?.has_next_page === true;
         const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
         const finishedTerm = !hasNext || !next || next === cursor;
@@ -203,7 +205,7 @@ export const xProvider: SourceProvider = {
           ? { source: "x" as const, step: stepIndex + 1, page: 0, cursor: "" }
           : { source: "x" as const, step: stepIndex, page: pageIndex + 1, cursor: next };
         if (request.onPage) {
-          await request.onPage({ records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
+          await request.onPage({ diagnostic, records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
         } else {
           records.push(...pageRecords);
         }
