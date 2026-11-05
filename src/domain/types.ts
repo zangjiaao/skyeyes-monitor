@@ -85,7 +85,9 @@ export interface SearchDiagnosticContext {
 }
 
 export type SearchDiagnostic = SearchDiagnosticContext & {
-  event: "request" | "response" | "result" | "error";
+  event: "request" | "response" | "result" | "error" | "wait";
+  delaySeconds?: number;
+  reason?: string;
   status?: number;
   elapsedMs?: number;
   rawItems?: number;
@@ -95,7 +97,7 @@ export type SearchDiagnostic = SearchDiagnosticContext & {
 };
 
 export interface SearchRequest {
-  onDiagnostic?: (diagnostic: SearchDiagnostic) => void;
+  onDiagnostic?: (diagnostic: SearchDiagnostic) => void | Promise<void>;
   targets: QueryTarget[];
   window: TimeWindow;
   countryName: string;
@@ -105,7 +107,7 @@ export interface SearchRequest {
   excludeRetweets?: boolean;
   /** Google News 版本列表，逗号分隔。空则用 en-US 和 zh-CN。 */
   googleNewsEditions?: string;
-  beforeRequest?: () => Promise<void>;
+  beforeRequest?: (context?: SearchDiagnosticContext) => Promise<void>;
   onRateLimit?: (info: RateLimitNotice) => Promise<void>;
   onPage?: (page: PageCheckpoint) => Promise<void>;
   resume?: BatchResume | null;

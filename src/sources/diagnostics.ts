@@ -7,17 +7,17 @@ export async function fetchSearchPage(
   url: URL,
   init?: RequestInit,
 ): Promise<Response> {
-  if (request.beforeRequest) await request.beforeRequest();
-  request.onDiagnostic?.({ ...context, event: "request" });
+  if (request.beforeRequest) await request.beforeRequest(context);
+  await request.onDiagnostic?.({ ...context, event: "request" });
   const started = Date.now();
   try {
     const response = await request.fetchImpl(url, init);
-    request.onDiagnostic?.({
+    await request.onDiagnostic?.({
       ...context, event: "response", status: response.status, elapsedMs: Date.now() - started,
     });
     return response;
   } catch (error) {
-    request.onDiagnostic?.({
+    await request.onDiagnostic?.({
       ...context, event: "error", elapsedMs: Date.now() - started,
       // Fetch errors can contain URLs or headers; retain only the error type.
       error: error instanceof Error ? error.name : "FetchError",
@@ -26,13 +26,13 @@ export async function fetchSearchPage(
   }
 }
 
-export function reportSearchResult(
+export async function reportSearchResult(
   request: SearchRequest,
   context: SearchDiagnosticContext,
   rawItems: number,
   matchedItems: number,
-): void {
-  request.onDiagnostic?.({
+): Promise<void> {
+  await request.onDiagnostic?.({
     ...context, event: "result", rawItems, matchedItems, rejectedItems: rawItems - matchedItems,
   });
 }

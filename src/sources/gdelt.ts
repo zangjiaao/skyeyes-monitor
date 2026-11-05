@@ -130,7 +130,7 @@ export const gdeltProvider: SourceProvider = {
           pageRecords.push({ ...record, matchedTerm: term });
         }
       }
-      reportSearchResult(request, diagnostic, articles.length, pageRecords.length);
+      await reportSearchResult(request, diagnostic, articles.length, pageRecords.length);
       const repeatResume = { source: "gdelt" as const, step: stepIndex, page: 0, cursor: "" };
       const nextResume = { source: "gdelt" as const, step: stepIndex + 1, page: 0, cursor: "" };
       if (request.onPage) {

@@ -207,7 +207,7 @@ export const googleNewsProvider: SourceProvider = {
             pageRecords.push({ ...record, matchedTerm: verdict.term });
           }
         }
-        reportSearchResult(request, diagnostic, items.length, pageRecords.length);
+        await reportSearchResult(request, diagnostic, items.length, pageRecords.length);
         const repeatResume = { source: "google_news" as const, step: stepIndex, page: 0, cursor: "" };
         const nextResume = { source: "google_news" as const, step: stepIndex + 1, page: 0, cursor: "" };
         if (request.onPage) {

@@ -10,7 +10,7 @@ function request(fetchImpl: typeof fetch, events: SearchDiagnostic[]): SearchReq
     targets: [{ id: "new-target", name: "新目标", kind: "keyword", query: "ProbeKeyword" }],
     countryName: "新分组", apiKey: "private-api-key", googleNewsEditions: "en-US",
     window: { start: new Date("2026-10-13T00:00:00Z"), end: new Date("2026-10-14T00:00:00Z") },
-    fetchImpl, onDiagnostic: (event) => events.push(event),
+    fetchImpl, onDiagnostic: (event) => { events.push(event); },
   };
 }
 

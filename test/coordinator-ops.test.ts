@@ -1,5 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { openDatabase, asD1 } from "./helpers/d1";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CollectMessage } from "../src/pipeline/messages";
 import { COORDINATOR_WALL_MS } from "../src/pipeline/lease";
@@ -20,37 +19,6 @@ afterEach(() => {
   pacing.now = originalPacingNow;
 });
 
-function openDatabase(): DatabaseSync {
-  const db = new DatabaseSync(":memory:");
-  const files = readdirSync("migrations").filter((name) => name.endsWith(".sql")).sort();
-  for (const name of files) db.exec(readFileSync(`migrations/${name}`, "utf8"));
-  return db;
-}
-
-function asD1(db: DatabaseSync): D1Database {
-  return {
-    prepare(sql: string) {
-      const statement = db.prepare(sql.replace(/\?(\d+)/g, "?"));
-      const bound = (binds: unknown[]) => {
-        const args = binds.map((value) => (value === undefined ? null : value)) as SQLInputValue[];
-        return {
-          all: async () => ({ results: args.length === 0 ? statement.all() : statement.all(...args) }),
-          first: async () => (args.length === 0 ? statement.get() : statement.get(...args)) ?? null,
-          run: async () => {
-            const info = args.length === 0 ? statement.run() : statement.run(...args);
-            return { meta: { changes: Number(info.changes ?? 0) }, results: [] };
-          },
-        };
-      };
-      return { bind: (...binds: unknown[]) => bound(binds), ...bound([]) };
-    },
-    async batch(statements: Array<{ run: () => Promise<unknown> }>) {
-      const results = [];
-      for (const statement of statements) results.push(await statement.run());
-      return results;
-    },
-  } as unknown as D1Database;
-}
 
 describe("来源协调者的队列操作", () => {
   it("2 组 × 100 目标、三个来源的一次运行只有几十次队列操作", async () => {

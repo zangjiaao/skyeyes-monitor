@@ -50,6 +50,7 @@ export default {
               null,
               error.delaySeconds,
               error instanceof RateLimitError ? error : undefined,
+              error.message,
             );
           }
           message.ack();

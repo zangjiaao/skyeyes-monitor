@@ -167,6 +167,7 @@ export const xProvider: SourceProvider = {
           const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
           if (shouldWaitInBatch(delaySeconds, waits)) {
             waits += 1;
+            await request.onDiagnostic?.({ ...diagnostic, event: "wait", delaySeconds, reason: "X 接口限流，当前调用内等待重试" });
             await pause(delaySeconds * 1000);
             continue;
           }
@@ -196,7 +197,7 @@ export const xProvider: SourceProvider = {
           }
           pageRecords.push({ ...record, matchedTerm: verdict.term });
         }
-        reportSearchResult(request, diagnostic, tweets.length, pageRecords.length);
+        await reportSearchResult(request, diagnostic, tweets.length, pageRecords.length);
         const hasNext = payload?.has_next_page === true;
         const next = typeof payload?.next_cursor === "string" ? payload.next_cursor : "";
         const finishedTerm = !hasNext || !next || next === cursor;
