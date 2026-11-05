@@ -1,4 +1,4 @@
-import type { QueryTarget } from "./types";
+import { MATCH_MODES, type MatchMode, type QueryTarget } from "./types";
 
 const CJK = /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}/u;
 
@@ -42,11 +42,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function termMatches(text: string, term: string, caseSensitive: boolean): boolean {
+export function parseMatchMode(value: unknown): MatchMode {
+  if (value === undefined) return "phrase";
+  if (typeof value !== "string" || !MATCH_MODES.includes(value as MatchMode)) throw new Error("匹配方式无效");
+  return value as MatchMode;
+}
+
+export function searchParts(target: Pick<QueryTarget, "matchMode" | "kind">, term: string): string[] {
+  const raw = term.trim();
+  if (!raw) return [];
+  return target.matchMode === "all_words" && target.kind !== "handle" ? uniqueTerms(raw.split(/\s+/u)) : [raw];
+}
+
+export function matchesSearchTerm(text: string, term: string, target: QueryTarget): boolean {
+  if (target.matchMode !== "all_words" || target.kind === "handle") {
+    return termMatches(text, term, Boolean(target.caseSensitive));
+  }
+  const words = searchParts(target, term);
+  return words.length > 0 && words.every((word) =>
+    termMatches(text, word, Boolean(target.caseSensitive), /^[A-Z]{2,5}$/.test(word)));
+}
+
+export function termMatches(text: string, term: string, caseSensitive: boolean, acronymSensitive = isShortAcronym(term.trim())): boolean {
   const needle = term.trim();
   if (!needle || !text) return false;
   if (containsCjk(needle)) return text.includes(needle);
-  const sensitive = caseSensitive || isShortAcronym(needle);
+  const sensitive = caseSensitive || acronymSensitive;
   const flags = sensitive ? "" : "i";
   const pattern = new RegExp(`(?<![A-Za-z0-9_])${escapeRegExp(needle)}(?![A-Za-z0-9_])`, flags);
   return pattern.test(text);
@@ -74,11 +95,11 @@ export function verifyHit(input: {
     const authored = terms.find((term) => term.trim().replace(/^@/, "").toLowerCase() === handle.toLowerCase());
     if (authored) return { ok: true, term: authored.trim().replace(/^@/, "") };
   }
-  if (termMatches(input.text, input.queriedTerm, sensitive)) {
+  if (matchesSearchTerm(input.text, input.queriedTerm, input.target)) {
     return { ok: true, term: input.queriedTerm };
   }
   const others = terms
-    .filter((term) => term !== input.queriedTerm && termMatches(input.text, term, sensitive))
+    .filter((term) => term !== input.queriedTerm && matchesSearchTerm(input.text, term, input.target))
     .sort((left, right) => right.length - left.length);
   if (others.length === 0) return { ok: false, term: null };
   return { ok: true, term: others[0] };

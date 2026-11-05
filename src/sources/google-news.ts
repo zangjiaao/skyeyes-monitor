@@ -165,7 +165,7 @@ export const googleNewsProvider: SourceProvider = {
         url.searchParams.set("hl", edition.hl);
         url.searchParams.set("gl", edition.gl);
         url.searchParams.set("ceid", edition.ceid);
-        const diagnostic = { targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: 0, edition: edition.id };
+        const diagnostic = { matchMode: step.target.matchMode ?? "phrase", targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: 0, edition: edition.id };
         const response = await fetchSearchPage(request, diagnostic, url);
         calls += 1;
         if (response.status === 429 || response.status === 503) {

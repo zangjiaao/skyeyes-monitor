@@ -4,7 +4,11 @@ export type TargetKind = (typeof TARGET_KINDS)[number];
 export const SOURCE_IDS = ["x", "google_news", "gdelt"] as const;
 export type SourceId = (typeof SOURCE_IDS)[number];
 
+export const MATCH_MODES = ["phrase", "all_words"] as const;
+export type MatchMode = (typeof MATCH_MODES)[number];
+
 export interface QueryTarget {
+  matchMode?: MatchMode;
   id: string;
   kind: TargetKind;
   name: string;
@@ -71,6 +75,7 @@ export interface PageCheckpoint {
 }
 
 export interface SearchDiagnosticContext {
+  matchMode?: MatchMode;
   targetId: string;
   terms: string[];
   query: string;

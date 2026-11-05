@@ -151,7 +151,7 @@ export const xProvider: SourceProvider = {
         url.searchParams.set("query", query);
         url.searchParams.set("queryType", "Latest");
         if (cursor) url.searchParams.set("cursor", cursor);
-        const diagnostic = { targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: pageIndex };
+        const diagnostic = { matchMode: step.target.matchMode ?? "phrase", targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: pageIndex };
         let response: Response;
         for (;;) {
           response = await fetchSearchPage(request, diagnostic, url, {

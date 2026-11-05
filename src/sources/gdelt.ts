@@ -93,7 +93,7 @@ export const gdeltProvider: SourceProvider = {
       url.searchParams.set("maxrecords", "75");
       url.searchParams.set("startdatetime", formatGdelt(request.window.start));
       url.searchParams.set("enddatetime", formatGdelt(request.window.end));
-      const diagnostic = { targetId: target.id, terms: group.terms, query: group.query, step: stepIndex, page: 0 };
+      const diagnostic = { matchMode: target.matchMode ?? "phrase", targetId: target.id, terms: group.terms, query: group.query, step: stepIndex, page: 0 };
       const response = await fetchSearchPage(request, diagnostic, url);
       calls += 1;
       if (response.status === 429 || response.status === 503) {

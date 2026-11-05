@@ -5,6 +5,7 @@ import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
+import { RadioList, RadioListItem } from "@astryxdesign/core/RadioList";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table } from "@astryxdesign/core/Table";
 import { TextArea } from "@astryxdesign/core/TextArea";
@@ -27,6 +28,7 @@ interface Target extends Record<string, unknown> {
   terms: string;
   exclude_terms: string;
   description: string;
+  match_mode: "phrase" | "all_words";
   case_sensitive: number;
   enabled: number;
 }
@@ -44,6 +46,7 @@ const IMPORT_HELP = [
   ["类型", "person 人物、organization 机构、keyword 关键词、handle X 账号。也可以写中文。"],
   ["显示名", "日报里的名称。没有目标 ID 时，同一分组、类型、显示名的多行会合并。"],
   ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。带目标 ID 的行会按文件里的检索词整列覆盖。"],
+  ["匹配方式", "phrase 连续短语；all_words 全部词同时出现。后一种每行用空格分隔词，词序不限，多行任一命中即可。账号按作者匹配。"],
   ["排除词", "可选。规则与检索词相同，命中就丢掉整条。"],
   ["背景说明", "可选。交给 AI 解读，最多 800 字。"],
   ["启用", "1 或 是 为启用，0 或 否 为停用。留空视为启用。"],
@@ -67,6 +70,7 @@ interface ImportPreviewRow extends Record<string, unknown> {
   excludeTerms: string[];
   errors: string[];
   duplicateOf: number | null;
+  matchMode?: "phrase" | "all_words";
 }
 
 interface ImportPreview {
@@ -85,6 +89,7 @@ export function TargetsPage() {
   const [terms, setTerms] = useState("");
   const [excludeTerms, setExcludeTerms] = useState("");
   const [description, setDescription] = useState("");
+  const [matchMode, setMatchMode] = useState("phrase");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [kind, setKind] = useState("keyword");
   const [editingId, setEditingId] = useState("");
@@ -105,6 +110,7 @@ export function TargetsPage() {
     setExcludeTerms("");
     setDescription("");
     setCaseSensitive(false);
+    setMatchMode("phrase");
     setKind("keyword");
   }
 
@@ -285,12 +291,31 @@ export function TargetsPage() {
         <Selector label="类型" value={kind} onChange={setKind} options={KINDS} />
         <TextInput label="显示名" value={targetName} onChange={setTargetName} description="日报里看到的名称" />
       </HStack>
+      <RadioList
+        label="匹配方式"
+        value={matchMode}
+        onChange={setMatchMode}
+        isDisabled={kind === "handle"}
+        disabledMessage="X 账号目标按作者账号匹配"
+        description="每行是一条条件，多行之间任一条件命中即可。新闻按接口返回的标题、摘要校验。"
+      >
+        <RadioListItem
+          value="phrase"
+          label="连续短语"
+          description="例如 Taiwan Japan，要求两个词按此顺序连续出现。适合人名、机构全称。"
+        />
+        <RadioListItem
+          value="all_words"
+          label="全部词同时出现"
+          description="同一行用空格分隔词。例如 Taiwan Japan 可命中 Japan strengthens ties with Taiwan。"
+        />
+      </RadioList>
       <TextArea
         label="检索词"
         rows={5}
         value={terms}
         onChange={setTerms}
-        description="一行一条。账号不要带 @。例如 BLA、Balochistan Liberation Army、俾路支解放军。"
+        description={kind === "handle" ? "一行一个账号，不要带 @。" : matchMode === "all_words" ? "一行一组词，组内用空格分隔，所有词都出现才命中。下一行可填另一组条件，例如 台湾 日本。" : "一行一个连续短语。例如 BLA、Balochistan Liberation Army、俾路支解放军。"}
       />
       <TextArea
         label="排除词"
@@ -326,6 +351,7 @@ export function TargetsPage() {
               excludeTerms,
               description,
               caseSensitive,
+              matchMode: kind === "handle" ? "phrase" : matchMode,
             });
             const request = editingId
               ? api(`/api/targets/${editingId}`, { method: "PATCH", body })
@@ -368,6 +394,7 @@ export function TargetsPage() {
             header: "排除词",
             renderCell: (row) => row.exclude_terms?.split(/\r?\n/).filter(Boolean).join(" · ") || "—",
           },
+          { key: "match_mode", header: "匹配方式", renderCell: (row) => row.kind === "handle" ? "作者账号" : row.match_mode === "all_words" ? "全部词同时出现" : "连续短语" },
           { key: "case_sensitive", header: "区分大小写", renderCell: (row) => (row.case_sensitive ? "是" : "否") },
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
           {
@@ -388,6 +415,7 @@ export function TargetsPage() {
                     setExcludeTerms(row.exclude_terms || "");
                     setDescription(row.description || "");
                     setCaseSensitive(row.case_sensitive === 1);
+                    setMatchMode(row.match_mode ?? "phrase");
                     setError("");
                   }}
                 />
@@ -486,6 +514,7 @@ export function TargetsPage() {
                 { key: "kind", header: "类型" },
                 { key: "name", header: "显示名" },
                 { key: "terms", header: "检索词", renderCell: (row) => row.terms.join(" | ") || "—" },
+                { key: "matchMode", header: "匹配方式", renderCell: (row) => row.matchMode === "all_words" ? "全部词同时出现" : row.matchMode === "phrase" ? "连续短语" : "保留原设置；新建默认连续短语" },
                 {
                   key: "errors",
                   header: "检查",

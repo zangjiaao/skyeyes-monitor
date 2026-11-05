@@ -79,6 +79,7 @@ interface TargetRow {
   case_sensitive: number;
   enabled: number;
   description?: string;
+  match_mode?: "phrase" | "all_words";
 }
 
 interface RunRow {
@@ -160,6 +161,7 @@ function toQueryTarget(target: TargetRow): QueryTarget {
     excludeTerms: splitLines(target.exclude_terms),
     caseSensitive: target.case_sensitive === 1,
     description: target.description ?? "",
+    matchMode: target.match_mode ?? "phrase",
   };
 }
 
@@ -459,7 +461,7 @@ export async function startRun(env: Env, input: {
     scopedTargets = [];
     for (const country of scopedCountries) {
       const targets = await env.DB.prepare(
-        `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+        `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
          FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
       ).bind(country.id).all<TargetRow>();
       if (targets.results.length === 0) throw new RunScopeError(`分组「${country.name}」没有启用的目标`);
@@ -509,7 +511,7 @@ export async function startRun(env: Env, input: {
   const targetRows: TargetRow[] = [];
   for (const country of countries.results) {
     const targets = scopedTargets ? { results: scopedTargets.filter((target) => target.country_id === country.id) } : await env.DB.prepare(
-      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
        FROM targets WHERE country_id = ? AND enabled = 1 ORDER BY name`,
     ).bind(country.id).all<TargetRow>();
     targetRows.push(...targets.results);
@@ -567,7 +569,7 @@ async function loadTargets(db: D1Database, ids: string[]): Promise<TargetRow[]> 
     const slice = ids.slice(index, index + 80);
     const marks = slice.map(() => "?").join(",");
     const result = await db.prepare(
-      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description
+      `SELECT id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, enabled, description, match_mode
        FROM targets WHERE id IN (${marks})`,
     ).bind(...slice).all<TargetRow>();
     rows.push(...result.results);
@@ -813,6 +815,7 @@ async function storeCollected(env: Env, input: {
           targetName: record.matchedTarget,
           terms,
           description: target?.description ?? "",
+          matchMode: target?.match_mode ?? "phrase",
           fetchImpl: globalThis.fetch.bind(globalThis),
           charge,
         });
@@ -1319,6 +1322,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
           targetName: record.matchedTarget,
           terms,
           description: target?.description ?? "",
+          matchMode: target?.match_mode ?? "phrase",
           fetchImpl: globalThis.fetch.bind(globalThis),
           charge: () => budget.charge(),
         });

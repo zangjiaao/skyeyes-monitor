@@ -4,7 +4,7 @@ import { EDITABLE_SETTINGS, SETTING_DEFAULTS, loadSettings, saveSettings, valida
 import { probeTranslationFallbackModel } from "../translate";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule, utcOffsetLabel } from "../domain/time";
-import { assertTermList, flagEnabled, joinTerms, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
+import { assertTermList, flagEnabled, joinTerms, parseMatchMode, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
 import { TARGET_KINDS, type TargetKind } from "../domain/types";
 import {
   buildTargetExportCsv,
@@ -69,6 +69,7 @@ interface StoredTargetRow {
   description: string | null;
   enabled: number;
   case_sensitive: number;
+  match_mode?: "phrase" | "all_words";
 }
 
 interface IndexedTarget extends ExistingTarget {
@@ -85,7 +86,7 @@ function targetNameKey(target: { countryCode: string; kind: string; name: string
 
 async function loadExistingTargets(db: D1Database, countryId?: string): Promise<IndexedTarget[]> {
   const sql = `SELECT t.id, t.country_id, c.code AS country_code, t.kind, t.name, t.query, t.terms,
-                      t.exclude_terms, t.description, t.enabled, t.case_sensitive
+                      t.exclude_terms, t.description, t.enabled, t.case_sensitive, t.match_mode
                FROM targets t
                JOIN countries c ON c.id = t.country_id
                ${countryId ? "WHERE t.country_id = ?" : ""}
@@ -105,6 +106,7 @@ async function loadExistingTargets(db: D1Database, countryId?: string): Promise<
       description: row.description ?? "",
       enabled: row.enabled === 1,
       caseSensitive: row.case_sensitive === 1,
+      matchMode: row.match_mode ?? "phrase",
     };
   });
 }
@@ -143,7 +145,8 @@ async function applyTargetImport(
         && sameTerms(current.excludeTerms, row.excludeTerms)
         && current.description === row.description
         && current.enabled === row.enabled
-        && current.caseSensitive === row.caseSensitive;
+        && current.caseSensitive === row.caseSensitive
+        && (current.matchMode ?? "phrase") === (row.matchMode ?? current.matchMode ?? "phrase");
       if (same) {
         unchanged += 1;
         continue;
@@ -151,7 +154,7 @@ async function applyTargetImport(
       await db.prepare(
         `UPDATE targets
          SET country_id = ?, kind = ?, name = ?, query = ?, terms = ?, exclude_terms = ?,
-             case_sensitive = ?, enabled = ?, description = ?
+             case_sensitive = ?, enabled = ?, description = ?, match_mode = ?
          WHERE id = ?`,
       ).bind(
         countryId,
@@ -163,6 +166,7 @@ async function applyTargetImport(
         row.caseSensitive ? 1 : 0,
         row.enabled ? 1 : 0,
         row.description,
+        row.matchMode ?? current.matchMode ?? "phrase",
         row.id,
       ).run();
       const oldKey = targetNameKey(current);
@@ -176,6 +180,7 @@ async function applyTargetImport(
       current.description = row.description;
       current.enabled = row.enabled;
       current.caseSensitive = row.caseSensitive;
+      current.matchMode = row.matchMode ?? current.matchMode ?? "phrase";
       byName.set(targetNameKey(current), current);
       updated += 1;
       continue;
@@ -186,8 +191,8 @@ async function applyTargetImport(
       const id = crypto.randomUUID();
       await db.prepare(
         `INSERT INTO targets (
-          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at, match_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         countryId,
@@ -200,6 +205,7 @@ async function applyTargetImport(
         row.description,
         row.enabled ? 1 : 0,
         now,
+        row.matchMode ?? "phrase",
       ).run();
       const createdTarget: IndexedTarget = {
         id,
@@ -212,6 +218,7 @@ async function applyTargetImport(
         description: row.description,
         enabled: row.enabled,
         caseSensitive: row.caseSensitive,
+        matchMode: row.matchMode ?? "phrase",
       };
       byId.set(id, createdTarget);
       byName.set(key, createdTarget);
@@ -223,18 +230,20 @@ async function applyTargetImport(
     const caseSensitive = current.caseSensitive || row.caseSensitive;
     const description = row.description || current.description;
     const enabled = row.enabled;
+    const matchMode = row.matchMode ?? current.matchMode ?? "phrase";
     const changed = !sameTerms(terms, current.terms)
       || !sameTerms(excludeTerms, current.excludeTerms)
       || caseSensitive !== current.caseSensitive
       || description !== current.description
-      || enabled !== current.enabled;
+      || enabled !== current.enabled
+      || matchMode !== (current.matchMode ?? "phrase");
     if (!changed) {
       unchanged += 1;
       continue;
     }
     await db.prepare(
       `UPDATE targets
-       SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?
+       SET query = ?, terms = ?, exclude_terms = ?, case_sensitive = ?, enabled = ?, description = ?, match_mode = ?
        WHERE id = ?`,
     ).bind(
       terms[0],
@@ -243,6 +252,7 @@ async function applyTargetImport(
       caseSensitive ? 1 : 0,
       enabled ? 1 : 0,
       description,
+      matchMode,
       current.id,
     ).run();
     current.terms = terms;
@@ -250,6 +260,7 @@ async function applyTargetImport(
     current.caseSensitive = caseSensitive;
     current.description = description;
     current.enabled = enabled;
+    current.matchMode = matchMode;
     updated += 1;
   }
   return { created, updated, unchanged };
@@ -599,13 +610,14 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const terms = assertTermList(termsFromUnknown(body.terms ?? body.query ?? body.name), "检索词");
       const excludeTerms = assertTermList(termsFromUnknown(body.excludeTerms ?? body.exclude_terms ?? ""), "排除词", true);
       const caseSensitive = flagEnabled(body.caseSensitive ?? body.case_sensitive) ? 1 : 0;
+      const matchMode = parseMatchMode(body.matchMode !== undefined ? body.matchMode : body.match_mode);
       const country = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(countryId).first();
       if (!country) throw new Error("分组不存在");
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
         `INSERT INTO targets (
-          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, country_id, kind, name, query, terms, exclude_terms, case_sensitive, description, enabled, created_at, match_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id,
         countryId,
@@ -618,6 +630,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
         descriptionText(body.description),
         body.enabled === false ? 0 : 1,
         new Date().toISOString(),
+        matchMode,
       ).run();
       return c.json({ id }, 201);
     } catch (error) {
@@ -629,8 +642,13 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
     try {
       const body = await readJson(c.req.raw);
       const id = c.req.param("id");
+      const hasMatchMode = body.matchMode !== undefined || body.match_mode !== undefined;
+      const matchMode = hasMatchMode ? parseMatchMode(body.matchMode !== undefined ? body.matchMode : body.match_mode) : undefined;
       const current = await c.env.DB.prepare("SELECT id FROM targets WHERE id = ?").bind(id).first();
       if (!current) return c.json({ error: "目标不存在" }, 404);
+      if (matchMode !== undefined) {
+        await c.env.DB.prepare("UPDATE targets SET match_mode = ? WHERE id = ?").bind(matchMode, id).run();
+      }
       if (typeof body.name === "string") {
         await c.env.DB.prepare("UPDATE targets SET name = ? WHERE id = ?").bind(body.name.trim(), id).run();
       }

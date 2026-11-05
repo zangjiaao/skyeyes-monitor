@@ -372,4 +372,87 @@ describe("手动指定分组", () => {
     expect(h.idsFor(next.runId)).toEqual([["target_demo_b1"], ["target_demo_b1"]]);
     h.sqlite.close();
   });
+
+  it("目标 API 保存、读取和切换匹配方式，旧文件导入不会重置模式", async () => {
+    const h = harness();
+    const app = createApp();
+    const response = await app.request("/api/targets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ countryId: "country_demo_beta", kind: "keyword", name: "Relations",
+        terms: "Taiwan Japan", matchMode: "all_words" }),
+    }, h.env, h.ctx);
+    expect(response.status).toBe(201);
+    const { id } = await response.json() as { id: string };
+    expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE id = ?").get(id)).toMatchObject({ match_mode: "all_words" });
+    const get = await app.request("/api/targets?countryId=country_demo_beta", {}, h.env, h.ctx);
+    const payload = await get.json() as { targets: Array<{ id: string; match_mode: string }> };
+    expect(payload.targets.find((row) => row.id === id)?.match_mode).toBe("all_words");
+    for (const mode of ["phrase", "all_words"]) {
+      const patched = await app.request(`/api/targets/${id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ matchMode: mode }),
+      }, h.env, h.ctx);
+      expect(patched.status).toBe(200);
+      expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE id = ?").get(id)).toMatchObject({ match_mode: mode });
+    }
+    const invalid = await app.request(`/api/targets/${id}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "should-not-save", matchMode: "unknown" }),
+    }, h.env, h.ctx);
+    expect(invalid.status).toBe(400);
+    expect(h.sqlite.prepare("SELECT name FROM targets WHERE id = ?").get(id)).toMatchObject({ name: "Relations" });
+    const form = new FormData();
+    form.set("file", new File([
+      `目标ID,分组代码,类型,显示名,检索词\n${id},demo-beta,keyword,Relations,Taiwan Japan\n`,
+    ], "targets.csv", { type: "text/csv" }));
+    const imported = await app.request("/api/targets/import", { method: "POST", body: form }, h.env, h.ctx);
+    expect(imported.status).toBe(200);
+    expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE id = ?").get(id)).toMatchObject({ match_mode: "all_words" });
+    const exported = await app.request("/api/targets/export.csv", {}, h.env, h.ctx);
+    expect(await exported.text()).toContain("all_words");
+    for (const [targetId, name, mode] of [[id, "Relations", "phrase"], ["", "Imported", "all_words"], ["", "Imported", "phrase"]]) {
+      const changedForm = new FormData();
+      changedForm.set("file", new File([
+        `目标ID,分组代码,类型,显示名,检索词,匹配方式\n${targetId},demo-beta,keyword,${name},Taiwan Japan,${mode}\n`,
+      ], "targets.csv", { type: "text/csv" }));
+      const changed = await app.request("/api/targets/import", { method: "POST", body: changedForm }, h.env, h.ctx);
+      expect(changed.status).toBe(200);
+      expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE name = ?").get(name)).toMatchObject({ match_mode: mode });
+    }
+    expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE id = 'target_demo_b1'").get()).toMatchObject({ match_mode: "phrase" });
+    h.sqlite.close();
+  });
+
+  it("所选分组任务将保存的 all_words 模式传给查询与校验并实际入库", async () => {
+    const h = harness();
+    h.sqlite.exec("UPDATE targets SET enabled = 0;");
+    for (const [key, value] of Object.entries({
+      google_news_enabled: "0", ai_enabled: "0", translation_enabled: "0", relevance_enabled: "0",
+    })) h.sqlite.prepare("INSERT OR REPLACE INTO settings VALUES (?, ?)").run(key, value);
+    const response = await createApp().request("/api/targets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ countryId: "country_demo_beta", kind: "keyword", name: "Relations",
+        terms: "Taiwan Japan", matchMode: "all_words" }),
+    }, h.env, h.ctx);
+    expect(response.status).toBe(201);
+    h.env.TWITTERAPI_IO_KEY = "test-key";
+    const queries: string[] = [];
+    globalThis.fetch = async (input) => {
+      queries.push(new URL(String(input)).searchParams.get("query") ?? "");
+      return Response.json({ tweets: [
+        { id: "relation-1", text: "Japan strengthens economic ties with Taiwan today", createdAt: "2026-10-14T01:00:00Z" },
+        { id: "relation-2", text: "Japan reports unrelated domestic developments today", createdAt: "2026-10-14T01:00:00Z" },
+      ], has_next_page: false });
+    };
+    const result = await startRun(h.env, { ...h.input, countryIds: ["country_demo_beta"] });
+    const batch = h.sent.find((message) => message.type === "batch");
+    if (!batch || batch.type !== "batch") throw new Error("missing batch");
+    await processBatch(h.env, result.runId, batch.batchId);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toMatch(/^"Taiwan" "Japan" since_time:/);
+    expect(h.sqlite.prepare("SELECT original_text, matched_term, country_id FROM records").all()).toEqual([
+      expect.objectContaining({ original_text: "Japan strengthens economic ties with Taiwan today",
+        matched_term: "Taiwan Japan", country_id: "country_demo_beta" }),
+    ]);
+    h.sqlite.close();
+  });
+
 });
