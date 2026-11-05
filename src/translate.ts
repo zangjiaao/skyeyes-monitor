@@ -1,3 +1,5 @@
+import { prepareAiText, type PreparedAiText } from "./domain/ai-text";
+import { logWarn } from "./log";
 import { detectSourceLang } from "./domain/lang";
 import { modelText } from "./domain/relevance";
 import { DeferredBatchError } from "./pipeline/lease";
@@ -37,6 +39,10 @@ function rawAiError(error: unknown): string {
 export function explainWorkersAiError(error: unknown, model: string): string | null {
   const raw = rawAiError(error).replace(/\s+/g, " ").trim();
   if (!raw) return null;
+  if (raw.startsWith("模型分词输入异常")) return raw.slice(0, 200);
+  if (/TextEncodeInput/i.test(raw)) {
+    return `模型分词输入异常（${model}）：${raw}`.slice(0, 200);
+  }
   if (raw.startsWith("模型不可用：")) return raw.slice(0, 200);
   if (/\b5018\b/.test(raw) || /deprecat/i.test(raw) || /not found|unknown model|no such model|does not exist|invalid model/i.test(raw)) {
     return `模型不可用：${raw}（${model}）`.slice(0, 200);
@@ -126,6 +132,17 @@ function failed(sourceLang: string, error: string): TranslationOutcome {
   return { text: null, status: "translation_failed", error: error.slice(0, 200), sourceLang };
 }
 
+function reportTokenizerError(error: unknown, model: string, prepared: PreparedAiText, sourceLang: string, targetLang: string): void {
+  const raw = rawAiError(error);
+  if (!/TextEncodeInput/i.test(raw)) return;
+  logWarn("translation tokenizer input rejected", {
+    model, code: /\b3030\b/.test(raw) ? 3030 : null, inputType: prepared.inputType,
+    inputLength: prepared.inputLength, sentLength: prepared.text?.length ?? 0,
+    sentBytes: prepared.inputBytes, replacements: prepared.replacements,
+    truncated: prepared.truncated, sourceLang, targetLang,
+  });
+}
+
 export async function translateToChinese(
   ai: Ai,
   text: string,
@@ -135,14 +152,17 @@ export async function translateToChinese(
   fallbackModel = DEFAULT_TRANSLATION_FALLBACK_MODEL,
   charge?: () => void,
 ): Promise<TranslationOutcome> {
-  const trimmed = text.trim();
+  const prepared = prepareAiText(text, Number.MAX_SAFE_INTEGER);
+  const trimmed = prepared.text ?? "";
   const sourceLang = detectSourceLang(trimmed, sourceLangOrHint, configuredLang);
-  if (!trimmed) return failed(sourceLang, "没有可翻译的正文");
+  if (prepared.error || !trimmed) return failed(sourceLang, prepared.error ?? "没有可翻译的正文");
   if (sourceLang === "zh" || isMostlyChinese(trimmed)) {
     return { text: trimmed, status: "ok", error: null, sourceLang: "zh" };
   }
   const target = targetLang?.trim() || "zh";
-  const slice = trimmed.slice(0, 1200);
+  const limited = prepareAiText(trimmed, 1200);
+  const slice = limited.text!;
+  const modelInput = { ...limited, inputLength: prepared.inputLength, inputType: prepared.inputType, replacements: prepared.replacements };
   let machine = "";
   let machineError = "";
   try {
@@ -152,9 +172,16 @@ export async function translateToChinese(
       source_lang: sourceLang,
       target_lang: target,
     });
-    machine = cleanTranslation(m2mText(payload));
+    const embedded = explainWorkersAiError(payload, TRANSLATION_MODEL);
+    if (embedded) {
+      reportTokenizerError(payload, TRANSLATION_MODEL, modelInput, sourceLang, target);
+      machineError = embedded;
+    } else {
+      machine = cleanTranslation(m2mText(payload));
+    }
   } catch (error) {
     if (error instanceof DeferredBatchError) throw error;
+    reportTokenizerError(error, TRANSLATION_MODEL, modelInput, sourceLang, target);
     machineError = explainWorkersAiError(error, TRANSLATION_MODEL) ?? (error instanceof Error ? error.message : String(error));
   }
   if (machine && acceptableChinese(slice, machine)) {
@@ -176,10 +203,15 @@ export async function translateToChinese(
       chat_template_kwargs: { enable_thinking: false },
     });
     const embedded = explainWorkersAiError(payload, chatModel);
-    if (embedded) throw new Error(embedded);
-    chat = cleanTranslation(modelText(payload));
+    if (embedded) {
+      reportTokenizerError(payload, chatModel, modelInput, sourceLang, target);
+      chatError = embedded;
+    } else {
+      chat = cleanTranslation(modelText(payload));
+    }
   } catch (error) {
     if (error instanceof DeferredBatchError) throw error;
+    reportTokenizerError(error, chatModel, modelInput, sourceLang, target);
     chatError = explainWorkersAiError(error, chatModel) ?? (error instanceof Error ? error.message : String(error));
   }
   if (chat && acceptableChinese(slice, chat)) {

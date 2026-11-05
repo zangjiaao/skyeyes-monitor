@@ -1,3 +1,4 @@
+import { prepareAiText } from "../domain/ai-text";
 import type { MatchMode } from "../domain/types";
 import type { AppSettings } from "../config/settings";
 import { detectSourceLang } from "../domain/lang";
@@ -128,6 +129,8 @@ export async function callDeepseek(input: {
   sleepImpl?: (ms: number) => Promise<void>;
   charge?: () => void;
 }): Promise<{ ok: true; parsed: NonNullable<ReturnType<typeof parseDeepseekContent>> } | { ok: false; error: string }> {
+  const prepared = prepareAiText(input.text, TEXT_LIMIT);
+  if (!prepared.text) return { ok: false, error: prepared.error ?? "没有可解读的正文" };
   const model = /^[A-Za-z0-9._-]{1,64}$/.test(input.model) ? input.model : "deepseek-chat";
   const body = {
     model,
@@ -142,11 +145,11 @@ export async function callDeepseek(input: {
       {
         role: "user",
         content: [
-          `监测对象：${input.targetName.slice(0, 80)}`,
-          `检索词：${input.terms.slice(0, 12).join("、").slice(0, 300)}`,
+          `监测对象：${prepareAiText(input.targetName, 80).text ?? ""}`,
+          `检索词：${prepareAiText(input.terms.slice(0, 12).join("、"), 300).text ?? ""}`,
           ...(input.matchMode === "all_words" ? ["检索方式：每行词组中的全部词需同时出现，词序不限、不要求连续；多行条件任一命中即可。"] : []),
-          `背景：${input.description.trim().slice(0, 500) || "无"}`,
-          `正文：${input.text.trim().slice(0, TEXT_LIMIT)}`,
+          `背景：${prepareAiText(input.description, 500).text || "无"}`,
+          `正文：${prepared.text}`,
         ].join("\n"),
       },
     ],

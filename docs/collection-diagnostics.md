@@ -72,3 +72,13 @@
 `source query request` 和后续分页事件包含 `matchMode`。`phrase` 会搜索整段连续短语；`all_words` 会将每行空格分隔的词分别查询，并要求所有词同时出现在本条采集文本中。
 例如针对国家关系的 `Taiwan Japan`，在监测目标里改为「全部词同时出现」后再开始一次指定分组运行。日志的实际查询应从 `"Taiwan Japan"` 变为 `"Taiwan" "Japan"`。
 排除词、时间窗口、相关度及去重规则仍然生效，因此匹配模式修正后新增数也可能为 0，需要继续检查 reasons。
+
+## 翻译分词器输入异常
+
+`3030: TextEncodeInput must be Union[...]` 不能单凭错误文本判定为编码问题。它表示模型的分词器未接受当前输入，也可能来自模型端或输入结构不匹配。
+
+模型调用前会校验正文是字符串、修复孤立 Unicode 代理项、替换不适合模型的控制字符、统一 NFC 与换行，并在 UTF-16 长度限制内按完整码点截断。emoji 的连接符和波斯语等文字使用的连接符会保留。原始正文、匹配和去重身份不因此改写。
+
+遇到此错误会记录 `translation tokenizer input rejected`，包含 model、inputType、inputLength、sentLength、sentBytes、replacements、truncated、sourceLang 和 targetLang，不记录正文或密钥。错误信息也包含模型名，以区分 m2m100 与备用对话模型。主翻译失败时仍会尝试备用模型。
+
+清理后若普通、合法字符串仍持续报错，应按日志中的具体模型核对输入协议和服务端问题，不能继续归因为乱码。已失败记录可在数据页使用「为所选解读」或重译功能重试。
