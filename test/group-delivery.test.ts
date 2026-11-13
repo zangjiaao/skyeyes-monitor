@@ -68,6 +68,21 @@ describe("分组推送", () => {
     expect(rejected.status).toBe(400);
 
     const removed = await app.request("/api/recipients/rec-d", { method: "DELETE" }, env, ctx);
+    const existing = await app.request("/api/countries/country_demo_alpha", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ delivery: "none", recipientIds: [] }),
+    }, env, ctx);
+    expect(existing.status).toBe(200);
+    const after = await app.request("/api/countries", { method: "GET" }, env, ctx);
+    const updated = await after.json() as {
+      countries: Array<{ id: string; delivery: string; recipient_ids: string[] }>;
+    };
+    expect(updated.countries.find((country) => country.id === "country_demo_alpha")).toMatchObject({
+      delivery: "none",
+      recipient_ids: [],
+    });
+
     expect(removed.status).toBe(200);
     expect(sqlite.prepare("SELECT COUNT(*) AS n FROM country_recipients WHERE recipient_id = ?").get("rec-d")).toEqual({ n: 0 });
   });

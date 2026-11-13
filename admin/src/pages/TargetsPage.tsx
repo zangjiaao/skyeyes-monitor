@@ -102,11 +102,8 @@ export function TargetsPage() {
   const [recipients, setRecipients] = useState<Recipient[]>([]);
   const [delivery, setDelivery] = useState("email");
   const [recipientIds, setRecipientIds] = useState<string[]>([]);
-  const [deliveryOpen, setDeliveryOpen] = useState(false);
-  const [draftId, setDraftId] = useState("");
-  const [draftDelivery, setDraftDelivery] = useState("email");
-  const [draftRecipientIds, setDraftRecipientIds] = useState<string[]>([]);
-  const [savingDelivery, setSavingDelivery] = useState(false);
+  const [editingCountryId, setEditingCountryId] = useState("");
+  const [savingGroup, setSavingGroup] = useState(false);
   const recipientDefaulted = useRef(false);
   const [targetName, setTargetName] = useState("");
   const [terms, setTerms] = useState("");
@@ -146,10 +143,26 @@ export function TargetsPage() {
 
   function deliveryText(row: Country): string {
     if (row.delivery === "none") return "不发送";
-    const emails = row.recipient_ids
-      .map((id) => recipients.find((person) => person.id === id)?.email)
-      .filter((email): email is string => Boolean(email));
-    return emails.length > 0 ? `邮件：${emails.join("、")}` : "邮件（未选收件人）";
+    const count = row.recipient_ids?.length ?? 0;
+    return count > 0 ? `邮件 · ${count} 人` : "邮件 · 未选收件人";
+  }
+
+  function resetGroupForm(people = recipients) {
+    setEditingCountryId("");
+    setName("");
+    setCode("");
+    setDelivery("email");
+    setRecipientIds(people.filter((person) => person.enabled).map((person) => person.id));
+  }
+
+  function beginEdit(row: Country) {
+    recipientDefaulted.current = true;
+    setEditingCountryId(row.id);
+    setName(row.name);
+    setCode(row.code);
+    setDelivery(row.delivery === "none" ? "none" : "email");
+    setRecipientIds(row.recipient_ids ?? []);
+    setError("");
   }
 
   async function reload() {
@@ -266,11 +279,12 @@ export function TargetsPage() {
       {notice ? <Banner status="success" title={notice} isDismissable onDismiss={() => setNotice("")} /> : null}
       <Heading level={2}>分组</Heading>
       <Text type="body" color="secondary">
-        每个分组都会按计划采集。选邮件时，只发给勾选的收件人，每个人只看到自己被选中的分组。选不发送时只采集，可在数据页查看，也可以留给以后的接口。
+        每个分组都会按计划采集。选邮件时，只发给勾选的收件人，每个人只看到自己被选中的分组。选不发送时只采集，可在数据页查看，也可以留给以后的接口。已有分组点「编辑」后在这里修改。
       </Text>
+      {editingCountryId ? <Text type="body">正在编辑「{name}」。改完推送方式或收件人后点保存修改。</Text> : null}
       <HStack gap={2}>
-        <TextInput label="名称" value={name} onChange={setName} />
-        <TextInput label="分组代码" value={code} onChange={setCode} description="任意短且唯一的代码，不必是 ISO 国家代码。小写字母、数字和连字符。" />
+        <TextInput label="名称" value={name} onChange={setName} isDisabled={savingGroup} />
+        <TextInput label="分组代码" value={code} onChange={setCode} description="任意短且唯一的代码，不必是 ISO 国家代码。小写字母、数字和连字符。" isDisabled={Boolean(editingCountryId) || savingGroup} />
       </HStack>
       <Selector label="推送方式" value={delivery} onChange={setDelivery} options={DELIVERIES} />
       <MultiSelector
@@ -286,25 +300,39 @@ export function TargetsPage() {
         hasClear
         triggerDisplay="labels"
         emptyText="还没有收件人，请先到配置页添加"
-        isDisabled={delivery === "none"}
+        isDisabled={delivery === "none" || savingGroup}
       />
-      <Button
-        label="添加分组"
-        variant="primary"
-        onClick={() => {
-          setError("");
-          api("/api/countries", {
-            method: "POST",
-            body: JSON.stringify({ name, code, delivery, recipientIds }),
-          })
-            .then(async () => {
-              setName("");
-              setCode("");
-              await reload();
-            })
-            .catch((reason: Error) => setError(reason.message));
-        }}
-      />
+      <HStack gap={2}>
+        <Button
+          label={editingCountryId ? "保存修改" : "添加分组"}
+          variant="primary"
+          isLoading={savingGroup}
+          onClick={() => {
+            setError("");
+            setSavingGroup(true);
+            const request = editingCountryId
+              ? api(`/api/countries/${editingCountryId}`, {
+                method: "PATCH",
+                body: JSON.stringify({ name, delivery, recipientIds }),
+              })
+              : api("/api/countries", {
+                method: "POST",
+                body: JSON.stringify({ name, code, delivery, recipientIds }),
+              });
+            request
+              .then(async () => {
+                setNotice(editingCountryId ? "已保存分组" : "已添加分组");
+                resetGroupForm();
+                await reload();
+              })
+              .catch((reason: Error) => setError(reason.message))
+              .finally(() => setSavingGroup(false));
+          }}
+        />
+        {editingCountryId ? (
+          <Button label="取消编辑" variant="secondary" isDisabled={savingGroup} onClick={() => resetGroupForm()} />
+        ) : null}
+      </HStack>
       <Table
         density="compact"
         idKey="id"
@@ -320,15 +348,10 @@ export function TargetsPage() {
             renderCell: (row) => (
               <HStack gap={1}>
                 <Button
-                  label="推送"
+                  label="编辑"
                   variant="secondary"
                   size="sm"
-                  onClick={() => {
-                    setDraftId(row.id);
-                    setDraftDelivery(row.delivery);
-                    setDraftRecipientIds(row.recipient_ids);
-                    setDeliveryOpen(true);
-                  }}
+                  onClick={() => beginEdit(row)}
                 />
                 <Button
                   label={row.enabled ? "停用" : "启用"}
@@ -356,62 +379,6 @@ export function TargetsPage() {
           },
         ]}
       />
-      <Dialog
-        isOpen={deliveryOpen}
-        purpose="form"
-        width={480}
-        onOpenChange={(open) => {
-          if (!open && !savingDelivery) setDeliveryOpen(false);
-        }}
-      >
-        <VStack gap={3}>
-          <DialogHeader
-            title="分组推送"
-            onOpenChange={(open) => {
-              if (!open && !savingDelivery) setDeliveryOpen(false);
-            }}
-          />
-          <Text type="body" color="secondary">
-            不发送时，这个分组仍会定时采集，只是不出现在邮件里。
-          </Text>
-          <Selector label="推送方式" value={draftDelivery} onChange={setDraftDelivery} options={DELIVERIES} isDisabled={savingDelivery} />
-          <MultiSelector
-            label="收件人"
-            placeholder={draftDelivery === "none" ? "不发送" : "选择收件人"}
-            value={draftRecipientIds}
-            onChange={setDraftRecipientIds}
-            options={recipientOptions(recipients)}
-            hasSearch
-            hasClear
-            triggerDisplay="labels"
-            emptyText="还没有收件人，请先到配置页添加"
-            isDisabled={draftDelivery === "none" || savingDelivery}
-          />
-          <HStack gap={2}>
-            <Button
-              label="保存"
-              variant="primary"
-              isLoading={savingDelivery}
-              onClick={() => {
-                setSavingDelivery(true);
-                setError("");
-                api(`/api/countries/${draftId}`, {
-                  method: "PATCH",
-                  body: JSON.stringify({ delivery: draftDelivery, recipientIds: draftRecipientIds }),
-                })
-                  .then(async () => {
-                    setDeliveryOpen(false);
-                    setNotice(draftDelivery === "none" ? "已改为不发送" : "已保存推送设置");
-                    await reload();
-                  })
-                  .catch((reason: Error) => setError(reason.message))
-                  .finally(() => setSavingDelivery(false));
-              }}
-            />
-            <Button label="取消" variant="secondary" isDisabled={savingDelivery} onClick={() => setDeliveryOpen(false)} />
-          </HStack>
-        </VStack>
-      </Dialog>
       <Heading level={2}>目标</Heading>
       <Text type="body" color="secondary">
         一个目标只有一个显示名，检索词一行一条。同一目标的每条检索词会单独搜索，命中都记在这个显示名上。2 到 5 个字母的缩写始终区分大小写并按整词匹配，请写成希望命中的样子，例如 BLA。
