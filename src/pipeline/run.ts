@@ -16,7 +16,8 @@ import {
 } from "../domain/gate";
 import type { BatchResume, CollectedRecord, QueryTarget, SearchDiagnostic, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
-import { buildDigest } from "../email/compose";
+import { buildDigest, type DigestCountry } from "../email/compose";
+import { emailBuckets, scopeLabel, type EmailGroup } from "../email/delivery";
 import { attachmentMode, recordEmailLog } from "../email/log";
 import { sendWithCloudflare } from "../email/cloudflare";
 import { sendWithResend } from "../email/resend";
@@ -1683,16 +1684,89 @@ export async function storeRunWindowExcel(
   return { bytes, key, filename, truncated: loaded.truncated, count: loaded.records.length };
 }
 
+async function loadRunEmailGroups(env: Env, runId: string): Promise<EmailGroup[]> {
+  const scope = await env.DB.prepare(
+    "SELECT DISTINCT country_id AS id FROM batches WHERE run_id = ? AND country_id != ''",
+  ).bind(runId).all<{ id: string }>();
+  const ids = scope.results.map((row) => row.id);
+  if (ids.length === 0) return [];
+  const marks = ids.map(() => "?").join(", ");
+  const countries = await env.DB.prepare(
+    `SELECT id, name FROM countries WHERE delivery = 'email' AND id IN (${marks})`,
+  ).bind(...ids).all<{ id: string; name: string }>();
+  const links = await env.DB.prepare(
+    `SELECT cr.country_id, r.email
+     FROM country_recipients cr
+     JOIN recipients r ON r.id = cr.recipient_id AND r.enabled = 1
+     WHERE cr.country_id IN (${marks})
+     ORDER BY r.email`,
+  ).bind(...ids).all<{ country_id: string; email: string }>();
+  const emails = new Map<string, string[]>();
+  for (const link of links.results) {
+    const list = emails.get(link.country_id) ?? [];
+    if (!list.includes(link.email)) list.push(link.email);
+    emails.set(link.country_id, list);
+  }
+  return countries.results.map((country) => ({
+    id: country.id,
+    name: country.name,
+    emails: emails.get(country.id) ?? [],
+  }));
+}
+
+async function bucketBatchHealth(
+  env: Env,
+  runId: string,
+  countryIds: string[],
+): Promise<{ failed: number; pending: number; cancelled: number }> {
+  if (countryIds.length === 0) return { failed: 0, pending: 0, cancelled: 0 };
+  const marks = countryIds.map(() => "?").join(", ");
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
+     FROM batches WHERE run_id = ? AND country_id IN (${marks})`,
+  ).bind(runId, ...countryIds).first<{ failed: number | null; pending: number | null; cancelled: number | null }>();
+  return { failed: row?.failed ?? 0, pending: row?.pending ?? 0, cancelled: row?.cancelled ?? 0 };
+}
+
+async function workbookForGroups(
+  env: Env,
+  settings: AppSettings,
+  run: { id: string; windowStart: string; windowEnd: string },
+  groups: Array<{ id: string; name: string }>,
+): Promise<{ bytes: Uint8Array | null; truncated: boolean }> {
+  if (groups.length === 0) return { bytes: null, truncated: false };
+  const marks = groups.map(() => "?").join(", ");
+  const loaded = await loadExcelRecords(
+    env.DB,
+    `run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ? AND country_id IN (${marks})`,
+    [run.id, run.windowStart, run.windowEnd, ...groups.map((group) => group.id)],
+  );
+  if (loaded.records.length === 0) return { bytes: null, truncated: false };
+  const windowEnd = new Date(run.windowEnd);
+  return {
+    bytes: buildMonitorWorkbook({
+      countries: groups.map((group) => ({ name: group.name })),
+      records: loaded.records,
+      reference: Number.isNaN(windowEnd.getTime()) ? new Date() : windowEnd,
+      timeZone: settings.timeZone,
+      scheduleHour: settings.scheduleHour,
+      windowHours: settings.windowHours,
+      periodSheets: false,
+    }),
+    truncated: loaded.truncated,
+  };
+}
+
 async function sendDigest(
   env: Env,
   settings: AppSettings,
   message: OutboundEmail,
+  to: string[],
 ): Promise<{ status: "sent" | "skipped" | "failed"; error: string | null; messageId: string | null; recipients: string[] }> {
   if (!settings.emailEnabled) return { status: "skipped", error: null, messageId: null, recipients: [] };
-  const recipients = await env.DB.prepare(
-    "SELECT email FROM recipients WHERE enabled = 1 ORDER BY email",
-  ).all<{ email: string }>();
-  const to = recipients.results.map((row) => row.email);
   if (to.length === 0) return { status: "skipped", error: "没有启用的收件人", messageId: null, recipients: [] };
   if (!settings.emailFrom) return { status: "failed", error: "未配置发件人", messageId: null, recipients: to };
   const outbound = { ...message, from: settings.emailFrom, fromName: settings.emailFromName, to };
@@ -1775,92 +1849,146 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     });
     if (windowFile.truncated) notes = [notes, `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。`].filter(Boolean).join(" ");
     const grouped = await env.DB.prepare(
-      `SELECT country_name, source, COUNT(*) AS n
+      `SELECT country_id, country_name, source, COUNT(*) AS n
        FROM records
        WHERE run_id = ? AND ${DELIVERABLE_SQL} AND published_at >= ? AND published_at < ?
-       GROUP BY country_name, source`,
-    ).bind(runId, run.window_start, run.window_end).all<{ country_name: string; source: string; n: number }>();
-    const byCountry = new Map<string, { added: number; bySource: Record<string, number> }>();
+       GROUP BY country_id, country_name, source`,
+    ).bind(runId, run.window_start, run.window_end).all<{ country_id: string; country_name: string; source: string; n: number }>();
+    const byCountry = new Map<string, DigestCountry>();
     for (const row of grouped.results) {
-      const current = byCountry.get(row.country_name) ?? { added: 0, bySource: {} };
+      const current: DigestCountry = byCountry.get(row.country_id) ?? { name: row.country_name, added: 0, bySource: {} };
       current.added += row.n;
       current.bySource[row.source] = row.n;
-      byCountry.set(row.country_name, current);
+      byCountry.set(row.country_id, current);
     }
-    const downloadUrl = windowFile.bytes && settings.appBaseUrl
-      ? `${settings.appBaseUrl}${runWindowDownloadPath(runId)}`
-      : null;
-    const attached = Boolean(windowFile.bytes && windowFile.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
-    const mode = attachmentMode(attached, downloadUrl);
-    const attachmentBytes = windowFile.bytes?.byteLength ?? 0;
-    const digest = buildDigest({
-      incomplete,
-      windowStart: run.window_start,
-      windowEnd: run.window_end,
-      timeZone: settings.timeZone,
-      countries: [...byCountry.entries()].map(([name, value]) => ({ name, ...value })),
-      failedBatches: failed,
-      downloadUrl,
-      attached,
-      notes,
-    });
     const alreadySent = await env.DB.prepare(
       "SELECT email_sent_at, email_status FROM runs WHERE id = ?",
     ).bind(runId).first<{ email_sent_at: string | null; email_status: string | null }>();
     const sentAlready = Boolean(alreadySent?.email_sent_at) || alreadySent?.email_status === "sent";
     if (!sentAlready && settings.emailEnabled) {
-      claimedAt = new Date().toISOString();
-      const claimed = await claimDailyEmail(env, runId, claimedAt);
-      if (!claimed) {
-        claimedAt = null;
-      } else {
+      const groups = await loadRunEmailGroups(env, runId);
+      const unaddressed = groups.filter((group) => group.emails.length === 0).map((group) => group.name);
+      if (unaddressed.length > 0) {
+        notes = [notes, `这些分组配置了邮件，但没有启用的收件人：${unaddressed.join("、")}。`].filter(Boolean).join(" ");
+      }
+      const buckets = emailBuckets(groups);
+      if (buckets.length === 0) {
         emailTouched = true;
-        const sent = await sendDigest(env, settings, {
-          from: settings.emailFrom,
-          fromName: settings.emailFromName,
-          to: [],
-          subject: digest.subject,
-          text: digest.text,
-          html: digest.html,
-          attachment: attached && windowFile.bytes
-            ? { filename: windowFile.filename, content: windowFile.bytes, contentType: EXCEL_TYPE }
-            : undefined,
-        });
-        if (sent.status === "sent") {
-          emailStatus = "sent";
-          emailError = null;
-          await recordEmailLog(env.DB, {
-            runId,
-            kind: "daily",
-            recipients: sent.recipients,
-            subject: digest.subject,
-            status: "sent",
-            error: null,
-            messageId: sent.messageId,
-            attachmentMode: mode,
-            attachmentBytes,
-          });
-        } else if (sent.status === "failed") {
-          await releaseDailyEmailClaim(env, runId, claimedAt);
+        emailStatus = "skipped";
+        emailError = groups.length > 0 ? "没有启用的收件人" : null;
+      } else {
+        claimedAt = new Date().toISOString();
+        const claimed = await claimDailyEmail(env, runId, claimedAt);
+        if (!claimed) {
           claimedAt = null;
-          emailStatus = "failed";
-          emailError = sent.error;
-          await recordEmailLog(env.DB, {
-            runId,
-            kind: "daily",
-            recipients: sent.recipients,
-            subject: digest.subject,
-            status: "failed",
-            error: sent.error,
-            messageId: null,
-            attachmentMode: mode,
-            attachmentBytes,
-          });
         } else {
-          await releaseDailyEmailClaim(env, runId, claimedAt);
-          claimedAt = null;
-          emailStatus = "skipped";
-          emailError = sent.error;
+          emailTouched = true;
+          const prior = await env.DB.prepare(
+            "SELECT recipients FROM email_log WHERE run_id = ? AND kind = 'daily' AND status = 'sent'",
+          ).bind(runId).all<{ recipients: string }>();
+          const priorKeys = new Set(prior.results.map((row) => row.recipients));
+          const allCountries = await env.DB.prepare("SELECT id FROM countries").all<{ id: string }>();
+          const allIds = new Set(allCountries.results.map((row) => row.id));
+          const errors: string[] = [];
+          let anyFailed = false;
+          let anySent = false;
+          for (const bucket of buckets) {
+            const recipientKey = bucket.emails.join(", ");
+            if (priorKeys.has(recipientKey)) {
+              anySent = true;
+              continue;
+            }
+            const health = await bucketBatchHealth(env, runId, bucket.groupIds);
+            const bucketIncomplete = health.failed > 0 || health.pending > 0 || (reason === "deadline" && health.cancelled > 0);
+            const coversAll = bucket.groupIds.length === allIds.size && bucket.groupIds.every((id) => allIds.has(id));
+            const file = coversAll
+              ? { bytes: windowFile.bytes, truncated: windowFile.truncated }
+              : await workbookForGroups(env, settings, {
+                id: runId,
+                windowStart: run.window_start,
+                windowEnd: run.window_end,
+              }, bucket.groupIds.map((id) => ({ id, name: byCountry.get(id)?.name ?? groups.find((group) => group.id === id)?.name ?? id })));
+            const downloadUrl = coversAll && file.bytes && settings.appBaseUrl
+              ? `${settings.appBaseUrl}${runWindowDownloadPath(runId)}`
+              : null;
+            const attached = Boolean(file.bytes && file.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
+            const digestNotes = [
+              run.notes ?? "",
+              bucketIncomplete ? "有批次未完成，已发送目前收集到的内容。" : "",
+              file.truncated ? `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。` : "",
+            ].filter((part, index, parts) => part && parts.indexOf(part) === index).join(" ");
+            const countries = bucket.groupIds
+              .map((id) => byCountry.get(id))
+              .filter((country): country is DigestCountry => Boolean(country))
+              .sort((left, right) => left.name.localeCompare(right.name, "zh"));
+            const digest = buildDigest({
+              incomplete: bucketIncomplete,
+              windowStart: run.window_start,
+              windowEnd: run.window_end,
+              timeZone: settings.timeZone,
+              countries,
+              failedBatches: health.failed,
+              downloadUrl,
+              attached,
+              attachmentOmitted: Boolean(file.bytes && !attached && !downloadUrl),
+              scopeLabel: buckets.length > 1 ? scopeLabel(bucket.names) : undefined,
+              notes: digestNotes,
+            });
+            const mode = attachmentMode(attached, downloadUrl);
+            const attachmentBytes = file.bytes?.byteLength ?? 0;
+            const sent = await sendDigest(env, settings, {
+              from: settings.emailFrom,
+              fromName: settings.emailFromName,
+              to: bucket.emails,
+              subject: digest.subject,
+              text: digest.text,
+              html: digest.html,
+              attachment: attached && file.bytes
+                ? { filename: windowFile.filename, content: file.bytes, contentType: EXCEL_TYPE }
+                : undefined,
+            }, bucket.emails);
+            if (sent.status === "sent") {
+              anySent = true;
+              await recordEmailLog(env.DB, {
+                runId,
+                kind: "daily",
+                recipients: sent.recipients,
+                subject: digest.subject,
+                status: "sent",
+                error: null,
+                messageId: sent.messageId,
+                attachmentMode: mode,
+                attachmentBytes,
+              });
+            } else if (sent.status === "failed") {
+              anyFailed = true;
+              if (sent.error) errors.push(sent.error);
+              await recordEmailLog(env.DB, {
+                runId,
+                kind: "daily",
+                recipients: sent.recipients,
+                subject: digest.subject,
+                status: "failed",
+                error: sent.error,
+                messageId: null,
+                attachmentMode: mode,
+                attachmentBytes,
+              });
+            }
+          }
+          if (anyFailed) {
+            await releaseDailyEmailClaim(env, runId, claimedAt);
+            claimedAt = null;
+            emailStatus = "failed";
+            emailError = errors.join("；").slice(0, 500) || "发送失败";
+          } else if (anySent) {
+            emailStatus = "sent";
+            emailError = null;
+          } else {
+            await releaseDailyEmailClaim(env, runId, claimedAt);
+            claimedAt = null;
+            emailStatus = "skipped";
+          }
         }
       }
     } else if (!sentAlready) {

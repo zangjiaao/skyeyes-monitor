@@ -191,7 +191,9 @@ describe("按分组诊断采集", () => {
       sqlite.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
     }
     for (const [id, name] of [["old", "a-old"], ["new", "z-new"]]) {
-      sqlite.prepare("INSERT INTO countries VALUES (?, ?, ?, 1, ?)").run(id, name, id, "2026-10-13T00:00:00Z");
+      sqlite.prepare(
+        "INSERT INTO countries (id, name, code, enabled, created_at) VALUES (?, ?, ?, 1, ?)",
+      ).run(id, name, id, "2026-10-13T00:00:00Z");
       sqlite.prepare(`INSERT INTO targets (id, country_id, kind, name, query, enabled, created_at)
         VALUES (?, ?, 'keyword', ?, 'ProbeKeyword', 1, ?)`)
         .run(id, id, name, "2026-10-13T00:00:00Z");

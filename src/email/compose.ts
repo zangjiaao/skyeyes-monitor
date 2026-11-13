@@ -15,6 +15,10 @@ export interface DigestInput {
   failedBatches: number;
   downloadUrl: string | null;
   attached: boolean;
+  /** 附件放不进邮件，且不能附上会带上其他分组的下载链接。 */
+  attachmentOmitted?: boolean;
+  /** 同一轮有多封邮件时，用来区分这封信包含哪些分组。 */
+  scopeLabel?: string;
   notes: string;
 }
 
@@ -49,6 +53,7 @@ function excelLine(input: DigestInput): string {
   if (total === 0) return "本轮时间窗口内没有新增，因此没有附件。";
   if (input.attached) return "本轮新增在附件 Excel 里。";
   if (input.downloadUrl) return `本轮新增请下载: ${input.downloadUrl}`;
+  if (input.attachmentOmitted) return "本轮新增超过邮件附件上限，未附上文件。请到管理后台的数据页按分组查看。";
   return MISSING_SITE_URL_LINE;
 }
 
@@ -65,9 +70,10 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
   const zoneLabel = Number.isNaN(end.getTime())
     ? input.timeZone
     : `${input.timeZone}, ${utcOffsetLabel(end, input.timeZone)}`;
-  const subject = input.incomplete
+  const base = input.incomplete
     ? `SkyEyes 每日监测 ${day}（部分批次未完成）`
     : `SkyEyes 每日监测 ${day}`;
+  const subject = input.scopeLabel ? `${base} · ${input.scopeLabel}` : base;
   const lines = [
     `SkyEyes 每日监测`,
     `时区: ${input.timeZone}`,

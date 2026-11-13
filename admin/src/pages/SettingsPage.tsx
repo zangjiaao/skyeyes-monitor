@@ -147,7 +147,7 @@ export function SettingsPage() {
         }}
       />
       <Heading level={2}>收件人</Heading>
-      <Text type="supporting" color="secondary">所有分组合成一封邮件，发给下面启用的地址。测试邮件使用已保存的发件人和邮件服务，每日邮件可以保持关闭。</Text>
+      <Text type="supporting" color="secondary">这里是收件人地址簿。每个分组在监测目标页选择是否发信、以及发给哪些地址。每个人只会收到勾选了自己的分组。不发送的分组仍会采集。新地址不会自动加入已有分组。每日邮件总开关关闭时，所有分组都不发信。测试邮件使用已保存的发件人和邮件服务。</Text>
       <Button label="发送测试邮件" variant="secondary" onClick={() => { setTestError(""); setTestTo(""); setTestOpen(true); }} />
       <HStack gap={2}>
         <TextInput label="邮箱" type="email" value={email} onChange={setEmail} />

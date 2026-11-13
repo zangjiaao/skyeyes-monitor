@@ -5,6 +5,7 @@ import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
+import { MultiSelector } from "@astryxdesign/core/MultiSelector";
 import { RadioList, RadioListItem } from "@astryxdesign/core/RadioList";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Table } from "@astryxdesign/core/Table";
@@ -17,7 +18,20 @@ interface Country {
   name: string;
   code: string;
   enabled: number;
+  delivery: "email" | "none";
+  recipient_ids: string[];
 }
+
+interface Recipient {
+  id: string;
+  email: string;
+  enabled: number;
+}
+
+const DELIVERIES = [
+  { value: "email", label: "邮件" },
+  { value: "none", label: "不发送" },
+];
 
 interface Target extends Record<string, unknown> {
   id: string;
@@ -83,8 +97,16 @@ export function TargetsPage() {
   const [countries, setCountries] = useState<Country[]>([]);
   const [targets, setTargets] = useState<Target[]>([]);
   const [countryId, setCountryId] = useState("");
+  const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [editingCountryId, setEditingCountryId] = useState("");
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
+  const [delivery, setDelivery] = useState("email");
+  const [recipientIds, setRecipientIds] = useState<string[]>([]);
+  const [savingGroup, setSavingGroup] = useState(false);
+  const [groupError, setGroupError] = useState("");
+  const [targetOpen, setTargetOpen] = useState(false);
   const [targetName, setTargetName] = useState("");
   const [terms, setTerms] = useState("");
   const [excludeTerms, setExcludeTerms] = useState("");
@@ -93,6 +115,8 @@ export function TargetsPage() {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [kind, setKind] = useState("keyword");
   const [editingId, setEditingId] = useState("");
+  const [savingTarget, setSavingTarget] = useState(false);
+  const [targetError, setTargetError] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [importOpen, setImportOpen] = useState(false);
@@ -112,10 +136,132 @@ export function TargetsPage() {
     setCaseSensitive(false);
     setMatchMode("phrase");
     setKind("keyword");
+    setTargetError("");
+  }
+
+  function openCreateGroup() {
+    setEditingCountryId("");
+    setName("");
+    setCode("");
+    setDelivery("email");
+    setRecipientIds(recipients.filter((person) => person.enabled).map((person) => person.id));
+    setGroupError("");
+    setGroupOpen(true);
+  }
+
+  function openEditGroup(row: Country) {
+    setEditingCountryId(row.id);
+    setName(row.name);
+    setCode(row.code);
+    setDelivery(row.delivery === "none" ? "none" : "email");
+    setRecipientIds(row.recipient_ids ?? []);
+    setGroupError("");
+    setGroupOpen(true);
+  }
+
+  function closeGroupDialog() {
+    if (savingGroup) return;
+    setGroupOpen(false);
+    setGroupError("");
+  }
+
+  function openCreateTarget() {
+    resetTargetForm();
+    setTargetOpen(true);
+  }
+
+  function openEditTarget(row: Target) {
+    setEditingId(row.id);
+    setCountryId(row.country_id);
+    setKind(row.kind);
+    setTargetName(row.name);
+    setTerms(row.terms || row.query);
+    setExcludeTerms(row.exclude_terms || "");
+    setDescription(row.description || "");
+    setCaseSensitive(row.case_sensitive === 1);
+    setMatchMode(row.match_mode ?? "phrase");
+    setTargetError("");
+    setTargetOpen(true);
+  }
+
+  function closeTargetDialog() {
+    if (savingTarget) return;
+    setTargetOpen(false);
+    resetTargetForm();
+  }
+
+  function recipientOptions(people: Recipient[]) {
+    return people.map((person) => ({
+      value: person.id,
+      label: person.enabled ? person.email : `${person.email}（已停用）`,
+    }));
+  }
+
+  function deliveryText(row: Country): string {
+    if (row.delivery === "none") return "不发送";
+    const count = row.recipient_ids?.length ?? 0;
+    return count > 0 ? `邮件 · ${count} 人` : "邮件 · 未选收件人";
+  }
+
+  function saveGroup() {
+    setGroupError("");
+    setSavingGroup(true);
+    const request = editingCountryId
+      ? api(`/api/countries/${editingCountryId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name, delivery, recipientIds }),
+      })
+      : api("/api/countries", {
+        method: "POST",
+        body: JSON.stringify({ name, code, delivery, recipientIds }),
+      });
+    request
+      .then(async () => {
+        setGroupOpen(false);
+        setNotice(editingCountryId ? "已保存分组" : "已添加分组");
+        await reload();
+      })
+      .catch((reason: Error) => setGroupError(reason.message))
+      .finally(() => setSavingGroup(false));
+  }
+
+  function saveTarget() {
+    setTargetError("");
+    if (!countryId) {
+      setTargetError("请选择分组");
+      return;
+    }
+    setSavingTarget(true);
+    const body = JSON.stringify({
+      countryId,
+      kind,
+      name: targetName,
+      terms,
+      excludeTerms,
+      description,
+      caseSensitive,
+      matchMode: kind === "handle" ? "phrase" : matchMode,
+    });
+    const request = editingId
+      ? api(`/api/targets/${editingId}`, { method: "PATCH", body })
+      : api("/api/targets", { method: "POST", body });
+    request
+      .then(async () => {
+        setNotice(editingId ? "已保存目标" : "已添加目标");
+        setTargetOpen(false);
+        resetTargetForm();
+        await reload();
+      })
+      .catch((reason: Error) => setTargetError(reason.message))
+      .finally(() => setSavingTarget(false));
   }
 
   async function reload() {
-    const payload = await api<{ countries: Country[] }>("/api/countries");
+    const [payload, people] = await Promise.all([
+      api<{ countries: Country[] }>("/api/countries"),
+      api<{ recipients: Recipient[] }>("/api/recipients"),
+    ]);
+    setRecipients(people.recipients);
     setCountries(payload.countries);
     const selected = countryId || payload.countries[0]?.id || "";
     if (!countryId && selected) setCountryId(selected);
@@ -218,25 +364,13 @@ export function TargetsPage() {
       </VStack>
       {error ? <Banner status="error" title="操作失败" description={error} /> : null}
       {notice ? <Banner status="success" title={notice} isDismissable onDismiss={() => setNotice("")} /> : null}
-      <Heading level={2}>分组</Heading>
       <HStack gap={2}>
-        <TextInput label="名称" value={name} onChange={setName} />
-        <TextInput label="分组代码" value={code} onChange={setCode} description="任意短且唯一的代码，不必是 ISO 国家代码。小写字母、数字和连字符。" />
-        <Button
-          label="添加分组"
-          variant="primary"
-          onClick={() => {
-            setError("");
-            api("/api/countries", { method: "POST", body: JSON.stringify({ name, code }) })
-              .then(async () => {
-                setName("");
-                setCode("");
-                await reload();
-              })
-              .catch((reason: Error) => setError(reason.message));
-          }}
-        />
+        <Heading level={2}>分组</Heading>
+        <Button label="添加分组" variant="primary" onClick={openCreateGroup} />
       </HStack>
+      <Text type="body" color="secondary">
+        每个分组都会按计划采集。邮件只发给勾选的收件人；不发送的分组只采集，可在数据页查看。
+      </Text>
       <Table
         density="compact"
         idKey="id"
@@ -245,11 +379,18 @@ export function TargetsPage() {
           { key: "name", header: "名称" },
           { key: "code", header: "分组代码" },
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
+          { key: "delivery", header: "推送", renderCell: (row) => deliveryText(row) },
           {
             key: "actions",
             header: "操作",
             renderCell: (row) => (
               <HStack gap={1}>
+                <Button
+                  label="编辑"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => openEditGroup(row)}
+                />
                 <Button
                   label={row.enabled ? "停用" : "启用"}
                   variant="secondary"
@@ -276,97 +417,20 @@ export function TargetsPage() {
           },
         ]}
       />
-      <Heading level={2}>目标</Heading>
+      <HStack gap={2}>
+        <Heading level={2}>目标</Heading>
+        <Button label="添加目标" variant="primary" onClick={openCreateTarget} isDisabled={countries.length === 0} />
+      </HStack>
       <Text type="body" color="secondary">
-        一个目标只有一个显示名，检索词一行一条。同一目标的每条检索词会单独搜索，命中都记在这个显示名上。2 到 5 个字母的缩写始终区分大小写并按整词匹配，请写成希望命中的样子，例如 BLA。
+        先选分组，再管理这个分组里的目标。检索词一行一条，命中都记在同一个显示名上。
       </Text>
       <Selector
-        label="分组"
+        label="当前分组"
         value={countryId}
         onChange={setCountryId}
         options={countries.map((country) => ({ value: country.id, label: `${country.name} (${country.code})` }))}
         placeholder="选择分组"
       />
-      <HStack gap={2}>
-        <Selector label="类型" value={kind} onChange={setKind} options={KINDS} />
-        <TextInput label="显示名" value={targetName} onChange={setTargetName} description="日报里看到的名称" />
-      </HStack>
-      <RadioList
-        label="匹配方式"
-        value={matchMode}
-        onChange={setMatchMode}
-        isDisabled={kind === "handle"}
-        disabledMessage="X 账号目标按作者账号匹配"
-        description="每行是一条条件，多行之间任一条件命中即可。新闻按接口返回的标题、摘要校验。"
-      >
-        <RadioListItem
-          value="phrase"
-          label="连续短语"
-          description="例如 Taiwan Japan，要求两个词按此顺序连续出现。适合人名、机构全称。"
-        />
-        <RadioListItem
-          value="all_words"
-          label="全部词同时出现"
-          description="同一行用空格分隔词。例如 Taiwan Japan 可命中 Japan strengthens ties with Taiwan。"
-        />
-      </RadioList>
-      <TextArea
-        label="检索词"
-        rows={5}
-        value={terms}
-        onChange={setTerms}
-        description={kind === "handle" ? "一行一个账号，不要带 @。" : matchMode === "all_words" ? "一行一组词，组内用空格分隔，所有词都出现才命中。下一行可填另一组条件，例如 台湾 日本。" : "一行一个连续短语。例如 BLA、Balochistan Liberation Army、俾路支解放军。"}
-      />
-      <TextArea
-        label="排除词"
-        rows={3}
-        value={excludeTerms}
-        onChange={setExcludeTerms}
-        description="可选，一行一条。命中则丢弃，例如 Biologics License、bla bla。"
-      />
-      <TextArea
-        label="背景说明"
-        rows={3}
-        value={description}
-        onChange={setDescription}
-        description="可选。交给 DeepSeek 的监测对象说明，例如组织是谁、要关注哪类事件。"
-      />
-      <CheckboxInput
-        label="英文短语区分大小写"
-        value={caseSensitive}
-        onChange={setCaseSensitive}
-        description="2 到 5 个字母的缩写始终区分大小写。这个开关作用于更长的英文短语。"
-      />
-      <HStack gap={2}>
-        <Button
-          label={editingId ? "保存修改" : "添加目标"}
-          variant="primary"
-          onClick={() => {
-            setError("");
-            const body = JSON.stringify({
-              countryId,
-              kind,
-              name: targetName,
-              terms,
-              excludeTerms,
-              description,
-              caseSensitive,
-              matchMode: kind === "handle" ? "phrase" : matchMode,
-            });
-            const request = editingId
-              ? api(`/api/targets/${editingId}`, { method: "PATCH", body })
-              : api("/api/targets", { method: "POST", body });
-            request.then(async () => {
-              resetTargetForm();
-              setNotice(editingId ? "已保存目标" : "已添加目标");
-              await reload();
-            }).catch((reason: Error) => setError(reason.message));
-          }}
-        />
-        {editingId ? (
-          <Button label="取消编辑" variant="secondary" onClick={resetTargetForm} />
-        ) : null}
-      </HStack>
       <HStack gap={2}>
         <Button label="导出 CSV" variant="secondary" onClick={() => { void downloadExport("csv"); }} />
         <Button label="导出 Excel" variant="secondary" onClick={() => { void downloadExport("xlsx"); }} />
@@ -406,18 +470,7 @@ export function TargetsPage() {
                   label="编辑"
                   variant="secondary"
                   size="sm"
-                  onClick={() => {
-                    setEditingId(row.id);
-                    setCountryId(row.country_id);
-                    setKind(row.kind);
-                    setTargetName(row.name);
-                    setTerms(row.terms || row.query);
-                    setExcludeTerms(row.exclude_terms || "");
-                    setDescription(row.description || "");
-                    setCaseSensitive(row.case_sensitive === 1);
-                    setMatchMode(row.match_mode ?? "phrase");
-                    setError("");
-                  }}
+                  onClick={() => openEditTarget(row)}
                 />
                 <Button
                   label={row.enabled ? "停用" : "启用"}
@@ -445,6 +498,137 @@ export function TargetsPage() {
           },
         ]}
       />
+      <Dialog
+        isOpen={groupOpen}
+        purpose="form"
+        width={480}
+        onOpenChange={(open) => {
+          if (!open) closeGroupDialog();
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={editingCountryId ? "编辑分组" : "添加分组"}
+            onOpenChange={(open) => {
+              if (!open) closeGroupDialog();
+            }}
+          />
+          <Text type="body" color="secondary">
+            不发送时，这个分组仍会定时采集，只是不出现在邮件里。分组代码创建后不能修改。
+          </Text>
+          {groupError ? <Banner status="error" title="无法保存分组" description={groupError} /> : null}
+          <TextInput label="名称" value={name} onChange={setName} isDisabled={savingGroup} />
+          <TextInput
+            label="分组代码"
+            value={code}
+            onChange={setCode}
+            description="任意短且唯一的代码，不必是 ISO 国家代码。小写字母、数字和连字符。"
+            isDisabled={Boolean(editingCountryId) || savingGroup}
+          />
+          <Selector label="推送方式" value={delivery} onChange={setDelivery} options={DELIVERIES} isDisabled={savingGroup} />
+          <MultiSelector
+            label="收件人"
+            placeholder={delivery === "none" ? "不发送" : "选择收件人"}
+            value={recipientIds}
+            onChange={setRecipientIds}
+            options={recipientOptions(recipients)}
+            hasSearch
+            hasClear
+            triggerDisplay="labels"
+            emptyText="还没有收件人，请先到配置页添加"
+            isDisabled={delivery === "none" || savingGroup}
+          />
+          <HStack gap={2}>
+            <Button label={editingCountryId ? "保存修改" : "添加分组"} variant="primary" isLoading={savingGroup} onClick={saveGroup} />
+            <Button label="取消" variant="secondary" isDisabled={savingGroup} onClick={closeGroupDialog} />
+          </HStack>
+        </VStack>
+      </Dialog>
+      <Dialog
+        isOpen={targetOpen}
+        purpose="form"
+        width={560}
+        maxHeight="80vh"
+        onOpenChange={(open) => {
+          if (!open) closeTargetDialog();
+        }}
+      >
+        <VStack gap={3}>
+          <DialogHeader
+            title={editingId ? "编辑目标" : "添加目标"}
+            onOpenChange={(open) => {
+              if (!open) closeTargetDialog();
+            }}
+          />
+          {targetError ? <Banner status="error" title="无法保存目标" description={targetError} /> : null}
+          <Selector
+            label="分组"
+            value={countryId}
+            onChange={setCountryId}
+            options={countries.map((country) => ({ value: country.id, label: `${country.name} (${country.code})` }))}
+            placeholder="选择分组"
+            isDisabled={Boolean(editingId) || savingTarget}
+          />
+          <HStack gap={2}>
+            <Selector label="类型" value={kind} onChange={setKind} options={KINDS} isDisabled={savingTarget} />
+            <TextInput label="显示名" value={targetName} onChange={setTargetName} description="日报里看到的名称" isDisabled={savingTarget} />
+          </HStack>
+          <RadioList
+            label="匹配方式"
+            value={matchMode}
+            onChange={setMatchMode}
+            isDisabled={kind === "handle" || savingTarget}
+            disabledMessage="X 账号目标按作者账号匹配"
+            description="每行是一条条件，多行之间任一条件命中即可。新闻按接口返回的标题、摘要校验。"
+          >
+            <RadioListItem
+              value="phrase"
+              label="连续短语"
+              description="例如 Taiwan Japan，要求两个词按此顺序连续出现。适合人名、机构全称。"
+            />
+            <RadioListItem
+              value="all_words"
+              label="全部词同时出现"
+              description="同一行用空格分隔词。例如 Taiwan Japan 可命中 Japan strengthens ties with Taiwan。"
+            />
+          </RadioList>
+          <TextArea
+            label="检索词"
+            rows={5}
+            value={terms}
+            onChange={setTerms}
+            isDisabled={savingTarget}
+            description={kind === "handle" ? "一行一个账号，不要带 @。" : matchMode === "all_words" ? "一行一组词，组内用空格分隔，所有词都出现才命中。下一行可填另一组条件，例如 台湾 日本。" : "一行一个连续短语。例如 BLA、Balochistan Liberation Army、俾路支解放军。"}
+          />
+          <TextArea
+            label="排除词"
+            rows={3}
+            value={excludeTerms}
+            onChange={setExcludeTerms}
+            isDisabled={savingTarget}
+            description="可选，一行一条。命中则丢弃，例如 Biologics License、bla bla。"
+          />
+          <TextArea
+            label="背景说明"
+            rows={3}
+            value={description}
+            onChange={setDescription}
+            isDisabled={savingTarget}
+            description="可选。交给 DeepSeek 的监测对象说明，例如组织是谁、要关注哪类事件。"
+          />
+          <CheckboxInput
+            label="英文短语区分大小写"
+            value={caseSensitive}
+            onChange={setCaseSensitive}
+            isDisabled={savingTarget}
+            description="2 到 5 个字母的缩写始终区分大小写。这个开关作用于更长的英文短语。"
+          />
+          <HStack gap={2}>
+            <Button label={editingId ? "保存修改" : "添加目标"} variant="primary" isLoading={savingTarget} onClick={saveTarget} />
+            <Button label="取消" variant="secondary" isDisabled={savingTarget} onClick={closeTargetDialog} />
+          </HStack>
+        </VStack>
+      </Dialog>
       <Dialog
         isOpen={importOpen}
         purpose="form"
