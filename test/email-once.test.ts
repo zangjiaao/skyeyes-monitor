@@ -67,6 +67,9 @@ describe("日报只发一次", () => {
       "INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)",
     ).run("rec-ops", "ops@example.com", now.toISOString());
     sqlite.prepare(
+      "INSERT INTO country_recipients (country_id, recipient_id) VALUES (?, ?)",
+    ).run("country_demo_alpha", "rec-ops");
+    sqlite.prepare(
       `INSERT INTO runs (
         id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at
       ) VALUES (?, ?, 'schedule', 'partial', ?, ?, ?, ?)`,
@@ -74,7 +77,7 @@ describe("日报只发一次", () => {
     sqlite.prepare(
       `INSERT INTO batches (
         id, run_id, country_id, source, batch_index, target_ids, status, created_at, enqueued_at
-      ) VALUES (?, ?, '', 'x', 0, '[]', 'queued', ?, ?)`,
+      ) VALUES (?, ?, 'country_demo_alpha', 'x', 0, '[]', 'queued', ?, ?)`,
     ).run("batch-x", "run-scheduled", stale, stale);
 
     const mails: Array<{ subject: string; to: string[] }> = [];
@@ -163,6 +166,9 @@ describe("日报只发一次", () => {
       "INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)",
     ).run("rec-ops", "ops@example.com", now.toISOString());
     sqlite.prepare(
+      "INSERT INTO country_recipients (country_id, recipient_id) VALUES (?, ?)",
+    ).run("country_demo_alpha", "rec-ops");
+    sqlite.prepare(
       `INSERT INTO runs (
         id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at
       ) VALUES (?, ?, 'manual', 'running', ?, ?, ?, ?)`,
@@ -174,6 +180,11 @@ describe("日报只发一次", () => {
       "2026-10-14T05:53:00.000Z",
       "2026-10-14T06:53:00.000Z",
     );
+    sqlite.prepare(
+      `INSERT INTO batches (
+        id, run_id, country_id, source, batch_index, target_ids, status, created_at
+      ) VALUES (?, ?, 'country_demo_alpha', 'x', 0, '[]', 'done', ?)`,
+    ).run("batch-manual", "run-manual", now.toISOString());
 
     let fail = true;
     const env = {

@@ -17,6 +17,7 @@ import {
   type ExistingTarget,
   type ImportPreviewRow,
 } from "../import/table";
+import { parseDeliveryMode, type DeliveryMode } from "../email/delivery";
 import { sendTestEmail } from "../email/send-test";
 import { isRunId, runWindowFilename, runWindowObjectKey } from "../export/run-file";
 import { storeExcel } from "../pipeline/run";
@@ -56,6 +57,28 @@ function descriptionText(value: unknown): string {
 function requireString(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label}不能为空`);
   return value.trim();
+}
+
+function recipientIdList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new Error("收件人无效");
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
+async function replaceCountryRecipients(db: D1Database, countryId: string, recipientIds: string[]): Promise<void> {
+  if (recipientIds.length > 0) {
+    const marks = recipientIds.map(() => "?").join(", ");
+    const found = await db.prepare(`SELECT id FROM recipients WHERE id IN (${marks})`).bind(...recipientIds).all<{ id: string }>();
+    if (found.results.length !== recipientIds.length) throw new Error("收件人不存在");
+  }
+  await db.batch([
+    db.prepare("DELETE FROM country_recipients WHERE country_id = ?").bind(countryId),
+    ...recipientIds.map((recipientId) => db.prepare(
+      "INSERT INTO country_recipients (country_id, recipient_id) VALUES (?, ?)",
+    ).bind(countryId, recipientId)),
+  ]);
 }
 
 interface StoredTargetRow {
@@ -564,8 +587,24 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   });
 
   app.get("/api/countries", async (c) => {
-    const rows = await c.env.DB.prepare("SELECT id, name, code, enabled, created_at FROM countries ORDER BY name").all();
-    return c.json({ countries: rows.results });
+    const rows = await c.env.DB.prepare(
+      "SELECT id, name, code, enabled, created_at, delivery FROM countries ORDER BY name",
+    ).all<{ id: string; name: string; code: string; enabled: number; created_at: string; delivery: DeliveryMode }>();
+    const links = await c.env.DB.prepare(
+      "SELECT country_id, recipient_id FROM country_recipients ORDER BY recipient_id",
+    ).all<{ country_id: string; recipient_id: string }>();
+    const recipients = new Map<string, string[]>();
+    for (const link of links.results) {
+      const list = recipients.get(link.country_id) ?? [];
+      list.push(link.recipient_id);
+      recipients.set(link.country_id, list);
+    }
+    return c.json({
+      countries: rows.results.map((country) => ({
+        ...country,
+        recipient_ids: recipients.get(country.id) ?? [],
+      })),
+    });
   });
 
   app.post("/api/countries", async (c) => {
@@ -574,10 +613,24 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       const name = requireString(body.name, "名称");
       const code = requireString(body.code, "代码").toLowerCase();
       if (!/^[a-z0-9-]{2,32}$/.test(code)) throw new Error("代码只能包含小写字母、数字和连字符");
+      const delivery = body.delivery === undefined ? "email" : parseDeliveryMode(body.delivery);
+      const requestedRecipients = recipientIdList(body.recipientIds);
+      const enabledRecipients = requestedRecipients === undefined && delivery === "email"
+        ? await c.env.DB.prepare("SELECT id FROM recipients WHERE enabled = 1 ORDER BY email").all<{ id: string }>()
+        : null;
+      const recipientIds = requestedRecipients
+        ?? enabledRecipients?.results.map((row) => row.id)
+        ?? [];
+      if (recipientIds.length > 0) {
+        const marks = recipientIds.map(() => "?").join(", ");
+        const found = await c.env.DB.prepare(`SELECT id FROM recipients WHERE id IN (${marks})`).bind(...recipientIds).all<{ id: string }>();
+        if (found.results.length !== recipientIds.length) throw new Error("收件人不存在");
+      }
       const id = crypto.randomUUID();
       await c.env.DB.prepare(
-        "INSERT INTO countries (id, name, code, enabled, created_at) VALUES (?, ?, ?, 1, ?)",
-      ).bind(id, name, code, new Date().toISOString()).run();
+        "INSERT INTO countries (id, name, code, enabled, delivery, created_at) VALUES (?, ?, ?, 1, ?, ?)",
+      ).bind(id, name, code, delivery, new Date().toISOString()).run();
+      await replaceCountryRecipients(c.env.DB, id, recipientIds);
       return c.json({ id }, 201);
     } catch (error) {
       return jsonError(error);
@@ -587,14 +640,20 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.patch("/api/countries/:id", async (c) => {
     try {
       const body = await readJson(c.req.raw);
-      const current = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(c.req.param("id")).first();
+      const id = c.req.param("id");
+      const current = await c.env.DB.prepare("SELECT id FROM countries WHERE id = ?").bind(id).first();
       if (!current) return c.json({ error: "分组不存在" }, 404);
       if (typeof body.name === "string" && body.name.trim()) {
-        await c.env.DB.prepare("UPDATE countries SET name = ? WHERE id = ?").bind(body.name.trim(), c.req.param("id")).run();
+        await c.env.DB.prepare("UPDATE countries SET name = ? WHERE id = ?").bind(body.name.trim(), id).run();
       }
       if (typeof body.enabled === "boolean") {
-        await c.env.DB.prepare("UPDATE countries SET enabled = ? WHERE id = ?").bind(body.enabled ? 1 : 0, c.req.param("id")).run();
+        await c.env.DB.prepare("UPDATE countries SET enabled = ? WHERE id = ?").bind(body.enabled ? 1 : 0, id).run();
       }
+      if (body.delivery !== undefined) {
+        await c.env.DB.prepare("UPDATE countries SET delivery = ? WHERE id = ?").bind(parseDeliveryMode(body.delivery), id).run();
+      }
+      const recipientIds = recipientIdList(body.recipientIds);
+      if (recipientIds !== undefined) await replaceCountryRecipients(c.env.DB, id, recipientIds);
       return c.json({ ok: true });
     } catch (error) {
       return jsonError(error);
@@ -604,6 +663,7 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   app.delete("/api/countries/:id", async (c) => {
     const id = c.req.param("id");
     await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM country_recipients WHERE country_id = ?").bind(id),
       c.env.DB.prepare("DELETE FROM targets WHERE country_id = ?").bind(id),
       c.env.DB.prepare("DELETE FROM countries WHERE id = ?").bind(id),
     ]);
@@ -821,7 +881,11 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
   });
 
   app.delete("/api/recipients/:id", async (c) => {
-    await c.env.DB.prepare("DELETE FROM recipients WHERE id = ?").bind(c.req.param("id")).run();
+    const id = c.req.param("id");
+    await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM country_recipients WHERE recipient_id = ?").bind(id),
+      c.env.DB.prepare("DELETE FROM recipients WHERE id = ?").bind(id),
+    ]);
     return c.json({ ok: true });
   });
 
