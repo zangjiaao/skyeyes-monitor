@@ -25,9 +25,7 @@ export async function authenticate(
       issuer: teamDomain,
       audience,
     });
-    const email = typeof payload.email === "string" ? payload.email.toLowerCase() : "";
-    if (!email) throw new Error("Access JWT 缺少 email");
-    return email;
+    return identityFromAccessPayload(payload);
   }
   if (env.ENVIRONMENT !== "production") {
     const identity = await ctx.access?.getIdentity();
@@ -37,7 +35,21 @@ export async function authenticate(
   throw new Error("缺少有效的 Cloudflare Access 凭证");
 }
 
+/** Access 已校验过的 Service Token 没有 email，用令牌名称作为身份。 */
+export function identityFromAccessPayload(payload: { email?: unknown; common_name?: unknown }): string {
+  const email = typeof payload.email === "string" ? payload.email.trim().toLowerCase() : "";
+  if (email) return email;
+  const commonName = typeof payload.common_name === "string" ? payload.common_name.trim() : "";
+  if (commonName) return `service-token:${commonName}`;
+  throw new Error("Access JWT 缺少 email");
+}
+
+export function isServiceTokenIdentity(identity: string): boolean {
+  return identity.startsWith("service-token:");
+}
+
 export async function assertAllowedEmail(env: Env, email: string): Promise<void> {
+  if (isServiceTokenIdentity(email)) return;
   const settings = await loadSettings(env.DB);
   if (settings.allowedAdminEmails.length === 0) return;
   if (!settings.allowedAdminEmails.includes(email.toLowerCase())) {
