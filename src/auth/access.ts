@@ -36,7 +36,7 @@ export async function authenticate(
 }
 
 /** Access 已校验过的 Service Token 没有 email，用令牌名称作为身份。 */
-export function identityFromAccessPayload(payload: { email?: unknown; common_name?: unknown }): string {
+export function identityFromAccessPayload(payload: { [key: string]: unknown }): string {
   const email = typeof payload.email === "string" ? payload.email.trim().toLowerCase() : "";
   if (email) return email;
   const commonName = typeof payload.common_name === "string" ? payload.common_name.trim() : "";
