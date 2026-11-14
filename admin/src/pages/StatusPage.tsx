@@ -26,6 +26,7 @@ const EVENTS: Record<string, string> = {
   "source query response": "收到响应", "source query wait": "接口等待", "source query result": "命中校验", "source page stored": "保存本页",
   "source query error": "请求失败", "batch deferred": "延后续跑", "batch retry": "错误重试",
   "batch failed": "来源失败", "batch done": "来源完成", "run cancelled": "取消任务", "run finalized": "任务结束",
+  "daily email resent": "补发日报",
 };
 const REASONS: Record<string, string> = {
   global_duplicate: "与已有内容重复", page_duplicate_or_invalid: "页内重复或格式无效", insert_conflict: "已存在相同记录",
@@ -35,6 +36,9 @@ const REASONS: Record<string, string> = {
   missing_attribution: "缺少命中目标", record_error: "条目处理异常",
 };
 const isActive = (status: string) => ["running", "partial", "finalizing"].includes(status);
+function canResendEmail(run: Run): boolean {
+  return !isActive(run.status) && run.email_status !== "sent";
+}
 
 interface Progress {
   pending: number; enqueued: number; running: number; done: number; failed: number; cancelled: number;
@@ -151,6 +155,7 @@ export function StatusPage() {
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
   const [cancelId, setCancelId] = useState<string | null>(null);
+  const [resendId, setResendId] = useState<string | null>(null);
   const [environmentOpen, setEnvironmentOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState("events");
@@ -212,14 +217,20 @@ export function StatusPage() {
     return () => { alive = false; if (timer !== null) window.clearInterval(timer); };
   }, [selectedId, eventCursor, autoRefresh, refreshKey, inspectorOpen, inspectorTab]);
 
-  async function action(type: "requeue" | "cancel", runId?: string) {
+  async function action(type: "requeue" | "cancel" | "resend", runId?: string) {
     if (actionBusy) return;
     setActionBusy(true); setActionError("");
     try {
-      const path = type === "cancel" ? `/api/runs/${runId}/cancel` : runId ? `/api/runs/${runId}/requeue` : "/api/runs/requeue";
-      const result = await api<{ batches?: number; cancelledBatches?: number; warning?: string | null }>(path, { method: "POST" });
+      const path = type === "cancel"
+        ? `/api/runs/${runId}/cancel`
+        : type === "resend"
+          ? `/api/runs/${runId}/email`
+          : runId ? `/api/runs/${runId}/requeue` : "/api/runs/requeue";
+      const result = await api<{ batches?: number; cancelledBatches?: number; warning?: string | null; recipients?: string[] }>(path, { method: "POST" });
       setCancelId(null);
-      setNotice(result.warning ?? (type === "cancel" ? `已取消 ${result.cancelledBatches ?? 0} 个未完成来源` : `已重新入队 ${result.batches ?? 0} 个采集来源`));
+      setResendId(null);
+      const resent = result.recipients?.length ? `已补发日报给 ${result.recipients.join("、")}` : "已补发日报";
+      setNotice(result.warning ?? (type === "cancel" ? `已取消 ${result.cancelledBatches ?? 0} 个未完成来源` : type === "resend" ? resent : `已重新入队 ${result.batches ?? 0} 个采集来源`));
       if (result.warning) setActionError(result.warning);
       setRefreshKey((key) => key + 1);
     } catch (reason) { setActionError(reason instanceof Error ? reason.message : "操作失败"); }
@@ -274,6 +285,7 @@ export function StatusPage() {
               </VStack>
               <HStack gap={2}>
                 <Button label="执行记录" variant="secondary" size="sm" onClick={() => inspect(run!.id)} />
+                {canResendEmail(run!) ? <Button label="补发日报" variant="primary" size="sm" isDisabled={actionBusy} onClick={() => setResendId(run!.id)} /> : null}
                 {canRecover ? <Button label="恢复" variant="primary" size="sm" isDisabled={actionBusy} onClick={() => { void action("requeue", run!.id); }} /> : null}
                 {isActive(run!.status) || run!.status === "failed" ? <Button label="取消" variant="ghost" size="sm" isDisabled={actionBusy} onClick={() => setCancelId(run!.id)} /> : null}
               </HStack>
@@ -343,6 +355,7 @@ export function StatusPage() {
       <Dialog isOpen={inspectorOpen} variant="fullscreen" purpose="info" onOpenChange={closeInspector}>
         <VStack gap={4}>
           <DialogHeader title={detail ? scope(detail.run) : "任务详情"} onOpenChange={closeInspector} />
+          {detail && canResendEmail(detail.run) ? <HStack gap={2}><Button label="补发日报" variant="primary" size="sm" isDisabled={actionBusy} onClick={() => setResendId(detail.run.id)} /></HStack> : null}
           <TabList value={inspectorTab} onChange={setInspectorTab} role="tablist" hasDivider>
             <Tab value="events" label="执行记录" panelId="run-events-panel" />
             <Tab value="issues" label="异常与等待" panelId="run-issues-panel" />
@@ -410,6 +423,14 @@ export function StatusPage() {
               { width: proportional(1), key: "yesterday", header: "昨日" }, { width: proportional(1), key: "total", header: "累计" },
             ]} />
           </> : null}
+        </VStack>
+      </Dialog>
+      <Dialog isOpen={resendId !== null} purpose="form" onOpenChange={(open) => { if (!open && !actionBusy) setResendId(null); }}>
+        <VStack gap={3}>
+          <DialogHeader title="补发这次日报？" onOpenChange={(open) => { if (!open && !actionBusy) setResendId(null); }} />
+          <Text type="body">按这次任务已经收集到的内容，发给当前配置了邮件的收件人。已经成功发出的不会再发。</Text>
+          {actionError ? <Banner status="error" title="补发失败" description={actionError} /> : null}
+          <HStack gap={2}><Button label="确认补发" variant="primary" isDisabled={actionBusy} onClick={() => { void action("resend", resendId!); }} /><Button label="取消" variant="secondary" isDisabled={actionBusy} onClick={() => setResendId(null)} /></HStack>
         </VStack>
       </Dialog>
       <Dialog isOpen={cancelId !== null} purpose="form" onOpenChange={(open) => { if (!open && !actionBusy) setCancelId(null); }}>
