@@ -57,7 +57,7 @@ export function runStallReason(run: { status: string; started_at: string; deadli
     return "收尾仍未结束；定时维护会检查并关闭超时任务";
   }
   if (["running", "partial"].includes(run.status) && Date.parse(run.deadline_at) <= now.getTime()) {
-    return "已超过采集截止时间，等待收尾；定时维护每小时执行一次";
+    return "已到保险检查时间。采集仍在进行时不会中断；只有长时间没有进展，或到了下一次定时运行，才会收尾";
   }
   return null;
 }

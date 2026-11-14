@@ -25,7 +25,7 @@ describe("等待和卡住原因", () => {
     expect(batchActivity({ ...running, lease_expires_at: "2026-11-05T09:59:00Z" }, "running", now).stuckReason).toContain("租约已过期");
     expect(batchActivity(batch, "incomplete", now).stuckReason).toBeNull();
     expect(runStallReason({ status: "finalizing", started_at: "2026-11-05T08:00:00Z", deadline_at: "2026-11-05T11:00:00Z", finalize_enqueued_at: "2026-11-05T09:00:00Z" }, now)).toContain("收尾");
-    expect(runStallReason({ status: "running", started_at: "2026-11-05T08:00:00Z", deadline_at: "2026-11-05T09:00:00Z" }, now)).toContain("截止时间");
+    expect(runStallReason({ status: "running", started_at: "2026-11-05T08:00:00Z", deadline_at: "2026-11-05T09:00:00Z" }, now)).toContain("保险检查");
   });
   it("计算各来源的真实检索条件总数", () => {
     const targets = [{ id: "t", name: "Relations", query: "Taiwan Japan", terms: ["Taiwan Japan", "Taiwan Pakistan"], kind: "keyword" as const }];

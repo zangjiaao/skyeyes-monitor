@@ -504,4 +504,101 @@ describe("收尾死锁", () => {
       next_wake_at: null,
     });
   });
+
+  it("仍在采集的运行过了保险时间只顺延，不取消批次", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-22T04:00:00.000Z");
+    insertRun(sqlite, {
+      id: "run-live",
+      slotKey: "2026-10-22T10",
+      status: "running",
+      startedAt: "2026-10-22T02:00:00.000Z",
+      deadlineAt: "2026-10-22T03:00:00.000Z",
+    });
+    insertBatch(sqlite, {
+      id: "batch-x",
+      runId: "run-live",
+      source: "x",
+      status: "running",
+      createdAt: "2026-10-22T03:50:00.000Z",
+      leaseExpiresAt: new Date(now.getTime() + 5 * 60 * 1000).toISOString(),
+    });
+    insertRun(sqlite, {
+      id: "run-wake",
+      slotKey: "2026-10-22T11",
+      status: "partial",
+      startedAt: "2026-10-22T02:00:00.000Z",
+      deadlineAt: "2026-10-22T03:00:00.000Z",
+    });
+    insertBatch(sqlite, {
+      id: "batch-news",
+      runId: "run-wake",
+      source: "google_news",
+      status: "queued",
+      createdAt: "2026-10-22T02:00:00.000Z",
+      enqueuedAt: "2026-10-22T02:10:00.000Z",
+    });
+    sqlite.prepare("UPDATE batches SET next_wake_at = ? WHERE id = ?").run(
+      new Date(now.getTime() + 30 * 60 * 1000).toISOString(),
+      "batch-news",
+    );
+
+    await finalizeOverdue(envFor(sqlite), now);
+
+    expect(sqlite.prepare("SELECT status FROM batches WHERE id = 'batch-x'").get()).toEqual({ status: "running" });
+    expect(sqlite.prepare("SELECT status FROM batches WHERE id = 'batch-news'").get()).toEqual({ status: "queued" });
+    const live = sqlite.prepare("SELECT status, deadline_at FROM runs WHERE id = 'run-live'").get() as {
+      status: string;
+      deadline_at: string;
+    };
+    const waiting = sqlite.prepare("SELECT status, deadline_at FROM runs WHERE id = 'run-wake'").get() as {
+      status: string;
+      deadline_at: string;
+    };
+    expect(live.status).toBe("running");
+    expect(waiting.status).toBe("partial");
+    expect(Date.parse(live.deadline_at)).toBe(now.getTime() + 60 * 60 * 1000);
+    expect(Date.parse(waiting.deadline_at)).toBe(now.getTime() + 60 * 60 * 1000);
+  });
+
+  it("到了下一次定时运行时，仍在采集的任务会收尾并让出新的一天", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-26T02:00:00.000Z");
+    insertRun(sqlite, {
+      id: "run-yesterday",
+      slotKey: "2026-10-25T10",
+      status: "running",
+      startedAt: "2026-10-25T02:00:00.000Z",
+      deadlineAt: new Date(now.getTime() + 30 * 60 * 1000).toISOString(),
+    });
+    insertBatch(sqlite, {
+      id: "batch-x",
+      runId: "run-yesterday",
+      source: "x",
+      status: "running",
+      createdAt: "2026-10-25T02:00:00.000Z",
+      leaseExpiresAt: new Date(now.getTime() + 5 * 60 * 1000).toISOString(),
+    });
+    const sent: CollectMessage[] = [];
+    const env = {
+      ...envFor(sqlite, sent),
+      EXPORTS: { async put() {} },
+    } as unknown as Env;
+    await handleScheduled(env, now.getTime());
+
+    const yesterday = sqlite.prepare("SELECT status FROM runs WHERE id = 'run-yesterday'").get() as { status: string };
+    expect(yesterday.status).toBe("incomplete");
+    expect(sqlite.prepare("SELECT status, error FROM batches WHERE id = 'batch-x'").get()).toEqual({
+      status: "cancelled",
+      error: "已到下一次定时运行",
+    });
+    const runs = sqlite.prepare("SELECT id, status, slot_key FROM runs ORDER BY started_at").all() as Array<{
+      id: string;
+      status: string;
+      slot_key: string;
+    }>;
+    expect(runs.map((run) => run.slot_key)).toEqual(["2026-10-25T10", "2026-10-26T10"]);
+    expect(runs[1]?.status).toBe("running");
+    expect(sent.some((message) => message.type === "batch" && message.runId === runs[1]?.id)).toBe(true);
+  });
 });

@@ -6,18 +6,18 @@ import { ActiveRunError, finalizeOverdue, requeueStuckBatches, startRun } from "
 
 export async function handleScheduled(env: Env, scheduledTime: number): Promise<void> {
   const now = new Date(scheduledTime);
-  await finalizeOverdue(env, now);
-  try {
-    await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
-  } catch (error) {
-    logError("requeue stuck batches failed", error);
-  }
   const settings = await loadSettings(env.DB);
   const decision = decideSchedule(now, {
     timeZone: settings.timeZone,
     scheduleHour: settings.scheduleHour,
     windowHours: settings.windowHours,
   });
+  await finalizeOverdue(env, now, { yieldToNextRun: decision.due });
+  try {
+    await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
+  } catch (error) {
+    logError("requeue stuck batches failed", error);
+  }
   console.log(JSON.stringify({
     message: "hourly cron",
     due: decision.due,

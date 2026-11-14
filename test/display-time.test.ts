@@ -151,7 +151,7 @@ describe("按时区显示", () => {
     expect(digest.text).toContain("窗口: 2026-10-13 00:00 至 2026-10-13 10:00（Asia/Shanghai, UTC+8）");
     expect(digest.text).toContain("- 示例分组: 新增 3（X 2，Google News 1）");
     expect(digest.text).toContain("失败批次: 1");
-    expect(digest.text).toContain("本轮在截止时间前仍有批次未完成。");
+    expect(digest.text).toContain("本轮仍有批次未完成，已发送目前收集到的内容。");
     expect(digest.text).toContain("有批次未完成，已发送目前收集到的内容。");
     expect(digest.text).toContain("本轮新增在附件 Excel 里。");
     expect(digest.text).not.toContain("本轮条目");

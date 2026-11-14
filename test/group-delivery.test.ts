@@ -259,4 +259,100 @@ describe("分组推送", () => {
     expect(mails).toEqual([["d@example.com"], ["f@example.com"]]);
     expect(sqlite.prepare("SELECT email_status FROM runs WHERE id = 'run-split'").get()).toEqual({ email_status: "sent" });
   });
+
+  it("来源批次没有分组 id 时，仍按任务范围发信", async () => {
+    const sqlite = openDatabase();
+    const now = "2026-10-15T03:00:00.000Z";
+    const windowStart = "2026-10-14T02:00:00.000Z";
+    const windowEnd = "2026-10-15T02:00:00.000Z";
+    for (const [key, value] of [
+      ["email_enabled", "1"],
+      ["email_provider", "cloudflare"],
+      ["email_from", "news@example.com"],
+    ]) {
+      sqlite.prepare(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(key, value);
+    }
+    for (const [id, email] of [
+      ["rec-d", "d@example.com"],
+      ["rec-e", "e@example.com"],
+      ["rec-f", "f@example.com"],
+    ]) {
+      sqlite.prepare("INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)").run(id, email, now);
+    }
+    for (const [id, name, code, delivery] of [
+      ["group-a", "分组甲", "group-a", "email"],
+      ["group-b", "分组乙", "group-b", "email"],
+      ["group-c", "分组丙", "group-c", "none"],
+    ] as const) {
+      sqlite.prepare(
+        "INSERT INTO countries (id, name, code, enabled, delivery, created_at) VALUES (?, ?, ?, 1, ?, ?)",
+      ).run(id, name, code, delivery, now);
+    }
+    for (const countryId of ["group-a", "group-b"]) {
+      for (const recipientId of ["rec-d", "rec-e", "rec-f"]) {
+        sqlite.prepare("INSERT INTO country_recipients (country_id, recipient_id) VALUES (?, ?)").run(countryId, recipientId);
+      }
+    }
+    sqlite.prepare(
+      `INSERT INTO runs (
+        id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at, scope_json
+      ) VALUES ('run-source', 'slot-source', 'schedule', 'running', ?, ?, ?, ?, ?)`,
+    ).run(windowStart, windowEnd, windowStart, windowEnd, JSON.stringify({
+      mode: "all",
+      countries: [
+        { id: "group-a", name: "分组甲" },
+        { id: "group-b", name: "分组乙" },
+        { id: "group-c", name: "分组丙" },
+      ],
+      targetCount: 3,
+    }));
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, created_at)
+       VALUES ('batch-x', 'run-source', '', 'x', 0, '[]', 'done', ?)`,
+    ).run(now);
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, created_at)
+       VALUES ('batch-news', 'run-source', '', 'google_news', 1, '[]', 'done', ?)`,
+    ).run(now);
+    const insertRecord = sqlite.prepare(
+      `INSERT INTO records (
+        id, dedupe_key, source, url, country_id, country_name, matched_target, original_text,
+        published_at, collected_at, run_id, time_status, is_spam, exclude_reason
+      ) VALUES (?, ?, 'x', ?, ?, ?, '目标', ?, ?, ?, 'run-source', 'in_window', 0, '')`,
+    );
+    for (const [id, name, text] of [
+      ["group-a", "分组甲", "甲的报道"],
+      ["group-b", "分组乙", "乙的报道"],
+      ["group-c", "分组丙", "丙的报道"],
+    ] as const) {
+      insertRecord.run(
+        `record-${id}`, `dedupe-${id}`, `https://example.com/${id}`, id, name, text,
+        "2026-10-14T08:00:00.000Z", now,
+      );
+    }
+    const mails: Array<{ to: string[]; text: string }> = [];
+    const env = {
+      ENVIRONMENT: "development",
+      EXCEL_FILENAME: "skyeyes.xlsx",
+      DB: asD1(sqlite),
+      EXPORTS: { async put() {} },
+      EMAIL: {
+        async send(message: { to: string[]; text: string }) {
+          mails.push({ to: message.to, text: message.text });
+          return { messageId: `mail-${mails.length}` };
+        },
+      },
+    } as unknown as Env;
+
+    await finalizeRun(env, "run-source", "complete");
+
+    expect(mails).toHaveLength(1);
+    expect(mails[0]?.to).toEqual(["d@example.com", "e@example.com", "f@example.com"]);
+    expect(mails[0]?.text).toContain("分组甲");
+    expect(mails[0]?.text).toContain("分组乙");
+    expect(mails[0]?.text).not.toContain("分组丙");
+    expect(sqlite.prepare("SELECT email_status FROM runs WHERE id = 'run-source'").get()).toEqual({ email_status: "sent" });
+  });
 });

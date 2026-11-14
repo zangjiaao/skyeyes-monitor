@@ -124,7 +124,7 @@ describe("日报只发一次", () => {
       status: string;
       error: string;
     };
-    expect(batchAfterDeadline).toEqual({ status: "cancelled", error: "已过截止时间" });
+    expect(batchAfterDeadline).toEqual({ status: "cancelled", error: "采集长时间没有进展" });
 
     await requeueStuckBatches(env, { now, minAgeMs: STUCK_BATCH_GRACE_MS });
     await requeueStuckBatches(env, { now, force: true, runId: "run-scheduled" });

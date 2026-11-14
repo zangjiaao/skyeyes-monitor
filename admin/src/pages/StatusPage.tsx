@@ -100,7 +100,11 @@ function preciseTime(value: string | null | undefined, zone: string): string {
 }
 function eventSummary(event: Event): string {
   const d = event.details;
-  if (event.type === "run finalized") return d.reason === "deadline" ? "到达截止时间，按已有结果结束" : "采集完成，汇总结束";
+  if (event.type === "run finalized") {
+    if (d.reason === "preempt") return "已到下一次定时运行，按已有结果结束";
+    if (d.reason === "deadline") return "采集长时间没有进展，按已有结果结束";
+    return "采集完成，汇总结束";
+  }
   if (event.type === "source query response") return `HTTP ${d.status ?? "—"}`;
   if (event.type === "source query result") return `上游返回 ${d.rawItems ?? 0} → 命中 ${d.matchedItems ?? 0}`;
   if (event.type === "source page stored") {
@@ -375,7 +379,7 @@ export function StatusPage() {
               { key: "任务 ID", value: detail.run.id }, { key: "触发", value: detail.run.trigger === "manual" ? "手动" : "定时" },
               { key: "范围", value: scope(detail.run) }, { key: "开始", value: activityTime(detail.run.started_at) },
               { key: "采集窗口", value: `${time(detail.run.window_start)} — ${time(detail.run.window_end)}` },
-              { key: "截止", value: activityTime(detail.run.deadline_at) }, { key: "结束", value: activityTime(detail.run.finished_at) },
+              { key: "保险检查", value: activityTime(detail.run.deadline_at) }, { key: "结束", value: activityTime(detail.run.finished_at) },
               { key: "邮件", value: EMAIL[detail.run.email_status ?? ""] ?? "尚未发送" },
               { key: "去重 / 过滤", value: `${detail.run.progress.deduped} / ${detail.run.progress.filtered}` },
               { key: "说明", value: detail.run.notes || "—" },

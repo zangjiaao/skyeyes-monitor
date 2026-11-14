@@ -29,7 +29,7 @@ const FIELDS = [
   ["translation_source_lang", "拉丁文字未标明语种时的源语言代码"],
   ["translation_target_lang", "翻译目标语言代码"],
   ["translation_fallback_model", "翻译备用对话模型（Workers AI）。DeepSeek 和 m2m100 都没有译成中文时使用。默认 @cf/zai-org/glm-4.7-flash。不要填写已停用的 @cf/google/gemma-3-12b-it"],
-  ["finalize_deadline_minutes", "收尾截止分钟"],
+  ["finalize_deadline_minutes", "无进展保险分钟。采集还在进行时会顺延；到了下一次定时运行才强制收尾"],
   ["x_max_pages", "X 每条检索词最多翻页。同一目标的每条词各自占用这些页"],
   ["x_qps", "X 每秒请求数。未付费账号保持 0.2（每 5 秒 1 次）；充值后可提高到 10，上限 20"],
   ["queue_concurrency", "同时进行的来源链数，1 到 8。一次运行最多三条，默认 4 可以一起跑。超过上限的链会等 30 秒再继续"],
