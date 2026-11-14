@@ -483,6 +483,8 @@ export async function startRun(env: Env, input: {
   const runId = crypto.randomUUID();
   const slotKey = input.trigger === "manual" ? `manual-${runId}` : input.slotKey;
   const startedAt = input.now.toISOString();
+  // First insurance check. A run that is still collecting has this pushed forward
+  // instead of being cancelled. The next scheduled slot closes it so the new day can start.
   const deadlineAt = new Date(input.now.getTime() + settings.finalizeDeadlineMinutes * 60 * 1000).toISOString();
   try {
     await env.DB.prepare(
@@ -1684,11 +1686,36 @@ export async function storeRunWindowExcel(
   return { bytes, key, filename, truncated: loaded.truncated, count: loaded.records.length };
 }
 
+function scopeCountryIds(scopeJson: string | null): string[] {
+  if (!scopeJson) return [];
+  try {
+    const parsed = JSON.parse(scopeJson) as { countries?: Array<{ id?: unknown }> };
+    if (!Array.isArray(parsed?.countries)) return [];
+    return parsed.countries
+      .map((country) => (typeof country?.id === "string" ? country.id : ""))
+      .filter((id) => id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 async function loadRunEmailGroups(env: Env, runId: string): Promise<EmailGroup[]> {
-  const scope = await env.DB.prepare(
-    "SELECT DISTINCT country_id AS id FROM batches WHERE run_id = ? AND country_id != ''",
-  ).bind(runId).all<{ id: string }>();
-  const ids = scope.results.map((row) => row.id);
+  const run = await env.DB.prepare("SELECT scope_json FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ scope_json: string | null }>();
+  let ids = scopeCountryIds(run?.scope_json ?? null);
+  if (ids.length === 0) {
+    const fromBatches = await env.DB.prepare(
+      "SELECT DISTINCT country_id AS id FROM batches WHERE run_id = ? AND country_id != ''",
+    ).bind(runId).all<{ id: string }>();
+    ids = fromBatches.results.map((row) => row.id);
+  }
+  if (ids.length === 0) {
+    const fromRecords = await env.DB.prepare(
+      "SELECT DISTINCT country_id AS id FROM records WHERE run_id = ? AND country_id != ''",
+    ).bind(runId).all<{ id: string }>();
+    ids = fromRecords.results.map((row) => row.id);
+  }
   if (ids.length === 0) return [];
   const marks = ids.map(() => "?").join(", ");
   const countries = await env.DB.prepare(
@@ -1799,7 +1826,7 @@ async function releaseDailyEmailClaim(env: Env, runId: string, claimedAt: string
   ).bind(runId, claimedAt).run();
 }
 
-export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline"): Promise<void> {
+export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline" | "preempt"): Promise<void> {
   const claim = await env.DB.prepare(
     `UPDATE runs SET status = 'finalizing'
      WHERE id = ? AND (
@@ -1811,8 +1838,8 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   await env.DB.prepare(
     "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
   ).bind(new Date().toISOString(), runId).run();
-  if (reason === "deadline") {
-    await cancelOpenBatches(env, runId, "已过截止时间");
+  if (reason === "deadline" || reason === "preempt") {
+    await cancelOpenBatches(env, runId, reason === "preempt" ? "已到下一次定时运行" : "采集长时间没有进展");
   }
 
   const settings = await loadSettings(env.DB);
@@ -1829,7 +1856,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   ).bind(runId).first<{ done: number | null; failed: number | null; pending: number | null }>();
   const failed = counts?.failed ?? 0;
   const pending = counts?.pending ?? 0;
-  const incomplete = reason === "deadline" || failed > 0 || pending > 0;
+  const incomplete = reason !== "complete" || failed > 0 || pending > 0;
   let notes = run.notes ?? "";
   if (incomplete && !notes.includes("有批次未完成，已发送目前收集到的内容。")) {
     notes = [notes, "有批次未完成，已发送目前收集到的内容。"].filter(Boolean).join(" ");
@@ -1899,7 +1926,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
               continue;
             }
             const health = await bucketBatchHealth(env, runId, bucket.groupIds);
-            const bucketIncomplete = health.failed > 0 || health.pending > 0 || (reason === "deadline" && health.cancelled > 0);
+            const bucketIncomplete = health.failed > 0 || health.pending > 0 || (reason !== "complete" && health.cancelled > 0);
             const coversAll = bucket.groupIds.length === allIds.size && bucket.groupIds.every((id) => allIds.has(id));
             const file = coversAll
               ? { bytes: windowFile.bytes, truncated: windowFile.truncated }
@@ -2126,8 +2153,68 @@ export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[
   return closed;
 }
 
-export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
+/** A batch is still doing the day's collection, including a scheduled continuation. */
+export function batchIsCollecting(
+  batch: {
+    status: string;
+    lease_expires_at?: string | null;
+    next_wake_at?: string | null;
+    enqueued_at?: string | null;
+  },
+  now: Date,
+): boolean {
+  if (batch.status === "running") {
+    const lease = Date.parse(batch.lease_expires_at ?? "");
+    return Number.isFinite(lease) && lease > now.getTime() - STALE_ENQUEUE_MS;
+  }
+  if (batch.status !== "queued") return false;
+  const wake = Date.parse(batch.next_wake_at ?? "");
+  if (Number.isFinite(wake) && wake > now.getTime()) return true;
+  const enqueuedAt = batch.enqueued_at ?? "";
+  if (!enqueuedAt || enqueuedAt.startsWith("claim:")) return false;
+  const enqueued = Date.parse(enqueuedAt);
+  return Number.isFinite(enqueued) && now.getTime() - enqueued <= STALE_ENQUEUE_MS;
+}
+
+async function runStillCollecting(env: Env, runId: string, now: Date): Promise<boolean> {
+  const batches = await env.DB.prepare(
+    `SELECT status, lease_expires_at, next_wake_at, enqueued_at
+     FROM batches WHERE run_id = ? AND status IN ('queued', 'running')`,
+  ).bind(runId).all<{
+    status: string;
+    lease_expires_at: string | null;
+    next_wake_at: string | null;
+    enqueued_at: string | null;
+  }>();
+  return batches.results.some((batch) => batchIsCollecting(batch, now));
+}
+
+async function postponeCollectionDeadline(env: Env, runId: string, now: Date): Promise<void> {
+  const settings = await loadSettings(env.DB);
+  const deadlineAt = new Date(now.getTime() + settings.finalizeDeadlineMinutes * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    `UPDATE runs SET deadline_at = ?
+     WHERE id = ? AND status IN ('running', 'partial')`,
+  ).bind(deadlineAt, runId).run();
+  log("collection deadline postponed", { runId, deadlineAt });
+}
+
+export async function finalizeOverdue(
+  env: Env,
+  now: Date,
+  options: { yieldToNextRun?: boolean } = {},
+): Promise<void> {
   const swept = new Set(await closeStuckFinalizing(env, now));
+  if (options.yieldToNextRun) {
+    const active = await env.DB.prepare(
+      "SELECT id FROM runs WHERE status IN ('running', 'partial')",
+    ).all<{ id: string }>();
+    for (const row of active.results) {
+      if (swept.has(row.id)) continue;
+      swept.add(row.id);
+      await finalizeRun(env, row.id, "preempt");
+    }
+  }
   const rows = await env.DB.prepare(
     `SELECT id FROM runs
      WHERE deadline_at <= ? AND (
@@ -2137,6 +2224,13 @@ export async function finalizeOverdue(env: Env, now: Date): Promise<void> {
   ).bind(now.toISOString()).all<{ id: string }>();
   for (const row of rows.results) {
     if (swept.has(row.id)) continue;
+    const current = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+      .bind(row.id)
+      .first<{ status: string }>();
+    if (current && (current.status === "running" || current.status === "partial") && await runStillCollecting(env, row.id, now)) {
+      await postponeCollectionDeadline(env, row.id, now);
+      continue;
+    }
     await finalizeRun(env, row.id, "deadline");
   }
 }

@@ -83,7 +83,7 @@ export function buildDigest(input: DigestInput): { subject: string; text: string
     ...input.countries.map((country) => `- ${country.name}: 新增 ${country.added}${sourceSuffix(country.bySource)}`),
     "",
     `失败批次: ${input.failedBatches}`,
-    input.incomplete ? "本轮在截止时间前仍有批次未完成。" : "本轮批次已全部结束。",
+    input.incomplete ? "本轮仍有批次未完成，已发送目前收集到的内容。" : "本轮批次已全部结束。",
     excelLine(input),
   ];
   if (input.notes) lines.push("", input.notes);
