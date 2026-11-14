@@ -27,7 +27,7 @@ import { rescoreRecords } from "../records/rescore";
 import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
 import { enqueueErrorMessage } from "../pipeline/queue-batch";
-import { ActiveRunError, RunScopeError, parseRunCountryIds, cancelRun, requeueStuckBatches } from "../pipeline/run";
+import { ActiveRunError, RunScopeError, parseRunCountryIds, cancelRun, requeueStuckBatches, resendRunDigest } from "../pipeline/run";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -1214,6 +1214,17 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       return c.json(result);
     } catch (error) {
       return jsonError(new Error(enqueueErrorMessage(error)), 500);
+    }
+  });
+
+  app.post("/api/runs/:id/email", async (c) => {
+    try {
+      const result = await resendRunDigest(c.env, c.req.param("id"));
+      if (result.status !== "sent") throw new Error(result.error || "没有可发送的收件人");
+      return c.json({ ok: true, ...result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      return jsonError(error, message === "运行不存在" ? 404 : 400);
     }
   });
 

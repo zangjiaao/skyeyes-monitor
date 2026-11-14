@@ -355,4 +355,82 @@ describe("分组推送", () => {
     expect(mails[0]?.text).not.toContain("分组丙");
     expect(sqlite.prepare("SELECT email_status FROM runs WHERE id = 'run-source'").get()).toEqual({ email_status: "sent" });
   });
+
+  it("未发出的任务可以手动补发，已发出的不能再发", async () => {
+    const sqlite = openDatabase();
+    const now = "2026-10-15T03:00:00.000Z";
+    const windowStart = "2026-10-14T02:00:00.000Z";
+    const windowEnd = "2026-10-15T02:00:00.000Z";
+    for (const [key, value] of [
+      ["email_enabled", "1"],
+      ["email_provider", "cloudflare"],
+      ["email_from", "news@example.com"],
+    ]) {
+      sqlite.prepare(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(key, value);
+    }
+    sqlite.prepare("INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)").run("rec-d", "d@example.com", now);
+    sqlite.prepare(
+      "INSERT INTO countries (id, name, code, enabled, delivery, created_at) VALUES ('group-a', '分组甲', 'group-a', 1, 'email', ?)",
+    ).run(now);
+    sqlite.prepare("INSERT INTO country_recipients (country_id, recipient_id) VALUES ('group-a', 'rec-d')").run();
+    sqlite.prepare(
+      `INSERT INTO runs (
+        id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at, finished_at, email_status, scope_json
+      ) VALUES ('run-skipped', 'slot-skipped', 'schedule', 'incomplete', ?, ?, ?, ?, ?, 'skipped', ?)`,
+    ).run(windowStart, windowEnd, windowStart, windowEnd, now, JSON.stringify({
+      mode: "all",
+      countries: [{ id: "group-a", name: "分组甲" }],
+      targetCount: 1,
+    }));
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, created_at, error)
+       VALUES ('batch-x', 'run-skipped', '', 'x', 0, '[]', 'cancelled', ?, '已过截止时间')`,
+    ).run(now);
+    sqlite.prepare(
+      `INSERT INTO records (
+        id, dedupe_key, source, url, country_id, country_name, matched_target, original_text,
+        published_at, collected_at, run_id, time_status, is_spam, exclude_reason
+      ) VALUES ('record-a', 'dedupe-a', 'x', 'https://example.com/a', 'group-a', '分组甲', '目标', '甲的报道', ?, ?, 'run-skipped', 'in_window', 0, '')`,
+    ).run("2026-10-14T08:00:00.000Z", now);
+    const mails: string[][] = [];
+    const env = {
+      ENVIRONMENT: "development",
+      EXCEL_FILENAME: "skyeyes.xlsx",
+      DB: asD1(sqlite),
+      EXPORTS: { async put() {} },
+      EMAIL: {
+        async send(message: { to: string[] }) {
+          mails.push(message.to);
+          return { messageId: "mail-resend" };
+        },
+      },
+    } as unknown as Env;
+    const ctx = {
+      access: { async getIdentity() { return { email: "dev@example.com" }; } },
+    } as unknown as ExecutionContext;
+    const app = createApp();
+
+    const sent = await app.request("/api/runs/run-skipped/email", { method: "POST" }, env, ctx);
+    expect(sent.status).toBe(200);
+    expect(mails).toEqual([["d@example.com"]]);
+    expect(sqlite.prepare("SELECT status, email_status FROM runs WHERE id = 'run-skipped'").get()).toEqual({
+      status: "incomplete",
+      email_status: "sent",
+    });
+
+    const again = await app.request("/api/runs/run-skipped/email", { method: "POST" }, env, ctx);
+    expect(again.status).toBe(400);
+    expect(mails).toHaveLength(1);
+
+    sqlite.prepare(
+      `INSERT INTO runs (
+        id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at, email_status
+      ) VALUES ('run-open', 'slot-open', 'schedule', 'running', ?, ?, ?, ?, 'skipped')`,
+    ).run(windowStart, windowEnd, windowStart, windowEnd);
+    const active = await app.request("/api/runs/run-open/email", { method: "POST" }, env, ctx);
+    expect(active.status).toBe(400);
+    expect(mails).toHaveLength(1);
+  });
 });
