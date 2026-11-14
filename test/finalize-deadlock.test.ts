@@ -583,7 +583,7 @@ describe("收尾死锁", () => {
     const env = {
       ...envFor(sqlite, sent),
       EXPORTS: { async put() {} },
-    } as Env;
+    } as unknown as Env;
     await handleScheduled(env, now.getTime());
 
     const yesterday = sqlite.prepare("SELECT status FROM runs WHERE id = 'run-yesterday'").get() as { status: string };
