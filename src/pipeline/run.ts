@@ -44,6 +44,7 @@ import {
   FINALIZE_LEASE_MS,
   FINALIZING_GRACE_MS,
   FinalizeBusyError,
+  finalizeRetryDelaySeconds,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
   batchWakeup,
@@ -1561,6 +1562,24 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
   await recordRunEvent(env.DB, { runId, batchId, type: "batch failed", details: { error: message.slice(0, 500) } });
 }
 
+/** 当前收尾还占着租约时，等租约结束后再投一条收尾消息，不消耗队列重试次数。 */
+export async function deferFinalizeWhileBusy(
+  env: Env,
+  message: Extract<CollectMessage, { type: "finalize" }>,
+  error: FinalizeBusyError,
+): Promise<boolean> {
+  try {
+    await env.COLLECT_QUEUE.send(
+      { type: "finalize", runId: message.runId, reason: message.reason },
+      { delaySeconds: error.delaySeconds },
+    );
+    return true;
+  } catch (sendError) {
+    logError("finalize retry enqueue failed", sendError, { runId: message.runId });
+    return false;
+  }
+}
+
 export async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   const now = new Date().toISOString();
   const claim = await env.DB.prepare(
@@ -2101,7 +2120,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
       && current.finalize_lease_until != null
       && current.finalize_lease_until > now.toISOString()
     ) {
-      throw new FinalizeBusyError();
+      throw new FinalizeBusyError(finalizeRetryDelaySeconds(current.finalize_lease_until, now.getTime()));
     }
     return;
   }
@@ -2313,7 +2332,14 @@ export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[
       try {
         await finalizeRun(env, row.id, (open?.pending ?? 0) > 0 ? "deadline" : "complete");
       } catch (error) {
-        if (error instanceof FinalizeBusyError) continue;
+        if (error instanceof FinalizeBusyError) {
+          await deferFinalizeWhileBusy(env, {
+            type: "finalize",
+            runId: row.id,
+            reason: (open?.pending ?? 0) > 0 ? "deadline" : "complete",
+          }, error);
+          continue;
+        }
         throw error;
       }
       const after = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")

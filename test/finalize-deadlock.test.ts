@@ -6,6 +6,7 @@ import { STUCK_BATCH_GRACE_MS } from "../src/pipeline/queue-batch";
 import {
   ActiveRunError,
   cancelRun,
+  deferFinalizeWhileBusy,
   finalizeOverdue,
   finalizeRun,
   processBatch,
@@ -712,7 +713,10 @@ describe("收尾死锁", () => {
       COLLECT_QUEUE: { async send() {}, async sendBatch() {} },
     } as unknown as Env;
 
-    await expect(finalizeRun(env, "run-live", "complete")).rejects.toBeInstanceOf(FinalizeBusyError);
+    await expect(finalizeRun(env, "run-live", "complete")).rejects.toMatchObject({
+      name: "FinalizeBusyError",
+      delaySeconds: expect.any(Number),
+    });
     expect(mails).toHaveLength(0);
     expect(sqlite.prepare("SELECT status, email_status FROM runs WHERE id = 'run-live'").get()).toEqual({
       status: "finalizing",
@@ -729,5 +733,108 @@ describe("收尾死锁", () => {
       status: "completed",
       email_status: "sent",
     });
+  });
+
+  it("收尾租约未过期时改约到租约结束再收尾，不等下一个整点", async () => {
+    const sqlite = openDatabase();
+    const now = new Date("2026-10-26T02:00:00.000Z");
+    sqlite.prepare(
+      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run("email_enabled", "1");
+    sqlite.prepare(
+      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run("email_provider", "cloudflare");
+    sqlite.prepare(
+      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run("email_from", "news@example.com");
+    sqlite.prepare(
+      "INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)",
+    ).run("rec-ops", "ops@example.com", now.toISOString());
+    sqlite.prepare(
+      "INSERT INTO country_recipients (country_id, recipient_id) VALUES (?, ?)",
+    ).run("country_demo_alpha", "rec-ops");
+    insertRun(sqlite, {
+      id: "run-soon",
+      slotKey: "2026-10-22T10",
+      status: "finalizing",
+      startedAt: "2026-10-22T02:00:15.000Z",
+      deadlineAt: "2026-10-22T03:00:15.000Z",
+      finalizeEnqueuedAt: "2026-10-22T05:00:00.000Z",
+    });
+    sqlite.prepare(
+      `INSERT INTO batches (
+        id, run_id, country_id, source, batch_index, target_ids, status, created_at
+      ) VALUES (?, ?, 'country_demo_alpha', 'x', 0, '[]', 'done', ?)`,
+    ).run("batch-done", "run-soon", "2026-10-22T02:00:15.000Z");
+    const leaseUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    sqlite.prepare("UPDATE runs SET finalize_lease_until = ? WHERE id = ?").run(leaseUntil, "run-soon");
+    const mails: string[][] = [];
+    const queued: Array<{ body: CollectMessage; delaySeconds?: number }> = [];
+    const env = {
+      ENVIRONMENT: "development",
+      EXCEL_FILENAME: "skyeyes.xlsx",
+      DB: asD1(sqlite),
+      EXPORTS: { async put() {} },
+      EMAIL: {
+        async send(message: { to: string[] }) {
+          mails.push(message.to);
+          return { messageId: `mail-${mails.length}` };
+        },
+      },
+      COLLECT_QUEUE: {
+        async send(body: CollectMessage, options?: { delaySeconds?: number }) {
+          queued.push({ body, delaySeconds: options?.delaySeconds });
+        },
+        async sendBatch() {},
+      },
+    } as unknown as Env;
+
+    const busy = await finalizeRun(env, "run-soon", "complete").then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(busy).toBeInstanceOf(FinalizeBusyError);
+    const delaySeconds = (busy as FinalizeBusyError).delaySeconds;
+    expect(delaySeconds).toBeGreaterThan(9 * 60);
+    expect(delaySeconds).toBeLessThanOrEqual(10 * 60 + 15);
+    expect(mails).toHaveLength(0);
+
+    await expect(deferFinalizeWhileBusy(env, { type: "finalize", runId: "run-soon", reason: "complete" }, busy as FinalizeBusyError)).resolves.toBe(true);
+    expect(queued).toEqual([{
+      body: { type: "finalize", runId: "run-soon", reason: "complete" },
+      delaySeconds,
+    }]);
+
+    sqlite.prepare("UPDATE runs SET finalize_lease_until = ? WHERE id = ?").run(
+      new Date(Date.now() - 1000).toISOString(),
+      "run-soon",
+    );
+    const before = Date.now();
+    await finalizeRun(env, queued[0]!.body.runId, queued[0]!.body.reason);
+    const finished = sqlite.prepare(
+      "SELECT status, email_status, finished_at FROM runs WHERE id = 'run-soon'",
+    ).get() as { status: string; email_status: string; finished_at: string };
+    expect(finished.status).toBe("completed");
+    expect(finished.email_status).toBe("sent");
+    expect(Date.parse(finished.finished_at)).toBeGreaterThanOrEqual(before - 1000);
+    expect(mails).toEqual([["ops@example.com"]]);
+
+    await finalizeRun(env, "run-soon", "complete");
+    expect(mails).toEqual([["ops@example.com"]]);
+  });
+
+  it("收尾续跑消息投递失败时保留队列重试", async () => {
+    const env = {
+      COLLECT_QUEUE: {
+        async send() {
+          throw new Error("队列不可用");
+        },
+      },
+    } as unknown as Env;
+    await expect(deferFinalizeWhileBusy(
+      env,
+      { type: "finalize", runId: "run-soon", reason: "complete" },
+      new FinalizeBusyError(30),
+    )).resolves.toBe(false);
   });
 });
