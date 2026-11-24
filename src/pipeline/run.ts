@@ -41,7 +41,9 @@ import {
   MAX_BATCH_ATTEMPTS,
   MAX_DEFER_COUNT,
   MAX_DEFER_WAIT_SEC,
+  FINALIZE_LEASE_MS,
   FINALIZING_GRACE_MS,
+  FinalizeBusyError,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
   batchWakeup,
@@ -2070,17 +2072,40 @@ export async function resendRunDigest(env: Env, runId: string): Promise<{
 }
 
 export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline" | "preempt"): Promise<void> {
+  const now = new Date();
+  const leaseUntil = new Date(now.getTime() + FINALIZE_LEASE_MS).toISOString();
   const claim = await env.DB.prepare(
-    `UPDATE runs SET status = 'finalizing'
+    `UPDATE runs
+     SET status = 'finalizing',
+         finalize_lease_until = ?,
+         email_sent_at = CASE WHEN COALESCE(email_status, '') = 'sent' THEN email_sent_at ELSE NULL END
      WHERE id = ? AND (
        status IN ('running', 'partial')
        OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+       OR (
+         status = 'finalizing'
+         AND COALESCE(email_status, '') != 'sent'
+         AND (finalize_lease_until IS NULL OR finalize_lease_until <= ?)
+       )
      )`,
-  ).bind(runId).run();
-  if ((claim.meta.changes ?? 0) === 0) return;
+  ).bind(leaseUntil, runId, now.toISOString()).run();
+  if ((claim.meta.changes ?? 0) === 0) {
+    const current = await env.DB.prepare(
+      "SELECT status, email_status, finalize_lease_until FROM runs WHERE id = ?",
+    ).bind(runId).first<{ status: string; email_status: string | null; finalize_lease_until: string | null }>();
+    if (
+      current?.status === "finalizing"
+      && current.email_status !== "sent"
+      && current.finalize_lease_until != null
+      && current.finalize_lease_until > now.toISOString()
+    ) {
+      throw new FinalizeBusyError();
+    }
+    return;
+  }
   await env.DB.prepare(
     "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
-  ).bind(new Date().toISOString(), runId).run();
+  ).bind(now.toISOString(), runId).run();
   if (reason === "deadline" || reason === "preempt") {
     await cancelOpenBatches(env, runId, reason === "preempt" ? "已到下一次定时运行" : "采集长时间没有进展");
   }
@@ -2146,6 +2171,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
         windowFile,
         byCountry,
       });
+      if (!delivered.emailTouched && delivered.emailError === "日报正在发送") return;
       notes = delivered.notes;
       emailStatus = delivered.emailStatus;
       emailError = delivered.emailError;
@@ -2173,12 +2199,13 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     });
   }
 
-  await env.DB.prepare(
+  const finished = await env.DB.prepare(
     `UPDATE runs
      SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?,
          email_status = CASE WHEN ? = 1 THEN ? ELSE email_status END,
-         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END
-     WHERE id = ? AND status = 'finalizing'`,
+         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END,
+         finalize_lease_until = NULL
+     WHERE id = ? AND status = 'finalizing' AND finalize_lease_until = ?`,
   ).bind(
     incomplete || emailStatus === "failed" ? "incomplete" : "completed",
     new Date().toISOString(),
@@ -2190,7 +2217,9 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     emailTouched ? 1 : 0,
     emailError,
     runId,
+    leaseUntil,
   ).run();
+  if ((finished.meta.changes ?? 0) === 0) return;
   log("run finalized", { runId, reason, incomplete, emailStatus });
   await recordRunEvent(env.DB, { runId, type: "run finalized", details: { reason, incomplete, emailStatus } });
 }
@@ -2253,6 +2282,26 @@ export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[
   ).bind(graceIso, graceIso).all<{ id: string; notes: string | null; email_status: string | null }>();
   const closed: string[] = [];
   for (const row of rows.results) {
+    if (row.email_status !== "sent") {
+      const open = await env.DB.prepare(
+        `SELECT SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending
+         FROM batches WHERE run_id = ?`,
+      ).bind(row.id).first<{ pending: number | null }>();
+      try {
+        await finalizeRun(env, row.id, (open?.pending ?? 0) > 0 ? "deadline" : "complete");
+      } catch (error) {
+        if (error instanceof FinalizeBusyError) continue;
+        throw error;
+      }
+      const after = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+        .bind(row.id)
+        .first<{ status: string }>();
+      if (after && after.status !== "finalizing") {
+        closed.push(row.id);
+        log("stuck finalizing resumed", { runId: row.id, status: after.status });
+        continue;
+      }
+    }
     const counts = await env.DB.prepare(
       `SELECT
          SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,

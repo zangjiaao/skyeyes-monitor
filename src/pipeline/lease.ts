@@ -28,6 +28,18 @@ export const RECOVERABLE_RUN_STATUSES = ["running", "partial", "failed"] as cons
  * One Worker invocation is at most 15 minutes; the cron gap is an hour.
  */
 export const FINALIZING_GRACE_MS = 20 * 60 * 1000;
+/**
+ * How long one finalize attempt owns the run. Matches the queue consumer wall
+ * clock, so a retry does not start a second send while the first is alive.
+ */
+export const FINALIZE_LEASE_MS = 15 * 60 * 1000;
+
+export class FinalizeBusyError extends Error {
+  constructor() {
+    super("收尾仍在进行");
+    this.name = "FinalizeBusyError";
+  }
+}
 
 export class DeferredBatchError extends Error {
   readonly delaySeconds: number;

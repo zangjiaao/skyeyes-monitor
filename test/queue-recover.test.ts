@@ -368,7 +368,8 @@ function createHarness(seed: { runs?: RunRow[]; batches?: BatchRow[] } = {}) {
     if (sql.includes("FROM countries")) return { results: [], first: null, changes: 0 };
     if (sql.includes("batches_total")) return { results: [], first: null, changes: 1 };
     if (sql.includes("SET status = 'finalizing'")) {
-      const run = runOf(String(binds[0]));
+      const id = binds.map((value) => String(value)).find((value) => runs.has(value));
+      const run = id ? runOf(id) : undefined;
       if (!run || (run.status !== "running" && run.status !== "partial")) return { results: [], first: null, changes: 0 };
       run.status = "finalizing";
       return { results: [], first: null, changes: 1 };
