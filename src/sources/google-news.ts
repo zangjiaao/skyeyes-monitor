@@ -3,7 +3,7 @@ import { buildNewsTermQuery, searchPlan } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { normalizeTitle } from "../domain/gate";
 import { cleanText, verifyHit } from "../domain/terms";
-import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
+import type { BatchResume, CollectedRecord, QueryTarget, SearchDiagnosticContext, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
 import { parseRetryAfter, rateAttemptIndex, retryDelaySeconds } from "./x-rate";
 import { parseRssItems, type RssItem } from "./xml";
@@ -145,6 +145,20 @@ export function mergeNewsRecords(records: CollectedRecord[]): CollectedRecord[] 
   return merged;
 }
 
+/** 同一条连续失败这么多次后，先试下一条，确认是不是只有这一条卡住。 */
+const NEWS_STICKY_FAILURES = 3;
+
+function newsResume(step: number, parkedSteps: number[]): BatchResume {
+  const parked = [...new Set(parkedSteps.filter((item) => item !== step))];
+  return {
+    source: "google_news",
+    step,
+    page: 0,
+    cursor: "",
+    ...(parked.length > 0 ? { parkedSteps: parked } : {}),
+  };
+}
+
 export const googleNewsProvider: SourceProvider = {
   id: "google_news",
   async search(request: SearchRequest): Promise<SearchResult> {
@@ -155,65 +169,145 @@ export const googleNewsProvider: SourceProvider = {
     const plan = searchPlan(request.targets).flatMap((step) => editions.map((edition) => ({ step, edition })));
     const resume = request.resume?.source === "google_news" ? request.resume : null;
     let stepIndex = resume?.step ?? 0;
-    for (; stepIndex < plan.length; stepIndex += 1) {
-      const { step, edition } = plan[stepIndex];
-      const query = buildNewsTermQuery(step.target, step.term, request.window);
-      if (!query) continue;
-      {
-        const url = new URL("https://news.google.com/rss/search");
-        url.searchParams.set("q", query);
-        url.searchParams.set("hl", edition.hl);
-        url.searchParams.set("gl", edition.gl);
-        url.searchParams.set("ceid", edition.ceid);
-        const diagnostic = { matchMode: step.target.matchMode ?? "phrase", targetId: step.target.id, terms: [step.term], query, step: stepIndex, page: 0, edition: edition.id };
-        const response = await fetchSearchPage(request, diagnostic, url);
-        calls += 1;
-        if (response.status === 429 || response.status === 503) {
-          const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
-          const attempt = rateAttemptIndex(request.rateAttempt ?? request.resume?.rateAttempts);
-          const delaySeconds = retryDelaySeconds({ attempt, retryAfterSeconds });
-          throw new RateLimitError(`Google News RSS 限流 ${response.status}`, {
-            delaySeconds,
-            retryAfterSeconds,
-            rateAttempts: attempt + 1,
+    let parked = (resume?.parkedSteps ?? []).filter((step) => Number.isInteger(step) && step >= 0 && step < plan.length);
+    let rateHold = resume?.rateHold === true;
+    let consecutive = rateAttemptIndex(request.rateAttempt ?? resume?.rateAttempts);
+
+    const queryFor = (index: number) => {
+      const item = plan[index];
+      if (!item) return "";
+      return buildNewsTermQuery(item.step.target, item.step.term, request.window);
+    };
+    const nextQueryable = (from: number) => {
+      for (let index = from; index < plan.length; index += 1) {
+        if (queryFor(index)) return index;
+      }
+      return null;
+    };
+
+    async function pull(index: number): Promise<
+      | { status: "ok"; records: CollectedRecord[]; raw: number; diagnostic: SearchDiagnosticContext }
+      | { status: "limited"; httpStatus: number; retryAfterSeconds: number | null; diagnostic: SearchDiagnosticContext }
+    > {
+      const { step, edition } = plan[index];
+      const query = queryFor(index);
+      const url = new URL("https://news.google.com/rss/search");
+      url.searchParams.set("q", query);
+      url.searchParams.set("hl", edition.hl);
+      url.searchParams.set("gl", edition.gl);
+      url.searchParams.set("ceid", edition.ceid);
+      const diagnostic: SearchDiagnosticContext = {
+        matchMode: step.target.matchMode ?? "phrase",
+        targetId: step.target.id,
+        terms: [step.term],
+        query,
+        step: index,
+        page: 0,
+        edition: edition.id,
+      };
+      const response = await fetchSearchPage(request, diagnostic, url);
+      calls += 1;
+      if (response.status === 429 || response.status === 503) {
+        return {
+          status: "limited",
+          httpStatus: response.status,
+          retryAfterSeconds: parseRetryAfter(response.headers.get("Retry-After"), Date.now()),
+          diagnostic,
+        };
+      }
+      if (!response.ok) throw new Error(`Google News RSS ${response.status}`);
+      const xml = await response.text();
+      const pageRecords: CollectedRecord[] = [];
+      const items = parseRssItems(xml);
+      for (const item of items) {
+        let converted: CollectedRecord[] = [];
+        try {
+          converted = rssItemsToRecords([item], request, { target: step.target, term: step.term, edition });
+        } catch {
+          filtered += 1;
+          continue;
+        }
+        for (const record of converted) {
+          const verdict = verifyHit({
+            text: record.text,
+            authorHandle: record.authorHandle,
+            target: step.target,
+            queriedTerm: step.term,
           });
-        }
-        if (!response.ok) {
-          throw new Error(`Google News RSS ${response.status}`);
-        }
-        const xml = await response.text();
-        const pageRecords: CollectedRecord[] = [];
-        const items = parseRssItems(xml);
-        for (const item of items) {
-          let converted: CollectedRecord[] = [];
-          try {
-            converted = rssItemsToRecords([item], request, { target: step.target, term: step.term, edition });
-          } catch {
+          if (!verdict.ok || !verdict.term) {
             filtered += 1;
             continue;
           }
-          for (const record of converted) {
-            const verdict = verifyHit({
-              text: record.text,
-              authorHandle: record.authorHandle,
-              target: step.target,
-              queriedTerm: step.term,
-            });
-            if (!verdict.ok || !verdict.term) {
-              filtered += 1;
-              continue;
-            }
-            pageRecords.push({ ...record, matchedTerm: verdict.term });
+          pageRecords.push({ ...record, matchedTerm: verdict.term });
+        }
+      }
+      await reportSearchResult(request, diagnostic, items.length, pageRecords.length);
+      return { status: "ok", records: pageRecords, raw: items.length, diagnostic };
+    }
+
+    async function publish(index: number, pageRecords: CollectedRecord[], diagnostic: SearchDiagnosticContext, nextStep: number) {
+      const repeatResume = newsResume(index, parked);
+      const nextResume = newsResume(nextStep, parked);
+      if (request.onPage) {
+        await request.onPage({ diagnostic, records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
+      } else {
+        records.push(...pageRecords);
+      }
+    }
+
+    function hold(httpStatus: number, retryAfterSeconds: number | null, rateHoldNext: boolean): never {
+      throw new RateLimitError(`Google News RSS 限流 ${httpStatus}`, {
+        delaySeconds: retryDelaySeconds({ attempt: Math.max(0, consecutive - 1), retryAfterSeconds }),
+        retryAfterSeconds,
+        rateAttempts: consecutive,
+        rateHold: rateHoldNext,
+      });
+    }
+
+    for (; stepIndex < plan.length; stepIndex += 1) {
+      if (!queryFor(stepIndex)) continue;
+      const outcome = await pull(stepIndex);
+      if (outcome.status === "limited") {
+        consecutive += 1;
+        const probeAt = !rateHold && outcome.retryAfterSeconds == null && consecutive >= NEWS_STICKY_FAILURES
+          ? nextQueryable(stepIndex + 1)
+          : null;
+        if (probeAt != null) {
+          const probe = await pull(probeAt);
+          if (probe.status === "ok") {
+            parked = [...new Set([...parked, stepIndex])];
+            consecutive = 0;
+            rateHold = false;
+            await publish(probeAt, probe.records, probe.diagnostic, probeAt + 1);
+            stepIndex = probeAt;
+            continue;
           }
+          rateHold = true;
+          hold(outcome.httpStatus, outcome.retryAfterSeconds, true);
         }
-        await reportSearchResult(request, diagnostic, items.length, pageRecords.length);
-        const repeatResume = { source: "google_news" as const, step: stepIndex, page: 0, cursor: "" };
-        const nextResume = { source: "google_news" as const, step: stepIndex + 1, page: 0, cursor: "" };
-        if (request.onPage) {
-          await request.onPage({ diagnostic, records: pageRecords, resume: nextResume, repeatResume, calls, filtered });
-        } else {
-          records.push(...pageRecords);
-        }
+        hold(outcome.httpStatus, outcome.retryAfterSeconds, rateHold);
+      }
+      consecutive = 0;
+      rateHold = false;
+      await publish(stepIndex, outcome.records, outcome.diagnostic, stepIndex + 1);
+    }
+
+    for (const parkedStep of [...parked]) {
+      if (!queryFor(parkedStep)) continue;
+      const outcome = await pull(parkedStep);
+      parked = parked.filter((step) => step !== parkedStep);
+      if (outcome.status === "ok") {
+        await publish(parkedStep, outcome.records, outcome.diagnostic, plan.length);
+        continue;
+      }
+      await request.onDiagnostic?.({
+        ...outcome.diagnostic,
+        event: "skipped",
+        status: outcome.httpStatus,
+        reason: "这条检索连续失败，其余检索已完成，本轮先跳过",
+      });
+      if (request.onPage) {
+        await publish(parkedStep, [], outcome.diagnostic, plan.length);
       }
     }
     return { records: mergeNewsRecords(records), calls, filtered };
