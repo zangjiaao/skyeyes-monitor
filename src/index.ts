@@ -1,8 +1,8 @@
 import { createApp } from "./http/app";
 import { logError, logWarn } from "./log";
 import { isCollectMessage } from "./pipeline/messages";
-import { DeferredBatchError } from "./pipeline/lease";
-import { continueEnqueue, handleDeadLetter, processBatch, finalizeRun, scheduleDeferredWake } from "./pipeline/run";
+import { DeferredBatchError, FinalizeBusyError } from "./pipeline/lease";
+import { continueEnqueue, deferFinalizeWhileBusy, handleDeadLetter, processBatch, finalizeRun, scheduleDeferredWake } from "./pipeline/run";
 import { handleScheduled } from "./schedule";
 import { RateLimitError } from "./sources/x";
 
@@ -54,6 +54,17 @@ export default {
             );
           }
           message.ack();
+          continue;
+        }
+        if (error instanceof FinalizeBusyError) {
+          logWarn("finalize still in progress", { queue: batch.queue, delaySeconds: error.delaySeconds });
+          const body = message.body;
+          if (isCollectMessage(body) && body.type === "finalize" && await deferFinalizeWhileBusy(env, body, error)) {
+            message.ack();
+            continue;
+          }
+          if (deadLetter) message.ack();
+          else message.retry();
           continue;
         }
         logError("queue message failed", error, { queue: batch.queue });
