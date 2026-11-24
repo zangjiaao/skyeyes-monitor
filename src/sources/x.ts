@@ -3,7 +3,7 @@ import { buildXTermQuery, searchPlan } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
 import { cleanText, verifyHit } from "../domain/terms";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
-import { parseRetryAfter, retryDelaySeconds, shouldWaitInBatch, sleep } from "./x-rate";
+import { parseRetryAfter, rateAttemptIndex, retryDelaySeconds, shouldWaitInBatch, sleep } from "./x-rate";
 
 const ENDPOINT = "https://api.twitterapi.io/twitter/tweet/advanced_search";
 
@@ -11,17 +11,21 @@ export class RateLimitError extends Error {
   readonly delaySeconds: number;
   readonly retryAfterSeconds: number | null;
   readonly recorded: boolean;
+  /** 含本次在内的连续限流次数，供下一次续跑接着退避。 */
+  readonly rateAttempts: number;
 
   constructor(message: string, options?: {
     delaySeconds?: number;
     retryAfterSeconds?: number | null;
     recorded?: boolean;
+    rateAttempts?: number;
   }) {
     super(message);
     this.name = "RateLimitError";
     this.delaySeconds = options?.delaySeconds ?? 45;
     this.retryAfterSeconds = options?.retryAfterSeconds ?? null;
     this.recorded = options?.recorded ?? false;
+    this.rateAttempts = rateAttemptIndex(options?.rateAttempts ?? 1);
   }
 }
 
@@ -130,6 +134,7 @@ export const xProvider: SourceProvider = {
     let calls = 0;
     let filtered = 0;
     let waits = 0;
+    let consecutive = rateAttemptIndex(request.rateAttempt ?? request.resume?.rateAttempts);
     const pause = request.sleepImpl ?? sleep;
     const plan = searchPlan(request.targets);
     const resume = request.resume?.source === "x" ? request.resume : null;
@@ -161,10 +166,11 @@ export const xProvider: SourceProvider = {
           if (response.status !== 429 && response.status !== 503) break;
           const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
           const delaySeconds = retryDelaySeconds({
-            attempt: (request.queueAttempt ?? 1) - 1 + waits,
+            attempt: consecutive,
             retryAfterSeconds,
           });
           const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
+          consecutive += 1;
           if (shouldWaitInBatch(delaySeconds, waits)) {
             waits += 1;
             await request.onDiagnostic?.({ ...diagnostic, event: "wait", delaySeconds, reason: "X 接口限流，当前调用内等待重试" });
@@ -175,12 +181,15 @@ export const xProvider: SourceProvider = {
             delaySeconds,
             retryAfterSeconds,
             recorded,
+            rateAttempts: consecutive,
           });
         }
         if (!response.ok) {
           const detail = await response.text();
           throw new Error(`twitterapi.io ${response.status}: ${detail.slice(0, 300)}`);
         }
+        consecutive = 0;
+        waits = 0;
         const payload = asRecord(await response.json());
         const tweets = Array.isArray(payload?.tweets) ? payload.tweets as Tweet[] : [];
         const pageRecords: CollectedRecord[] = [];

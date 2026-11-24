@@ -41,6 +41,12 @@ export function parseRetryAfter(header: string | null, nowMs: number): number | 
   return Math.max(0, (date - nowMs) / 1000);
 }
 
+/** 连续限流次数。预算用尽之类的续跑不计入，成功请求后从 0 重新开始。 */
+export function rateAttemptIndex(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return 0;
+  return value;
+}
+
 export function retryDelaySeconds(input: {
   attempt: number;
   retryAfterSeconds: number | null;

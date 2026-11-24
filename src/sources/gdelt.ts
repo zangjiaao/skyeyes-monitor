@@ -5,7 +5,7 @@ import { cleanText, verifyHit } from "../domain/terms";
 import { formatGdelt } from "../domain/time";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
-import { gdeltRetryDelaySeconds, parseRetryAfter } from "./x-rate";
+import { gdeltRetryDelaySeconds, parseRetryAfter, rateAttemptIndex } from "./x-rate";
 
 interface GdeltArticle {
   url?: string;
@@ -98,15 +98,14 @@ export const gdeltProvider: SourceProvider = {
       calls += 1;
       if (response.status === 429 || response.status === 503) {
         const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
-        const delaySeconds = gdeltRetryDelaySeconds({
-          attempt: Math.max(0, (request.queueAttempt ?? 1) - 1),
-          retryAfterSeconds,
-        });
+        const attempt = rateAttemptIndex(request.rateAttempt ?? request.resume?.rateAttempts);
+        const delaySeconds = gdeltRetryDelaySeconds({ attempt, retryAfterSeconds });
         const recorded = await noteRateLimit(request, response.status, retryAfterSeconds, delaySeconds);
         throw new RateLimitError(`GDELT 限流 ${response.status}`, {
           delaySeconds,
           retryAfterSeconds,
           recorded,
+          rateAttempts: attempt + 1,
         });
       }
       if (!response.ok) throw new Error(`GDELT ${response.status}`);

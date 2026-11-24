@@ -118,21 +118,21 @@ describe("GDELT 查询打包", () => {
 
   it("429 使用 Retry-After，没有响应头时按尝试次数退避", async () => {
     const delays: number[] = [];
-    const search = (queueAttempt: number, retryAfter?: string) => gdeltProvider.search({
+    const search = (rateAttempt: number, retryAfter?: string) => gdeltProvider.search({
       targets: [phrase],
       window: {
         start: new Date("2026-10-13T00:00:00.000Z"),
         end: new Date("2026-10-14T00:00:00.000Z"),
       },
       countryName: "示例",
-      queueAttempt,
+      rateAttempt,
       fetchImpl: async () => new Response("slow", {
         status: 429,
         headers: retryAfter ? { "retry-after": retryAfter } : undefined,
       }),
     });
-    await expect(search(1, "45")).rejects.toMatchObject({ delaySeconds: 45, retryAfterSeconds: 45 });
-    for (const attempt of [1, 2, 3, 4]) {
+    await expect(search(0, "45")).rejects.toMatchObject({ delaySeconds: 45, retryAfterSeconds: 45, rateAttempts: 1 });
+    for (const attempt of [0, 1, 2, 3]) {
       await search(attempt).catch((error: { delaySeconds: number }) => {
         delays.push(error.delaySeconds);
       });
@@ -290,6 +290,7 @@ function createMemory(options: {
       });
     }
     if (sql.includes("resume_json, defer_count FROM batches")) return result({ ...batch });
+    if (sql.includes("SELECT resume_json FROM batches WHERE id = ?")) return result({ resume_json: batch.resume_json });
     if (sql.includes("next_wake_at, lease_expires_at FROM batches")) {
       return result({
         status: batch.status,
@@ -399,6 +400,11 @@ function createMemory(options: {
         return result(null, 1);
       }
       return result(null, 0, []);
+    }
+    if (sql.includes("SET resume_json = ? WHERE id = ?")) {
+      if (batch.id !== binds[1]) return result(null, 0, []);
+      batch.resume_json = String(binds[0]);
+      return result(null, 1);
     }
     if (sql.includes("SET resume_json")) {
       if (batch.id !== binds[7] || batch.lease_token !== binds[8] || batch.status !== "running") {
