@@ -1750,12 +1750,13 @@ async function bucketBatchHealth(
 ): Promise<{ failed: number; pending: number; cancelled: number }> {
   if (countryIds.length === 0) return { failed: 0, pending: 0, cancelled: 0 };
   const marks = countryIds.map(() => "?").join(", ");
+  // 来源协调批次的 country_id 为空，它覆盖这轮的全部分组。
   const row = await env.DB.prepare(
     `SELECT
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
        SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending,
        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
-     FROM batches WHERE run_id = ? AND country_id IN (${marks})`,
+     FROM batches WHERE run_id = ? AND (country_id = '' OR country_id IN (${marks}))`,
   ).bind(runId, ...countryIds).first<{ failed: number | null; pending: number | null; cancelled: number | null }>();
   return { failed: row?.failed ?? 0, pending: row?.pending ?? 0, cancelled: row?.cancelled ?? 0 };
 }
@@ -1905,6 +1906,7 @@ async function sendRunDigestEmails(
         : null;
       const attached = Boolean(file.bytes && file.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
       const digestNotes = [
+        input.notes,
         run.notes ?? "",
         bucketIncomplete ? "有批次未完成，已发送目前收集到的内容。" : "",
         file.truncated ? `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。` : "",
@@ -2119,12 +2121,14 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     `SELECT
        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
        SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending
      FROM batches WHERE run_id = ?`,
-  ).bind(runId).first<{ done: number | null; failed: number | null; pending: number | null }>();
+  ).bind(runId).first<{ done: number | null; failed: number | null; cancelled: number | null; pending: number | null }>();
   const failed = counts?.failed ?? 0;
+  const cancelled = counts?.cancelled ?? 0;
   const pending = counts?.pending ?? 0;
-  const incomplete = reason !== "complete" || failed > 0 || pending > 0;
+  const incomplete = reason !== "complete" || failed > 0 || pending > 0 || cancelled > 0;
   let notes = run.notes ?? "";
   if (incomplete && !notes.includes("有批次未完成，已发送目前收集到的内容。")) {
     notes = [notes, "有批次未完成，已发送目前收集到的内容。"].filter(Boolean).join(" ");
@@ -2134,8 +2138,6 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   let emailTouched = false;
 
   try {
-    const stored = await storeExcel(env, settings);
-    if (stored.truncated) notes = [notes, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`].filter(Boolean).join(" ");
     const windowFile = await storeRunWindowExcel(env, settings, {
       id: runId,
       windowStart: run.window_start,
@@ -2167,7 +2169,7 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
         notes: run.notes,
       }, {
         notes,
-        treatCancelledAsIncomplete: reason !== "complete",
+        treatCancelledAsIncomplete: reason !== "complete" || cancelled > 0,
         windowFile,
         byCountry,
       });
@@ -2222,6 +2224,27 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   if ((finished.meta.changes ?? 0) === 0) return;
   log("run finalized", { runId, reason, incomplete, emailStatus });
   await recordRunEvent(env.DB, { runId, type: "run finalized", details: { reason, incomplete, emailStatus } });
+  await refreshCumulativeExcel(env, settings, runId);
+}
+
+/** 历史总表失败不能挡住已经发出的日报。 */
+async function refreshCumulativeExcel(env: Env, settings: AppSettings, runId: string): Promise<void> {
+  try {
+    const stored = await storeExcel(env, settings);
+    if (stored.truncated) await appendRunNote(env, runId, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`);
+  } catch (error) {
+    logError("cumulative excel failed", error, { runId });
+    await appendRunNote(env, runId, "历史总表生成失败。");
+  }
+}
+
+async function appendRunNote(env: Env, runId: string, sentence: string): Promise<void> {
+  const row = await env.DB.prepare("SELECT notes FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ notes: string | null }>();
+  if (!row || (row.notes ?? "").includes(sentence)) return;
+  const notes = [row.notes ?? "", sentence].filter((part) => part.length > 0).join(" ");
+  await env.DB.prepare("UPDATE runs SET notes = ? WHERE id = ?").bind(notes, runId).run();
 }
 
 export async function handleDeadLetter(env: Env, message: CollectMessage): Promise<void> {

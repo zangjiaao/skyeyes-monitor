@@ -353,7 +353,135 @@ describe("分组推送", () => {
     expect(mails[0]?.text).toContain("分组甲");
     expect(mails[0]?.text).toContain("分组乙");
     expect(mails[0]?.text).not.toContain("分组丙");
+    expect(mails[0]?.text).toContain("本轮批次已全部结束。");
     expect(sqlite.prepare("SELECT email_status FROM runs WHERE id = 'run-source'").get()).toEqual({ email_status: "sent" });
+  });
+
+  it("来源批次失败或取消时，日报会标明未完成", async () => {
+    const sqlite = openDatabase();
+    const now = "2026-10-15T03:00:00.000Z";
+    const windowStart = "2026-10-14T02:00:00.000Z";
+    const windowEnd = "2026-10-15T02:00:00.000Z";
+    for (const [key, value] of [
+      ["email_enabled", "1"],
+      ["email_provider", "cloudflare"],
+      ["email_from", "news@example.com"],
+    ]) {
+      sqlite.prepare(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(key, value);
+    }
+    sqlite.prepare("INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)").run("rec-d", "d@example.com", now);
+    sqlite.prepare(
+      "INSERT INTO countries (id, name, code, enabled, delivery, created_at) VALUES ('group-a', '分组甲', 'group-a', 1, 'email', ?)",
+    ).run(now);
+    sqlite.prepare("INSERT INTO country_recipients (country_id, recipient_id) VALUES ('group-a', 'rec-d')").run();
+    sqlite.prepare(
+      `INSERT INTO runs (
+        id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at, scope_json
+      ) VALUES ('run-source', 'slot-source', 'schedule', 'running', ?, ?, ?, ?, ?)`,
+    ).run(windowStart, windowEnd, windowStart, windowEnd, JSON.stringify({
+      mode: "all",
+      countries: [{ id: "group-a", name: "分组甲" }],
+      targetCount: 1,
+    }));
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, error, created_at)
+       VALUES ('batch-x', 'run-source', '', 'x', 0, '[]', 'failed', '源站失败', ?)`,
+    ).run(now);
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, error, created_at)
+       VALUES ('batch-news', 'run-source', '', 'google_news', 1, '[]', 'cancelled', '已过截止时间', ?)`,
+    ).run(now);
+    const mails: Array<{ subject: string; text: string }> = [];
+    const env = {
+      ENVIRONMENT: "development",
+      EXCEL_FILENAME: "skyeyes.xlsx",
+      DB: asD1(sqlite),
+      EXPORTS: { async put() {} },
+      EMAIL: {
+        async send(message: { subject: string; text: string }) {
+          mails.push({ subject: message.subject, text: message.text });
+          return { messageId: "mail-1" };
+        },
+      },
+    } as unknown as Env;
+
+    await finalizeRun(env, "run-source", "complete");
+
+    expect(mails).toHaveLength(1);
+    expect(mails[0]?.subject).toContain("部分批次未完成");
+    expect(mails[0]?.text).toContain("失败批次: 1");
+    expect(mails[0]?.text).toContain("本轮仍有批次未完成，已发送目前收集到的内容。");
+    expect(mails[0]?.text).toContain("有批次未完成，已发送目前收集到的内容。");
+    expect(mails[0]?.text).not.toContain("本轮批次已全部结束。");
+    expect(sqlite.prepare("SELECT status, email_status FROM runs WHERE id = 'run-source'").get()).toEqual({
+      status: "incomplete",
+      email_status: "sent",
+    });
+  });
+
+  it("历史总表生成失败时，日报仍然发出", async () => {
+    const sqlite = openDatabase();
+    const now = "2026-10-15T03:00:00.000Z";
+    const windowStart = "2026-10-14T02:00:00.000Z";
+    const windowEnd = "2026-10-15T02:00:00.000Z";
+    for (const [key, value] of [
+      ["email_enabled", "1"],
+      ["email_provider", "cloudflare"],
+      ["email_from", "news@example.com"],
+    ]) {
+      sqlite.prepare(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run(key, value);
+    }
+    sqlite.prepare("INSERT INTO recipients (id, email, enabled, created_at) VALUES (?, ?, 1, ?)").run("rec-d", "d@example.com", now);
+    sqlite.prepare(
+      "INSERT INTO countries (id, name, code, enabled, delivery, created_at) VALUES ('group-a', '分组甲', 'group-a', 1, 'email', ?)",
+    ).run(now);
+    sqlite.prepare("INSERT INTO country_recipients (country_id, recipient_id) VALUES ('group-a', 'rec-d')").run();
+    sqlite.prepare(
+      `INSERT INTO runs (
+        id, slot_key, trigger, status, window_start, window_end, started_at, deadline_at, scope_json
+      ) VALUES ('run-sheet', 'slot-sheet', 'schedule', 'running', ?, ?, ?, ?, ?)`,
+    ).run(windowStart, windowEnd, windowStart, windowEnd, JSON.stringify({
+      mode: "all",
+      countries: [{ id: "group-a", name: "分组甲" }],
+      targetCount: 1,
+    }));
+    sqlite.prepare(
+      `INSERT INTO batches (id, run_id, country_id, source, batch_index, target_ids, status, created_at)
+       VALUES ('batch-x', 'run-sheet', '', 'x', 0, '[]', 'done', ?)`,
+    ).run(now);
+    const mails: string[] = [];
+    const env = {
+      ENVIRONMENT: "development",
+      EXCEL_FILENAME: "skyeyes.xlsx",
+      DB: asD1(sqlite),
+      EXPORTS: {
+        async put(key: string) {
+          if (key === "skyeyes.xlsx") throw new Error("总表写入失败");
+        },
+      },
+      EMAIL: {
+        async send() {
+          mails.push("sent");
+          return { messageId: "mail-1" };
+        },
+      },
+    } as unknown as Env;
+
+    await finalizeRun(env, "run-sheet", "complete");
+
+    expect(mails).toEqual(["sent"]);
+    const run = sqlite.prepare("SELECT status, email_status, notes FROM runs WHERE id = 'run-sheet'").get() as {
+      status: string;
+      email_status: string;
+      notes: string;
+    };
+    expect(run.status).toBe("completed");
+    expect(run.email_status).toBe("sent");
+    expect(run.notes).toContain("历史总表生成失败。");
   });
 
   it("未发出的任务可以手动补发，已发出的不能再发", async () => {
