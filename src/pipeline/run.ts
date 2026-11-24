@@ -41,7 +41,10 @@ import {
   MAX_BATCH_ATTEMPTS,
   MAX_DEFER_COUNT,
   MAX_DEFER_WAIT_SEC,
+  FINALIZE_LEASE_MS,
   FINALIZING_GRACE_MS,
+  FinalizeBusyError,
+  finalizeRetryDelaySeconds,
   RECOVERABLE_RUN_STATUSES,
   STALE_ENQUEUE_MS,
   batchWakeup,
@@ -1559,6 +1562,24 @@ async function markBatchFailed(env: Env, runId: string, batchId: string, message
   await recordRunEvent(env.DB, { runId, batchId, type: "batch failed", details: { error: message.slice(0, 500) } });
 }
 
+/** 当前收尾还占着租约时，等租约结束后再投一条收尾消息，不消耗队列重试次数。 */
+export async function deferFinalizeWhileBusy(
+  env: Env,
+  message: Extract<CollectMessage, { type: "finalize" }>,
+  error: FinalizeBusyError,
+): Promise<boolean> {
+  try {
+    await env.COLLECT_QUEUE.send(
+      { type: "finalize", runId: message.runId, reason: message.reason },
+      { delaySeconds: error.delaySeconds },
+    );
+    return true;
+  } catch (sendError) {
+    logError("finalize retry enqueue failed", sendError, { runId: message.runId });
+    return false;
+  }
+}
+
 export async function maybeEnqueueFinalize(env: Env, runId: string): Promise<void> {
   const now = new Date().toISOString();
   const claim = await env.DB.prepare(
@@ -1748,12 +1769,13 @@ async function bucketBatchHealth(
 ): Promise<{ failed: number; pending: number; cancelled: number }> {
   if (countryIds.length === 0) return { failed: 0, pending: 0, cancelled: 0 };
   const marks = countryIds.map(() => "?").join(", ");
+  // 来源协调批次的 country_id 为空，它覆盖这轮的全部分组。
   const row = await env.DB.prepare(
     `SELECT
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
        SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending,
        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
-     FROM batches WHERE run_id = ? AND country_id IN (${marks})`,
+     FROM batches WHERE run_id = ? AND (country_id = '' OR country_id IN (${marks}))`,
   ).bind(runId, ...countryIds).first<{ failed: number | null; pending: number | null; cancelled: number | null }>();
   return { failed: row?.failed ?? 0, pending: row?.pending ?? 0, cancelled: row?.cancelled ?? 0 };
 }
@@ -1903,6 +1925,7 @@ async function sendRunDigestEmails(
         : null;
       const attached = Boolean(file.bytes && file.bytes.byteLength <= ATTACHMENT_LIMIT_BYTES);
       const digestNotes = [
+        input.notes,
         run.notes ?? "",
         bucketIncomplete ? "有批次未完成，已发送目前收集到的内容。" : "",
         file.truncated ? `本轮新增 Excel 只保留最新 ${MAX_EXCEL_ROWS} 条。` : "",
@@ -2070,17 +2093,40 @@ export async function resendRunDigest(env: Env, runId: string): Promise<{
 }
 
 export async function finalizeRun(env: Env, runId: string, reason: "complete" | "deadline" | "preempt"): Promise<void> {
+  const now = new Date();
+  const leaseUntil = new Date(now.getTime() + FINALIZE_LEASE_MS).toISOString();
   const claim = await env.DB.prepare(
-    `UPDATE runs SET status = 'finalizing'
+    `UPDATE runs
+     SET status = 'finalizing',
+         finalize_lease_until = ?,
+         email_sent_at = CASE WHEN COALESCE(email_status, '') = 'sent' THEN email_sent_at ELSE NULL END
      WHERE id = ? AND (
        status IN ('running', 'partial')
        OR (status = 'incomplete' AND email_status = 'failed' AND email_sent_at IS NULL)
+       OR (
+         status = 'finalizing'
+         AND COALESCE(email_status, '') != 'sent'
+         AND (finalize_lease_until IS NULL OR finalize_lease_until <= ?)
+       )
      )`,
-  ).bind(runId).run();
-  if ((claim.meta.changes ?? 0) === 0) return;
+  ).bind(leaseUntil, runId, now.toISOString()).run();
+  if ((claim.meta.changes ?? 0) === 0) {
+    const current = await env.DB.prepare(
+      "SELECT status, email_status, finalize_lease_until FROM runs WHERE id = ?",
+    ).bind(runId).first<{ status: string; email_status: string | null; finalize_lease_until: string | null }>();
+    if (
+      current?.status === "finalizing"
+      && current.email_status !== "sent"
+      && current.finalize_lease_until != null
+      && current.finalize_lease_until > now.toISOString()
+    ) {
+      throw new FinalizeBusyError(finalizeRetryDelaySeconds(current.finalize_lease_until, now.getTime()));
+    }
+    return;
+  }
   await env.DB.prepare(
     "UPDATE runs SET finalize_enqueued_at = COALESCE(finalize_enqueued_at, ?) WHERE id = ?",
-  ).bind(new Date().toISOString(), runId).run();
+  ).bind(now.toISOString(), runId).run();
   if (reason === "deadline" || reason === "preempt") {
     await cancelOpenBatches(env, runId, reason === "preempt" ? "已到下一次定时运行" : "采集长时间没有进展");
   }
@@ -2094,12 +2140,14 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     `SELECT
        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
        SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending
      FROM batches WHERE run_id = ?`,
-  ).bind(runId).first<{ done: number | null; failed: number | null; pending: number | null }>();
+  ).bind(runId).first<{ done: number | null; failed: number | null; cancelled: number | null; pending: number | null }>();
   const failed = counts?.failed ?? 0;
+  const cancelled = counts?.cancelled ?? 0;
   const pending = counts?.pending ?? 0;
-  const incomplete = reason !== "complete" || failed > 0 || pending > 0;
+  const incomplete = reason !== "complete" || failed > 0 || pending > 0 || cancelled > 0;
   let notes = run.notes ?? "";
   if (incomplete && !notes.includes("有批次未完成，已发送目前收集到的内容。")) {
     notes = [notes, "有批次未完成，已发送目前收集到的内容。"].filter(Boolean).join(" ");
@@ -2109,8 +2157,6 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
   let emailTouched = false;
 
   try {
-    const stored = await storeExcel(env, settings);
-    if (stored.truncated) notes = [notes, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`].filter(Boolean).join(" ");
     const windowFile = await storeRunWindowExcel(env, settings, {
       id: runId,
       windowStart: run.window_start,
@@ -2142,10 +2188,11 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
         notes: run.notes,
       }, {
         notes,
-        treatCancelledAsIncomplete: reason !== "complete",
+        treatCancelledAsIncomplete: reason !== "complete" || cancelled > 0,
         windowFile,
         byCountry,
       });
+      if (!delivered.emailTouched && delivered.emailError === "日报正在发送") return;
       notes = delivered.notes;
       emailStatus = delivered.emailStatus;
       emailError = delivered.emailError;
@@ -2173,12 +2220,13 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     });
   }
 
-  await env.DB.prepare(
+  const finished = await env.DB.prepare(
     `UPDATE runs
      SET status = ?, finished_at = ?, batches_done = ?, batches_failed = ?, notes = ?,
          email_status = CASE WHEN ? = 1 THEN ? ELSE email_status END,
-         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END
-     WHERE id = ? AND status = 'finalizing'`,
+         email_error = CASE WHEN ? = 1 THEN ? ELSE email_error END,
+         finalize_lease_until = NULL
+     WHERE id = ? AND status = 'finalizing' AND finalize_lease_until = ?`,
   ).bind(
     incomplete || emailStatus === "failed" ? "incomplete" : "completed",
     new Date().toISOString(),
@@ -2190,9 +2238,32 @@ export async function finalizeRun(env: Env, runId: string, reason: "complete" | 
     emailTouched ? 1 : 0,
     emailError,
     runId,
+    leaseUntil,
   ).run();
+  if ((finished.meta.changes ?? 0) === 0) return;
   log("run finalized", { runId, reason, incomplete, emailStatus });
   await recordRunEvent(env.DB, { runId, type: "run finalized", details: { reason, incomplete, emailStatus } });
+  await refreshCumulativeExcel(env, settings, runId);
+}
+
+/** 历史总表失败不能挡住已经发出的日报。 */
+async function refreshCumulativeExcel(env: Env, settings: AppSettings, runId: string): Promise<void> {
+  try {
+    const stored = await storeExcel(env, settings);
+    if (stored.truncated) await appendRunNote(env, runId, `Excel 只保留最新 ${MAX_EXCEL_ROWS} 条，更早的记录仍在数据库中。`);
+  } catch (error) {
+    logError("cumulative excel failed", error, { runId });
+    await appendRunNote(env, runId, "历史总表生成失败。");
+  }
+}
+
+async function appendRunNote(env: Env, runId: string, sentence: string): Promise<void> {
+  const row = await env.DB.prepare("SELECT notes FROM runs WHERE id = ?")
+    .bind(runId)
+    .first<{ notes: string | null }>();
+  if (!row || (row.notes ?? "").includes(sentence)) return;
+  const notes = [row.notes ?? "", sentence].filter((part) => part.length > 0).join(" ");
+  await env.DB.prepare("UPDATE runs SET notes = ? WHERE id = ?").bind(notes, runId).run();
 }
 
 export async function handleDeadLetter(env: Env, message: CollectMessage): Promise<void> {
@@ -2253,6 +2324,33 @@ export async function closeStuckFinalizing(env: Env, now: Date): Promise<string[
   ).bind(graceIso, graceIso).all<{ id: string; notes: string | null; email_status: string | null }>();
   const closed: string[] = [];
   for (const row of rows.results) {
+    if (row.email_status !== "sent") {
+      const open = await env.DB.prepare(
+        `SELECT SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END) AS pending
+         FROM batches WHERE run_id = ?`,
+      ).bind(row.id).first<{ pending: number | null }>();
+      try {
+        await finalizeRun(env, row.id, (open?.pending ?? 0) > 0 ? "deadline" : "complete");
+      } catch (error) {
+        if (error instanceof FinalizeBusyError) {
+          await deferFinalizeWhileBusy(env, {
+            type: "finalize",
+            runId: row.id,
+            reason: (open?.pending ?? 0) > 0 ? "deadline" : "complete",
+          }, error);
+          continue;
+        }
+        throw error;
+      }
+      const after = await env.DB.prepare("SELECT status FROM runs WHERE id = ?")
+        .bind(row.id)
+        .first<{ status: string }>();
+      if (after && after.status !== "finalizing") {
+        closed.push(row.id);
+        log("stuck finalizing resumed", { runId: row.id, status: after.status });
+        continue;
+      }
+    }
     const counts = await env.DB.prepare(
       `SELECT
          SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
