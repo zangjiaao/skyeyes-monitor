@@ -61,6 +61,8 @@ export interface BatchResume {
   step: number;
   page: number;
   cursor: string;
+  /** 到这次暂停为止，连续遇到的限流次数。成功后清零。 */
+  rateAttempts?: number;
 }
 
 export interface PageCheckpoint {
@@ -112,7 +114,8 @@ export interface SearchRequest {
   onPage?: (page: PageCheckpoint) => Promise<void>;
   resume?: BatchResume | null;
   sleepImpl?: (ms: number) => Promise<void>;
-  queueAttempt?: number;
+  /** 连续限流次数，下一次 429/503 用它选择退避。不含预算续跑。 */
+  rateAttempt?: number;
 }
 
 export interface SearchResult {

@@ -5,7 +5,7 @@ import { normalizeTitle } from "../domain/gate";
 import { cleanText, verifyHit } from "../domain/terms";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
-import { parseRetryAfter, retryDelaySeconds } from "./x-rate";
+import { parseRetryAfter, rateAttemptIndex, retryDelaySeconds } from "./x-rate";
 import { parseRssItems, type RssItem } from "./xml";
 
 export const DEFAULT_GOOGLE_NEWS_EDITIONS = "en-US,zh-CN";
@@ -170,13 +170,12 @@ export const googleNewsProvider: SourceProvider = {
         calls += 1;
         if (response.status === 429 || response.status === 503) {
           const retryAfterSeconds = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
-          const delaySeconds = retryDelaySeconds({
-            attempt: Math.max(0, (request.queueAttempt ?? 1) - 1),
-            retryAfterSeconds,
-          });
+          const attempt = rateAttemptIndex(request.rateAttempt ?? request.resume?.rateAttempts);
+          const delaySeconds = retryDelaySeconds({ attempt, retryAfterSeconds });
           throw new RateLimitError(`Google News RSS 限流 ${response.status}`, {
             delaySeconds,
             retryAfterSeconds,
+            rateAttempts: attempt + 1,
           });
         }
         if (!response.ok) {

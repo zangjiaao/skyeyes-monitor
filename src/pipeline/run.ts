@@ -980,16 +980,32 @@ async function storeCollected(env: Env, input: {
   };
 }
 
+/** 限流续跑只记住连续失败次数，不改检索进度。 */
+async function rememberRateAttempts(env: Env, batchId: string, source: SourceId, rateAttempts: number): Promise<void> {
+  const row = await env.DB.prepare("SELECT resume_json FROM batches WHERE id = ?")
+    .bind(batchId)
+    .first<{ resume_json: string | null }>();
+  const current = parseResume(row?.resume_json, source) ?? { source, step: 0, page: 0, cursor: "" };
+  const next: BatchResume = { ...current, rateAttempts };
+  await env.DB.prepare(
+    "UPDATE batches SET resume_json = ? WHERE id = ? AND status IN ('queued', 'running')",
+  ).bind(JSON.stringify(next), batchId).run();
+}
+
 function parseResume(raw: string | null | undefined, source: SourceId): BatchResume | null {
   if (!raw) return null;
   try {
     const value = JSON.parse(raw) as BatchResume;
     if (!value || value.source !== source || !Number.isInteger(value.step) || value.step < 0) return null;
+    const rateAttempts = Number.isInteger(value.rateAttempts) && (value.rateAttempts ?? 0) > 0
+      ? value.rateAttempts
+      : 0;
     return {
       source,
       step: value.step,
       page: Number.isInteger(value.page) && value.page > 0 ? value.page : 0,
       cursor: typeof value.cursor === "string" ? value.cursor : "",
+      ...(rateAttempts ? { rateAttempts } : {}),
     };
   } catch {
     return null;
@@ -1182,7 +1198,8 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
       maxPages: settings.xMaxPages,
       excludeRetweets: settings.excludeRetweets,
       googleNewsEditions: settings.googleNewsEditions,
-      queueAttempt: (batch.defer_count ?? 0) + 1,
+      sleepImpl: (ms) => pacing.sleep(ms),
+      rateAttempt: parseResume(batch.resume_json, batch.source)?.rateAttempts ?? 0,
       resume: parseResume(batch.resume_json, batch.source),
       beforeRequest: async (context) => {
         const remaining = COORDINATOR_WALL_MS - (pacing.now() - startedMs);
@@ -1521,6 +1538,9 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
   } catch (error) {
     if (error instanceof BatchLostError) return;
     if (error instanceof DeferredBatchError || error instanceof RateLimitError) {
+      if (error instanceof RateLimitError) {
+        await rememberRateAttempts(env, batchId, batch.source, error.rateAttempts);
+      }
       await scheduleDeferredWake(
         env,
         runId,
