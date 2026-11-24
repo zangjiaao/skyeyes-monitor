@@ -810,7 +810,9 @@ describe("收尾死锁", () => {
       "run-soon",
     );
     const before = Date.now();
-    await finalizeRun(env, queued[0]!.body.runId, queued[0]!.body.reason);
+    const continuation = queued[0]!.body;
+    if (continuation.type !== "finalize") throw new Error("收尾续跑消息类型不对");
+    await finalizeRun(env, continuation.runId, continuation.reason);
     const finished = sqlite.prepare(
       "SELECT status, email_status, finished_at FROM runs WHERE id = 'run-soon'",
     ).get() as { status: string; email_status: string; finished_at: string };
