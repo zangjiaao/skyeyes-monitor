@@ -13,12 +13,15 @@ export class RateLimitError extends Error {
   readonly recorded: boolean;
   /** 含本次在内的连续限流次数，供下一次续跑接着退避。 */
   readonly rateAttempts: number;
+  /** 已经确认整个来源在限流，续跑时不要改去试下一条。 */
+  readonly rateHold: boolean;
 
   constructor(message: string, options?: {
     delaySeconds?: number;
     retryAfterSeconds?: number | null;
     recorded?: boolean;
     rateAttempts?: number;
+    rateHold?: boolean;
   }) {
     super(message);
     this.name = "RateLimitError";
@@ -26,6 +29,7 @@ export class RateLimitError extends Error {
     this.retryAfterSeconds = options?.retryAfterSeconds ?? null;
     this.recorded = options?.recorded ?? false;
     this.rateAttempts = rateAttemptIndex(options?.rateAttempts ?? 1);
+    this.rateHold = options?.rateHold === true;
   }
 }
 

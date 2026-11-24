@@ -981,12 +981,18 @@ async function storeCollected(env: Env, input: {
 }
 
 /** 限流续跑只记住连续失败次数，不改检索进度。 */
-async function rememberRateAttempts(env: Env, batchId: string, source: SourceId, rateAttempts: number): Promise<void> {
+async function rememberRateAttempts(
+  env: Env,
+  batchId: string,
+  source: SourceId,
+  rateAttempts: number,
+  rateHold = false,
+): Promise<void> {
   const row = await env.DB.prepare("SELECT resume_json FROM batches WHERE id = ?")
     .bind(batchId)
     .first<{ resume_json: string | null }>();
   const current = parseResume(row?.resume_json, source) ?? { source, step: 0, page: 0, cursor: "" };
-  const next: BatchResume = { ...current, rateAttempts };
+  const next: BatchResume = { ...current, rateAttempts, ...(rateHold ? { rateHold: true } : {}) };
   await env.DB.prepare(
     "UPDATE batches SET resume_json = ? WHERE id = ? AND status IN ('queued', 'running')",
   ).bind(JSON.stringify(next), batchId).run();
@@ -1000,12 +1006,17 @@ function parseResume(raw: string | null | undefined, source: SourceId): BatchRes
     const rateAttempts = Number.isInteger(value.rateAttempts) && (value.rateAttempts ?? 0) > 0
       ? value.rateAttempts
       : 0;
+    const parkedSteps = Array.isArray(value.parkedSteps)
+      ? [...new Set(value.parkedSteps.filter((step) => Number.isInteger(step) && step >= 0 && step !== value.step))]
+      : [];
     return {
       source,
       step: value.step,
       page: Number.isInteger(value.page) && value.page > 0 ? value.page : 0,
       cursor: typeof value.cursor === "string" ? value.cursor : "",
       ...(rateAttempts ? { rateAttempts } : {}),
+      ...(parkedSteps.length > 0 ? { parkedSteps } : {}),
+      ...(value.rateHold === true ? { rateHold: true } : {}),
     };
   } catch {
     return null;
@@ -1539,7 +1550,7 @@ export async function processBatch(env: Env, runId: string, batchId: string): Pr
     if (error instanceof BatchLostError) return;
     if (error instanceof DeferredBatchError || error instanceof RateLimitError) {
       if (error instanceof RateLimitError) {
-        await rememberRateAttempts(env, batchId, batch.source, error.rateAttempts);
+        await rememberRateAttempts(env, batchId, batch.source, error.rateAttempts, error.rateHold);
       }
       await scheduleDeferredWake(
         env,

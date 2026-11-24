@@ -4,6 +4,7 @@ import { normalizeTitle } from "../src/domain/gate";
 import type { SearchRequest } from "../src/domain/types";
 import { validateSettingsPatch } from "../src/config/settings";
 import { googleNewsProvider, parseGoogleNewsEditions, rssItemsToRecords } from "../src/sources/google-news";
+import { RateLimitError } from "../src/sources/x";
 import { parseRssItems } from "../src/sources/xml";
 
 const HYPHEN = "\u2011";
@@ -172,5 +173,107 @@ describe("Google News 去重", () => {
     expect(parseGoogleNewsEditions("").editions.map((edition) => edition.id)).toEqual(["en-US", "zh-CN"]);
     expect(validateSettingsPatch({ google_news_editions: "en-US, zh-CN, en-PK" }).google_news_editions).toBe("en-US,zh-CN,en-PK");
     expect(() => validateSettingsPatch({ google_news_editions: "everywhere" })).toThrow(/无法识别/);
+  });
+});
+
+describe("Google News 卡住的单条检索", () => {
+  const window = {
+    start: new Date("2026-10-11T02:00:00.000Z"),
+    end: new Date("2026-10-12T02:00:00.000Z"),
+  };
+  const targets = [{
+    id: "places",
+    kind: "keyword" as const,
+    name: "地名",
+    query: "甲\n乙\n丙",
+    terms: ["甲", "乙", "丙"],
+  }];
+  const emptyRss = `<?xml version="1.0"?><rss><channel></channel></rss>`;
+
+  function queryOf(input: RequestInfo | URL): string {
+    return new URL(String(input)).searchParams.get("q") ?? "";
+  }
+
+  it("同一条没到 3 次时不试下一条", async () => {
+    const urls: string[] = [];
+    const error = await googleNewsProvider.search({
+      targets,
+      window,
+      countryName: "示例",
+      googleNewsEditions: "en-US",
+      rateAttempt: 1,
+      fetchImpl: async (input) => {
+        urls.push(queryOf(input));
+        return new Response("slow", { status: 503 });
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(RateLimitError);
+    expect(error).toMatchObject({ rateAttempts: 2, rateHold: false, delaySeconds: 10 });
+    expect(urls).toEqual(['"甲" after:2026-10-11 before:2026-10-13']);
+  });
+
+  it("第 3 次失败时下一条成功，则搁置这一条并在最后再试一次", async () => {
+    const urls: string[] = [];
+    const resumes: Array<{ step: number; parkedSteps?: number[] }> = [];
+    const skipped: string[] = [];
+    const result = await googleNewsProvider.search({
+      targets,
+      window,
+      countryName: "示例",
+      googleNewsEditions: "en-US",
+      rateAttempt: 2,
+      fetchImpl: async (input) => {
+        const query = queryOf(input);
+        urls.push(query);
+        if (query.startsWith('"甲"')) return new Response("slow", { status: 503 });
+        return new Response(emptyRss, { status: 200, headers: { "content-type": "application/rss+xml" } });
+      },
+      onPage: async (page) => {
+        resumes.push({ step: page.resume.step, parkedSteps: page.resume.parkedSteps });
+      },
+      onDiagnostic: async (diagnostic) => {
+        if (diagnostic.event === "skipped") skipped.push(diagnostic.query);
+      },
+    });
+    expect(result.calls).toBe(4);
+    expect(urls.map((query) => query.slice(0, 3))).toEqual(['"甲"', '"乙"', '"丙"', '"甲"']);
+    expect(resumes[0]).toEqual({ step: 2, parkedSteps: [0] });
+    expect(skipped).toEqual(['"甲" after:2026-10-11 before:2026-10-13']);
+    expect(resumes.at(-1)).toEqual({ step: 3 });
+  });
+
+  it("下一条也失败时保持退避，不再继续往后试", async () => {
+    const urls: string[] = [];
+    const error = await googleNewsProvider.search({
+      targets,
+      window,
+      countryName: "示例",
+      googleNewsEditions: "en-US",
+      rateAttempt: 2,
+      fetchImpl: async (input) => {
+        urls.push(queryOf(input));
+        return new Response("slow", { status: 503 });
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ rateAttempts: 3, rateHold: true, delaySeconds: 20 });
+    expect(urls.map((query) => query.slice(0, 3))).toEqual(['"甲"', '"乙"']);
+  });
+
+  it("已经确认整个来源在限流时，不再跳过当前检索", async () => {
+    const urls: string[] = [];
+    const error = await googleNewsProvider.search({
+      targets,
+      window,
+      countryName: "示例",
+      googleNewsEditions: "en-US",
+      rateAttempt: 3,
+      resume: { source: "google_news", step: 0, page: 0, cursor: "", rateAttempts: 3, rateHold: true },
+      fetchImpl: async (input) => {
+        urls.push(queryOf(input));
+        return new Response("slow", { status: 503 });
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ rateAttempts: 4, rateHold: true, delaySeconds: 40 });
+    expect(urls).toHaveLength(1);
   });
 });

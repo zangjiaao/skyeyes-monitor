@@ -63,6 +63,10 @@ export interface BatchResume {
   cursor: string;
   /** 到这次暂停为止，连续遇到的限流次数。成功后清零。 */
   rateAttempts?: number;
+  /** 同一条连续失败后先搁置，等其余检索结束再试一次。 */
+  parkedSteps?: number[];
+  /** 下一条也失败过，整个来源在限流，不要再跳过别的检索。 */
+  rateHold?: boolean;
 }
 
 export interface PageCheckpoint {
@@ -87,7 +91,7 @@ export interface SearchDiagnosticContext {
 }
 
 export type SearchDiagnostic = SearchDiagnosticContext & {
-  event: "request" | "response" | "result" | "error" | "wait";
+  event: "request" | "response" | "result" | "error" | "wait" | "skipped";
   delaySeconds?: number;
   reason?: string;
   status?: number;
