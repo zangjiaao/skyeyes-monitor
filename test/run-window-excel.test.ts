@@ -118,8 +118,8 @@ describe("本轮窗口 Excel", () => {
     expect(windowSheets["示例国家乙"].map((row) => row[0])).toEqual(["原文"]);
     expect(Object.keys(windowSheets)).not.toContain("今日");
     expect(Object.keys(windowSheets)).not.toContain("昨日");
-    expect(cumulativeSheets["今日"]).toBeDefined();
-    expect(cumulativeSheets["昨日"]).toBeDefined();
+    expect(Object.keys(cumulativeSheets)).not.toContain("今日");
+    expect(Object.keys(cumulativeSheets)).not.toContain("昨日");
     expect(JSON.stringify(windowSheets)).not.toContain("history-item");
     expect(JSON.stringify(windowSheets)).not.toContain("spam-item");
     expect(JSON.stringify(windowSheets)).not.toContain("outside-item");
