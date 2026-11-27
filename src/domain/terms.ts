@@ -48,19 +48,24 @@ export function parseMatchMode(value: unknown): MatchMode {
   return value as MatchMode;
 }
 
+export function splitsWords(target: Pick<QueryTarget, "matchMode" | "kind">): boolean {
+  return target.kind !== "handle" && (target.matchMode === "all_words" || target.matchMode === "any_word" || target.matchMode === "unfiltered");
+}
+
 export function searchParts(target: Pick<QueryTarget, "matchMode" | "kind">, term: string): string[] {
   const raw = term.trim();
   if (!raw) return [];
-  return target.matchMode === "all_words" && target.kind !== "handle" ? uniqueTerms(raw.split(/\s+/u)) : [raw];
+  return splitsWords(target) ? uniqueTerms(raw.split(/\s+/u)) : [raw];
 }
 
 export function matchesSearchTerm(text: string, term: string, target: QueryTarget): boolean {
-  if (target.matchMode !== "all_words" || target.kind === "handle") {
+  if (!text.trim() || target.kind === "handle" || (target.matchMode !== "all_words" && target.matchMode !== "any_word" && target.matchMode !== "unfiltered")) {
     return termMatches(text, term, Boolean(target.caseSensitive));
   }
+  if (target.matchMode === "unfiltered") return true;
   const words = searchParts(target, term);
-  return words.length > 0 && words.every((word) =>
-    termMatches(text, word, Boolean(target.caseSensitive), /^[A-Z]{2,5}$/.test(word)));
+  const hit = (word: string) => termMatches(text, word, Boolean(target.caseSensitive), /^[A-Z]{2,5}$/.test(word));
+  return words.length > 0 && (target.matchMode === "any_word" ? words.some(hit) : words.every(hit));
 }
 
 export function termMatches(text: string, term: string, caseSensitive: boolean, acronymSensitive = isShortAcronym(term.trim())): boolean {

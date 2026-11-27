@@ -51,6 +51,35 @@ describe("匹配方式", () => {
     })).toEqual({ ok: true, term: "example_handle" });
   });
 
+  it("至少一个词命中其中一词即可，完全没有这些词则丢掉", () => {
+    const anyWord = { matchMode: "any_word" as const };
+    expect(hit("Taiwan news", anyWord)).toEqual({ ok: true, term: "Taiwan Japan" });
+    expect(hit("only Japan today", anyWord)).toEqual({ ok: true, term: "Taiwan Japan" });
+    expect(hit("Korea summit", anyWord)).toEqual({ ok: false, term: null });
+    expect(hit("Taiwan and Japan trade war", { ...anyWord, excludeTerms: ["trade war"] })).toEqual({ ok: false, term: null });
+  });
+
+  it("保留全部检索结果不再要求标题里出现关键词，排除词仍然生效", () => {
+    const open = { matchMode: "unfiltered" as const };
+    expect(hit("韩国举行峰会", open)).toEqual({ ok: true, term: "Taiwan Japan" });
+    expect(hit("Taiwan and Japan trade war", { ...open, excludeTerms: ["trade war"] })).toEqual({ ok: false, term: null });
+    expect(hit("", open)).toEqual({ ok: false, term: null });
+  });
+
+  it("至少一个词和保留全部都按 OR 检索，GDELT 仍按行分开", () => {
+    for (const matchMode of ["any_word", "unfiltered"] as const) {
+      const loose = { ...target, matchMode };
+      expect(buildXTermQuery(loose, "Taiwan Japan", window)).toMatch(/^\("Taiwan" OR "Japan"\) since_time:/);
+      expect(buildNewsTermQuery(loose, "Taiwan Japan", window)).toBe('("Taiwan" OR "Japan") after:2026-11-04 before:2026-11-06');
+      expect(buildGdeltTermQuery(loose, "Taiwan Japan")).toBe('("Taiwan" OR "Japan")');
+      expect(buildNewsTermQuery(loose, "Taiwan", window)).toBe('"Taiwan" after:2026-11-04 before:2026-11-06');
+      expect(packGdeltQueries(loose)).toEqual([
+        { query: '("Taiwan" OR "Japan")', terms: ["Taiwan Japan"] },
+        { query: '("China" OR "Pakistan")', terms: ["China Pakistan"] },
+      ]);
+    }
+  });
+
   it("三种来源使用分开的词查询，GDELT 的多行 AND 条件分别请求", () => {
     expect(buildXTermQuery(target, "Taiwan Japan", window)).toMatch(/^"Taiwan" "Japan" since_time:/);
     expect(buildNewsTermQuery(target, "Taiwan Japan", window)).toBe('"Taiwan" "Japan" after:2026-11-04 before:2026-11-06');

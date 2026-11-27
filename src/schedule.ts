@@ -2,6 +2,7 @@ import { loadSettings } from "./config/settings";
 import { decideSchedule, rollingWindow } from "./domain/time";
 import { log, logError } from "./log";
 import { STUCK_BATCH_GRACE_MS } from "./pipeline/queue-batch";
+import { runDueCollectJobs } from "./jobs/collect";
 import { ActiveRunError, finalizeOverdue, requeueStuckBatches, startRun } from "./pipeline/run";
 
 export async function handleScheduled(env: Env, scheduledTime: number): Promise<void> {
@@ -25,23 +26,31 @@ export async function handleScheduled(env: Env, scheduledTime: number): Promise<
     scheduleHour: settings.scheduleHour,
     timeZone: settings.timeZone,
   }));
-  if (!decision.due) return;
-  try {
-    await startRun(env, {
-      trigger: "schedule",
-      now,
-      slotKey: decision.slotKey,
-      windowStart: decision.start,
-      windowEnd: decision.end,
-    });
-  } catch (error) {
-    if (error instanceof ActiveRunError) {
-      log("schedule skipped because a run is active", { activeRunId: error.activeRunId, slotKey: decision.slotKey });
-      return;
+  let scheduleError: unknown = null;
+  if (decision.due) {
+    try {
+      await startRun(env, {
+        trigger: "schedule",
+        now,
+        slotKey: decision.slotKey,
+        windowStart: decision.start,
+        windowEnd: decision.end,
+      });
+    } catch (error) {
+      if (error instanceof ActiveRunError) {
+        log("schedule skipped because a run is active", { activeRunId: error.activeRunId, slotKey: decision.slotKey });
+      } else {
+        logError("scheduled run failed", error, { slotKey: decision.slotKey });
+        scheduleError = error;
+      }
     }
-    logError("scheduled run failed", error, { slotKey: decision.slotKey });
-    throw error;
   }
+  try {
+    await runDueCollectJobs(env, now);
+  } catch (error) {
+    logError("collect jobs failed", error);
+  }
+  if (scheduleError) throw scheduleError;
 }
 
 export async function startManualRun(env: Env, now = new Date(), options: { confirm?: boolean; countryIds?: string[] } = {}): Promise<{

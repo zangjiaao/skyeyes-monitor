@@ -1,4 +1,4 @@
-import { searchParts, termsOf } from "./terms";
+import { searchParts, splitsWords, termsOf } from "./terms";
 import type { QueryTarget, TimeWindow } from "./types";
 
 export const MAX_QUERY_CHARS = 450;
@@ -23,7 +23,18 @@ export function clauseForTerm(target: QueryTarget, term: string): string {
     const handle = raw.replace(/[^A-Za-z0-9_]/g, "");
     return handle ? `from:${handle}` : "";
   }
-  return searchParts(target, raw).map((part) => `"${part}"`).join(" ");
+  return keywordClause(target, raw);
+}
+
+/** 连续短语和全部词用空格表示同时出现；至少一个词、保留全部用 OR，多个词加括号，避免排除词只套在最后一个词上。 */
+export function keywordClause(target: QueryTarget, term: string): string {
+  const parts = searchParts(target, term.trim().replace(/^@/, "").replace(/"/g, ""));
+  if (parts.length === 0) return "";
+  const quoted = parts.map((part) => `"${part}"`);
+  if ((target.matchMode === "any_word" || target.matchMode === "unfiltered") && quoted.length > 1) {
+    return `(${quoted.join(" OR ")})`;
+  }
+  return quoted.join(" ");
 }
 
 export function clauseForTarget(target: QueryTarget): string {
@@ -71,7 +82,7 @@ export function buildNewsTermQuery(target: QueryTarget, term: string, window: Ti
   const after = window.start.toISOString().slice(0, 10);
   const beforeDate = new Date(window.end.getTime() + 24 * 60 * 60 * 1000);
   const before = beforeDate.toISOString().slice(0, 10);
-  const clause = searchParts(target, raw).map((part) => `"${part}"`).join(" ");
+  const clause = keywordClause(target, raw);
   return [clause, ...excludeClauses(target), `after:${after}`, `before:${before}`].join(" ");
 }
 
@@ -88,7 +99,7 @@ function gdeltExcludes(target: QueryTarget): string[] {
 }
 
 export function buildGdeltTermQuery(target: QueryTarget, term: string): string {
-  const quoted = searchParts(target, term).map(gdeltQuote).filter(Boolean).join(" ");
+  const quoted = keywordClause(target, term);
   if (!quoted) return "";
   return [quoted, ...gdeltExcludes(target)].join(" ");
 }
@@ -106,8 +117,8 @@ export function buildGdeltOrQuery(target: QueryTarget, terms: string[]): string 
 }
 
 export function packGdeltQueries(target: QueryTarget, maxChars = MAX_QUERY_CHARS): GdeltQueryGroup[] {
-  // Keep AND conditions as separate requests: GDELT OR blocks cannot be nested.
-  if (target.matchMode === "all_words" && target.kind !== "handle") {
+  // 全部词是 AND，不能塞进外层 OR。至少一个词和保留全部按行拆成 OR，也不和别的行嵌套。
+  if (splitsWords(target)) {
     return termsOf(target).flatMap((term) => {
       const query = buildGdeltTermQuery(target, term);
       return query ? [{ query, terms: [term] }] : [];

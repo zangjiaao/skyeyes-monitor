@@ -42,6 +42,13 @@ export interface InterpretInput {
 
 const EVENT_TYPES = new Set(["statement", "attack", "meeting", "other"]);
 
+function matchHint(mode: MatchMode | undefined): string[] {
+  if (mode === "all_words") return ["检索方式：每行词组中的全部词需同时出现，词序不限、不要求连续；多行条件任一命中即可。"];
+  if (mode === "any_word") return ["检索方式：每行词组里只要出现其中一个词就会入库。只命中一个词不能当作相关，请结合背景判断正文是否在讨论监测对象。"];
+  if (mode === "unfiltered") return ["检索方式：搜索引擎返回的结果都会入库，标题或摘要里可能看不到检索词。请主要依据监测对象和背景判断相关性，无关内容打低分。"];
+  return [];
+}
+
 export function parseDeepseekContent(content: string): Omit<Interpretation, "provider" | "translationStatus" | "translationError" | "relevanceError"> | null {
   const trimmed = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/u, "").trim();
   let payload: unknown;
@@ -144,7 +151,7 @@ export async function callDeepseek(input: {
         content: [
           `监测对象：${input.targetName.slice(0, 80)}`,
           `检索词：${input.terms.slice(0, 12).join("、").slice(0, 300)}`,
-          ...(input.matchMode === "all_words" ? ["检索方式：每行词组中的全部词需同时出现，词序不限、不要求连续；多行条件任一命中即可。"] : []),
+          ...matchHint(input.matchMode),
           `背景：${input.description.trim().slice(0, 500) || "无"}`,
           `正文：${input.text.trim().slice(0, TEXT_LIMIT)}`,
         ].join("\n"),
@@ -280,7 +287,7 @@ export async function interpretRecord(input: InterpretInput): Promise<Interpreta
     return result;
   }
   if (input.settings.relevanceEnabled && input.text.trim()) {
-    const scored = await scoreRelevance(input.ai, input.text, input.targetName, input.charge);
+    const scored = await scoreRelevance(input.ai, input.text, input.targetName, input.charge, input.description);
     result.score = scored.score;
     result.relevant = scored.score == null ? null : scored.score >= input.settings.relevanceThreshold;
     result.relevanceError = scored.error;

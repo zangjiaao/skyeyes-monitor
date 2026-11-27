@@ -14,7 +14,7 @@ import {
   type ExistingIdentity,
   type FilterRules,
 } from "../domain/gate";
-import type { BatchResume, CollectedRecord, QueryTarget, SearchDiagnostic, SourceId, TargetKind } from "../domain/types";
+import type { BatchResume, CollectedRecord, MatchMode, QueryTarget, SearchDiagnostic, SourceId, TargetKind } from "../domain/types";
 import { SOURCE_IDS } from "../domain/types";
 import { buildDigest, type DigestCountry } from "../email/compose";
 import { emailBuckets, scopeLabel, type EmailGroup } from "../email/delivery";
@@ -85,7 +85,7 @@ interface TargetRow {
   case_sensitive: number;
   enabled: number;
   description?: string;
-  match_mode?: "phrase" | "all_words";
+  match_mode?: MatchMode;
 }
 
 interface RunRow {
@@ -454,12 +454,14 @@ export async function startRun(env: Env, input: {
   windowEnd: Date;
   confirm?: boolean;
   countryIds?: string[];
+  jobId?: string;
+  jobName?: string;
 }): Promise<{ runId: string; created: boolean; batches: number; enqueued: number; warning: string | null }> {
   const countryIds = parseRunCountryIds(input.countryIds);
   let scopedCountries: CountryRow[] | undefined;
   let scopedTargets: TargetRow[] | undefined;
   if (countryIds) {
-    if (input.trigger !== "manual") throw new RunScopeError("只有手动运行可以指定分组");
+    if (input.trigger !== "manual" && !input.jobId) throw new RunScopeError("只有手动运行或采集任务可以指定分组");
     const enabled = await env.DB.prepare(
       "SELECT id, name, code, enabled FROM countries WHERE enabled = 1 ORDER BY name",
     ).all<CountryRow>();
@@ -556,6 +558,10 @@ export async function startRun(env: Env, input: {
     }
   }
 
+  if (input.jobName) {
+    await env.DB.prepare("UPDATE runs SET notes = ? WHERE id = ?")
+      .bind(`采集任务：${input.jobName}`.slice(0, 200), runId).run();
+  }
   await env.DB.prepare("UPDATE runs SET scope_json = ? WHERE id = ?").bind(JSON.stringify({
     mode: countryIds ? "selected" : "all",
     countries: countries.results.map((country) => ({ id: country.id, name: country.name })),
@@ -571,7 +577,7 @@ export async function startRun(env: Env, input: {
   });
   await recordRunEvent(env.DB, { runId, type: "run started", details: {
     trigger: input.trigger, targetCount: targetRows.length, groupCount: countries.results.length,
-    countryIds: countryIds ?? null, windowStart: input.windowStart.toISOString(), windowEnd: input.windowEnd.toISOString(),
+    countryIds: countryIds ?? null, jobId: input.jobId ?? null, windowStart: input.windowStart.toISOString(), windowEnd: input.windowEnd.toISOString(),
   } });
   if (messages.length === 0) {
     await finalizeRun(env, runId, "complete");

@@ -357,13 +357,17 @@ describe("手动指定分组", () => {
     const get = await app.request("/api/targets?countryId=country_demo_beta", {}, h.env, h.ctx);
     const payload = await get.json() as { targets: Array<{ id: string; match_mode: string }> };
     expect(payload.targets.find((row) => row.id === id)?.match_mode).toBe("all_words");
-    for (const mode of ["phrase", "all_words"]) {
+    for (const mode of ["phrase", "all_words", "any_word", "unfiltered"]) {
       const patched = await app.request(`/api/targets/${id}`, {
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ matchMode: mode }),
       }, h.env, h.ctx);
       expect(patched.status).toBe(200);
       expect(h.sqlite.prepare("SELECT match_mode FROM targets WHERE id = ?").get(id)).toMatchObject({ match_mode: mode });
     }
+    const restored = await app.request(`/api/targets/${id}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ matchMode: "all_words" }),
+    }, h.env, h.ctx);
+    expect(restored.status).toBe(200);
     const invalid = await app.request(`/api/targets/${id}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "should-not-save", matchMode: "unknown" }),
     }, h.env, h.ctx);

@@ -42,7 +42,7 @@ interface Target extends Record<string, unknown> {
   terms: string;
   exclude_terms: string;
   description: string;
-  match_mode: "phrase" | "all_words";
+  match_mode: "phrase" | "all_words" | "any_word" | "unfiltered";
   case_sensitive: number;
   enabled: number;
 }
@@ -60,9 +60,9 @@ const IMPORT_HELP = [
   ["类型", "person 人物、organization 机构、keyword 关键词、handle X 账号。也可以写中文。"],
   ["显示名", "日报里的名称。没有目标 ID 时，同一分组、类型、显示名的多行会合并。"],
   ["检索词", "必填。多条用 | 或单元格里的换行分开。账号不要带 @。带目标 ID 的行会按文件里的检索词整列覆盖。"],
-  ["匹配方式", "phrase 连续短语；all_words 全部词同时出现。后一种每行用空格分隔词，词序不限，多行任一命中即可。账号按作者匹配。"],
+  ["匹配方式", "phrase 连续短语；all_words 全部词同时出现；any_word 至少一个词；unfiltered 保留全部检索结果。多行任一命中即可。账号按作者匹配。"],
   ["排除词", "可选。规则与检索词相同，命中就丢掉整条。"],
-  ["背景说明", "可选。交给 AI 解读，最多 800 字。"],
+  ["背景说明", "可选，最多 800 字。交给 DeepSeek 打相关度。背景为空时，分数主要看显示名和检索词。"],
   ["启用", "1 或 是 为启用，0 或 否 为停用。留空视为启用。"],
   ["英文短语区分大小写", "可选。1 或 是 时，更长的英文短语也区分大小写。缩写始终区分大小写。"],
 ];
@@ -84,7 +84,23 @@ interface ImportPreviewRow extends Record<string, unknown> {
   excludeTerms: string[];
   errors: string[];
   duplicateOf: number | null;
-  matchMode?: "phrase" | "all_words";
+  matchMode?: "phrase" | "all_words" | "any_word" | "unfiltered";
+}
+
+function matchModeLabel(mode: string | undefined, empty = "连续短语"): string {
+  if (mode === "all_words") return "全部词同时出现";
+  if (mode === "any_word") return "至少一个词";
+  if (mode === "unfiltered") return "保留全部检索结果";
+  if (mode === "phrase") return "连续短语";
+  return empty;
+}
+
+function termsHint(kind: string, matchMode: string): string {
+  if (kind === "handle") return "一行一个账号，不要带 @。";
+  if (matchMode === "all_words") return "一行一组词，组内用空格分隔，所有词都出现才命中。下一行可填另一组条件，例如 台湾 日本。";
+  if (matchMode === "any_word") return "一行一组词，组内用空格分隔，出现其中一个词就入库。下一行是另一组条件。";
+  if (matchMode === "unfiltered") return "一行一组检索词，仍按这些词去查。返回结果不再因为标题或摘要里缺少某个词而被丢掉。";
+  return "一行一个连续短语。例如 BLA、Balochistan Liberation Army、俾路支解放军。";
 }
 
 interface ImportPreview {
@@ -458,7 +474,7 @@ export function TargetsPage() {
             header: "排除词",
             renderCell: (row) => row.exclude_terms?.split(/\r?\n/).filter(Boolean).join(" · ") || "—",
           },
-          { key: "match_mode", header: "匹配方式", renderCell: (row) => row.kind === "handle" ? "作者账号" : row.match_mode === "all_words" ? "全部词同时出现" : "连续短语" },
+          { key: "match_mode", header: "匹配方式", renderCell: (row) => row.kind === "handle" ? "作者账号" : matchModeLabel(row.match_mode) },
           { key: "case_sensitive", header: "区分大小写", renderCell: (row) => (row.case_sensitive ? "是" : "否") },
           { key: "enabled", header: "启用", renderCell: (row) => (row.enabled ? "是" : "否") },
           {
@@ -591,6 +607,16 @@ export function TargetsPage() {
               label="全部词同时出现"
               description="同一行用空格分隔词。例如 Taiwan Japan 可命中 Japan strengthens ties with Taiwan。"
             />
+            <RadioListItem
+              value="any_word"
+              label="至少一个词"
+              description="例如 Taiwan Japan，出现 Taiwan 或 Japan 即入库。适合先多留线索，再交给相关度筛。"
+            />
+            <RadioListItem
+              value="unfiltered"
+              label="保留全部检索结果"
+              description="仍用这些词去检索，但不再按标题或摘要丢掉结果。搜索引擎返回的都会入库，再由相关度判断。"
+            />
           </RadioList>
           <TextArea
             label="检索词"
@@ -598,7 +624,7 @@ export function TargetsPage() {
             value={terms}
             onChange={setTerms}
             isDisabled={savingTarget}
-            description={kind === "handle" ? "一行一个账号，不要带 @。" : matchMode === "all_words" ? "一行一组词，组内用空格分隔，所有词都出现才命中。下一行可填另一组条件，例如 台湾 日本。" : "一行一个连续短语。例如 BLA、Balochistan Liberation Army、俾路支解放军。"}
+            description={termsHint(kind, matchMode)}
           />
           <TextArea
             label="排除词"
@@ -614,7 +640,7 @@ export function TargetsPage() {
             value={description}
             onChange={setDescription}
             isDisabled={savingTarget}
-            description="可选。交给 DeepSeek 的监测对象说明，例如组织是谁、要关注哪类事件。"
+            description="可选，最多 800 字。DeepSeek 打分时会读这段说明。背景为空时，分数主要看显示名和检索词，分组名称不参与。"
           />
           <CheckboxInput
             label="英文短语区分大小写"
@@ -698,7 +724,7 @@ export function TargetsPage() {
                 { key: "kind", header: "类型" },
                 { key: "name", header: "显示名" },
                 { key: "terms", header: "检索词", renderCell: (row) => row.terms.join(" | ") || "—" },
-                { key: "matchMode", header: "匹配方式", renderCell: (row) => row.matchMode === "all_words" ? "全部词同时出现" : row.matchMode === "phrase" ? "连续短语" : "保留原设置；新建默认连续短语" },
+                { key: "matchMode", header: "匹配方式", renderCell: (row) => matchModeLabel(row.matchMode, "保留原设置；新建默认连续短语") },
                 {
                   key: "errors",
                   header: "检查",
