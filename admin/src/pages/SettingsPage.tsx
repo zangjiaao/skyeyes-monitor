@@ -79,7 +79,7 @@ export function SettingsPage() {
       <VStack gap={1}>
         <Heading level={1}>配置</Heading>
         <Text type="body" color="secondary">
-          修改后立即生效，不需要重新部署。Cron 每小时触发一次，只有到达设定小时才会开跑。密钥不会在这里显示。
+          修改后立即生效，不需要重新部署。Cron 每小时触发一次，到达这里设定的小时会采集全部启用分组。要按分组另定时，或随时开跑一次，用采集任务。密钥不会在这里显示。
         </Text>
       </VStack>
       {error ? <Banner status="error" title="保存失败" description={error} /> : null}

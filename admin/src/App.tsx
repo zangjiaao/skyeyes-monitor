@@ -3,6 +3,7 @@ import { SideNav, SideNavHeading, SideNavItem, SideNavSection } from "@astryxdes
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { MouseEvent } from "react";
 import { DataPage } from "./pages/DataPage";
+import { JobsPage } from "./pages/JobsPage";
 import { EmailLogPage } from "./pages/EmailLogPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { StatusPage } from "./pages/StatusPage";
@@ -11,6 +12,7 @@ import { TargetsPage } from "./pages/TargetsPage";
 const LINKS = [
   { href: "/status", label: "系统状态" },
   { href: "/targets", label: "监测目标" },
+  { href: "/jobs", label: "采集任务" },
   { href: "/settings", label: "配置" },
   { href: "/email-log", label: "发信记录" },
   { href: "/data", label: "数据" },
@@ -50,6 +52,7 @@ export function App() {
         <Route path="/" element={<Navigate to="/status" replace />} />
         <Route path="/status" element={<StatusPage />} />
         <Route path="/targets" element={<TargetsPage />} />
+        <Route path="/jobs" element={<JobsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/email-log" element={<EmailLogPage />} />
         <Route path="/data" element={<DataPage />} />

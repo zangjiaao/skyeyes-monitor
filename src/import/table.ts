@@ -103,7 +103,7 @@ const TEMPLATE_HELP: string[][] = [
   ["排除词", "否", "多条用 | 或换行分开，可留空", "命中就丢掉整条。表头也可以写 exclude 或 exclude_terms。"],
   ["背景说明", "否", "最多 800 字，可留空", "会交给 AI 解读。表头也可以写 description。"],
   ["启用", "否", "1、是、true 为启用；0、否、false 为停用", "留空视为启用。表头也可以写 enabled。"],
-  ["匹配方式", "否", "phrase 连续短语；all_words 全部词同时出现", "每行是一条条件，多行任一命中即可。all_words 模式中用空格分隔词，词序不限。旧文件未填时保留原目标模式，新目标默认 phrase。账号按作者匹配。"],
+  ["匹配方式", "否", "phrase 连续短语；all_words 全部词同时出现；any_word 至少一个词；unfiltered 保留全部检索结果", "每行是一条条件，多行任一命中即可。all_words 要求空格分开的词都出现。any_word 只要其中一个词出现。unfiltered 仍用这些词检索，但不再按标题或摘要丢掉结果。旧文件未填时保留原目标模式，新目标默认 phrase。账号按作者匹配。"],
   ["英文短语区分大小写", "否", "1 或 是 为打开，留空或其他为关闭", "只影响更长的英文短语。2 到 5 个字母的缩写始终区分大小写。表头也可以写 case_sensitive。"],
 ];
 
@@ -155,6 +155,13 @@ const KIND_ALIASES: Record<string, TargetKind> = {
   handle: "handle",
   账号: "handle",
   x账号: "handle",
+};
+
+const MATCH_MODE_LABELS: Record<string, MatchMode> = {
+  连续短语: "phrase",
+  全部词同时出现: "all_words",
+  至少一个词: "any_word",
+  保留全部检索结果: "unfiltered",
 };
 
 function canonicalHeader(header: string): string {
@@ -366,9 +373,9 @@ function readRaw(row: Record<string, string>, line: number): ImportPreviewRow {
   const mode = cell(row, "match_mode");
   if (mode) {
     try {
-      matchMode = parseMatchMode(mode === "连续短语" ? "phrase" : mode === "全部词同时出现" ? "all_words" : mode);
+      matchMode = parseMatchMode(MATCH_MODE_LABELS[mode] ?? mode);
     } catch {
-      errors.push("匹配方式无效，只能是 phrase 或 all_words");
+      errors.push("匹配方式无效，只能是 phrase、all_words、any_word 或 unfiltered");
     }
   }
   return {

@@ -41,6 +41,20 @@ describe("相关度调用", () => {
     await expect(scoreRelevance(ai, "正文讨论 BLA", "BLA")).resolves.toEqual({ score: 85, error: null });
     expect(sent).toContain("BLA");
     expect(sent).toContain("正文讨论 BLA");
+    expect(sent).not.toContain("背景：");
+  });
+
+  it("有背景说明时把背景交给评分", async () => {
+    let sent = "";
+    const ai = {
+      async run(_model: string, input: { messages: Array<{ content: string }> }) {
+        sent = input.messages.map((message) => message.content).join("\n");
+        return { response: "60" };
+      },
+    } as unknown as Ai;
+    await scoreRelevance(ai, "正文", "显示名", undefined, "这个组织关注武装活动");
+    expect(sent).toContain("背景：这个组织关注武装活动");
+    expect(sent).toContain("显示名");
   });
 
   it("读取 choices 里的分数", async () => {

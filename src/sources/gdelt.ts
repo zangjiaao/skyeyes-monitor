@@ -1,7 +1,7 @@
 import { fetchSearchPage, reportSearchResult } from "./diagnostics";
 import { packGdeltQueries } from "../domain/batch";
 import { dedupeRecords, makeDedupeKey } from "../domain/dedupe";
-import { cleanText, verifyHit } from "../domain/terms";
+import { cleanText, matchesSearchTerm, termMatches, verifyHit } from "../domain/terms";
 import { formatGdelt } from "../domain/time";
 import type { CollectedRecord, QueryTarget, SearchRequest, SearchResult, SourceProvider } from "../domain/types";
 import { RateLimitError } from "./x";
@@ -52,6 +52,15 @@ export function gdeltArticlesToRecords(
 }
 
 function attributeTerm(text: string, target: QueryTarget, terms: string[]): string | null {
+  if (target.matchMode === "unfiltered" && target.kind !== "handle") {
+    const sensitive = Boolean(target.caseSensitive);
+    if ((target.excludeTerms ?? []).some((item) => termMatches(text, item, sensitive))) return null;
+    const probe: QueryTarget = { ...target, matchMode: "any_word" };
+    const present = terms
+      .filter((term) => matchesSearchTerm(text, term, probe))
+      .sort((left, right) => right.length - left.length);
+    return present[0] ?? terms[0] ?? null;
+  }
   const scoped = { ...target, terms, query: terms[0] ?? target.query };
   const hits = terms
     .map((term) => verifyHit({ text, authorHandle: "", target: scoped, queriedTerm: term }))

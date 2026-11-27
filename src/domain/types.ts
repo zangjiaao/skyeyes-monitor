@@ -4,7 +4,7 @@ export type TargetKind = (typeof TARGET_KINDS)[number];
 export const SOURCE_IDS = ["x", "google_news", "gdelt"] as const;
 export type SourceId = (typeof SOURCE_IDS)[number];
 
-export const MATCH_MODES = ["phrase", "all_words"] as const;
+export const MATCH_MODES = ["phrase", "all_words", "any_word", "unfiltered"] as const;
 export type MatchMode = (typeof MATCH_MODES)[number];
 
 export interface QueryTarget {

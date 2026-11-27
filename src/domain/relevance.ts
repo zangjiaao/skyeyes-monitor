@@ -53,12 +53,15 @@ export async function scoreRelevance(
   text: string,
   target: string,
   charge?: () => void,
+  description = "",
 ): Promise<RelevanceOutcome> {
+  const background = description.trim().slice(0, 500);
   const prompt = [
     "给正文和监测对象的相关度打分。",
     "只输出一个 0 到 100 的整数。",
     "100 表示正文明确在讨论监测对象，0 表示无关、旧闻或广告。",
     `监测对象：${target.slice(0, 80)}`,
+    ...(background ? [`背景：${background}`] : []),
     `正文：${text.trim().slice(0, 800)}`,
   ].join("\n");
   let payload: unknown;

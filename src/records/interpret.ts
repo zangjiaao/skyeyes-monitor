@@ -1,4 +1,5 @@
 import { interpretRecord } from "../ai/interpret";
+import type { MatchMode } from "../domain/types";
 import { loadSettings } from "../config/settings";
 import { logError } from "../log";
 
@@ -12,7 +13,7 @@ interface InterpretRow {
   matched_term: string;
   terms: string | null;
   description: string | null;
-  match_mode?: "phrase" | "all_words";
+  match_mode?: MatchMode;
 }
 
 export async function interpretStoredRecords(env: Env, input: {

@@ -6,7 +6,7 @@ import { probeTranslationFallbackModel } from "../translate";
 import { authorBlockKey, DELIVERABLE_SQL } from "../domain/gate";
 import { closedWindow, decideSchedule, utcOffsetLabel } from "../domain/time";
 import { assertTermList, flagEnabled, joinTerms, parseMatchMode, splitLines, termsFromUnknown, uniqueTerms } from "../domain/terms";
-import { TARGET_KINDS, type TargetKind } from "../domain/types";
+import { TARGET_KINDS, type MatchMode, type TargetKind } from "../domain/types";
 import {
   buildTargetExportCsv,
   buildTargetExportXlsx,
@@ -28,6 +28,7 @@ import { retranslateRecords } from "../records/retranslate";
 import { interpretStoredRecords } from "../records/interpret";
 import { enqueueErrorMessage } from "../pipeline/queue-batch";
 import { ActiveRunError, RunScopeError, parseRunCountryIds, cancelRun, requeueStuckBatches, resendRunDigest } from "../pipeline/run";
+import { insertJob, parseJobBody, parseJobPatch, presentJob, startCollectJob, updateJob, type CollectJobRow } from "../jobs/collect";
 import { startManualRun } from "../schedule";
 
 const EXCEL_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -93,7 +94,7 @@ interface StoredTargetRow {
   description: string | null;
   enabled: number;
   case_sensitive: number;
-  match_mode?: "phrase" | "all_words";
+  match_mode?: MatchMode;
 }
 
 interface IndexedTarget extends ExistingTarget {
@@ -1172,6 +1173,56 @@ export function createApp(): Hono<{ Bindings: Env; Variables: AppVars }> {
       return c.json({ ok: true, key: stored.key, bytes: stored.bytes.byteLength, truncated: stored.truncated });
     } catch (error) {
       return jsonError(error, 500);
+    }
+  });
+
+  app.get("/api/jobs", async (c) => {
+    const rows = await c.env.DB.prepare("SELECT * FROM collect_jobs ORDER BY name, created_at").all<CollectJobRow>();
+    return c.json({ jobs: rows.results.map(presentJob) });
+  });
+
+  app.post("/api/jobs", async (c) => {
+    try {
+      const row = await insertJob(c.env.DB, parseJobBody(await readJson(c.req.raw)));
+      return c.json(presentJob(row), 201);
+    } catch (error) {
+      return jsonError(error);
+    }
+  });
+
+  app.patch("/api/jobs/:id", async (c) => {
+    try {
+      const row = await updateJob(c.env.DB, c.req.param("id"), parseJobPatch(await readJson(c.req.raw)));
+      return c.json(presentJob(row));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      return jsonError(error, message === "任务不存在" ? 404 : 400);
+    }
+  });
+
+  app.delete("/api/jobs/:id", async (c) => {
+    const result = await c.env.DB.prepare("DELETE FROM collect_jobs WHERE id = ?").bind(c.req.param("id")).run();
+    if ((result.meta?.changes ?? 0) === 0) return c.json({ error: "任务不存在" }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/jobs/:id/run", async (c) => {
+    try {
+      let confirm = false;
+      if ((c.req.header("content-type") ?? "").includes("application/json")) {
+        const body = await readJson(c.req.raw);
+        confirm = body.confirm === true;
+      }
+      const started = await startCollectJob(c.env, c.req.param("id"), { confirm, trigger: "manual" });
+      if (!started) return c.json({ error: "任务不存在" }, 404);
+      return c.json(started, 202);
+    } catch (error) {
+      if (error instanceof RunScopeError) return jsonError(error, 400);
+      if (error instanceof ActiveRunError) {
+        return c.json({ error: error.message, code: "active_run", activeRunId: error.activeRunId }, 409);
+      }
+      const message = error instanceof Error ? error.message : "";
+      return jsonError(error, message === "任务不存在" ? 404 : 500);
     }
   });
 
